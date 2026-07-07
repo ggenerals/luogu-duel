@@ -1,0 +1,332 @@
+:root {
+  color: #1e2329;
+  background: #f4f5f7;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+html,
+body,
+#app {
+  min-height: 100vh;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background:
+    linear-gradient(180deg, #ffffff 0, #f4f5f7 180px),
+    #f4f5f7;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  border: 1px solid #cfd4dc;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1e2329;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: #7c8798;
+  background: #f8fafc;
+}
+
+button.ghost {
+  border-color: transparent;
+  background: transparent;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid #cfd4dc;
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 8px 10px;
+  color: #1e2329;
+}
+
+input:focus,
+textarea:focus {
+  border-color: #3867d6;
+  outline: 3px solid #dfe8ff;
+}
+
+textarea {
+  min-height: 86px;
+  resize: vertical;
+}
+
+a {
+  color: #1759b6;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  border-bottom: 1px solid #e1e4e8;
+  padding: 9px 8px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+th {
+  color: #647084;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 62px;
+  border-bottom: 1px solid #e1e4e8;
+  background: #ffffff;
+  padding: 10px 18px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.identity {
+  display: grid;
+  grid-template-columns: minmax(160px, 240px) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.home-grid,
+.arena {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+  min-height: calc(100vh - 62px);
+}
+
+.home-grid {
+  grid-template-columns: minmax(260px, 1fr) minmax(420px, 2fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.arena {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.lobby {
+  display: grid;
+  grid-template-columns: 1.2fr 0.8fr;
+  gap: 14px;
+  padding: 14px;
+  min-height: calc(100vh - 62px);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.panel {
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid #dce0e6;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 14px;
+  box-shadow: 0 1px 2px rgb(18 25 38 / 0.05);
+  overflow: auto;
+}
+
+.stack {
+  display: grid;
+  gap: 14px;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.section-head,
+.scoreboard,
+.actions,
+.vote,
+.history,
+.player {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+h2,
+h3 {
+  margin: 0 0 12px;
+  font-size: 18px;
+  letter-spacing: 0;
+}
+
+h3 {
+  font-size: 15px;
+}
+
+.muted {
+  color: #647084;
+}
+
+.create-form {
+  display: grid;
+  gap: 12px;
+}
+
+.teams {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.team {
+  border: 1px solid #e1e4e8;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.red {
+  color: #b3261e;
+}
+
+.blue {
+  color: #1459c8;
+}
+
+tr.red {
+  background: #fff2f1;
+}
+
+tr.blue {
+  background: #edf4ff;
+}
+
+.scoreboard {
+  margin-bottom: 12px;
+  border: 1px solid #e1e4e8;
+  border-radius: 8px;
+  background: #fbfcfd;
+  padding: 10px 12px;
+}
+
+.scoreboard strong {
+  font-size: 20px;
+}
+
+.result {
+  border: 1px solid #b7d4bd;
+  border-radius: 8px;
+  background: #edf8ef;
+  padding: 10px;
+  margin-bottom: 12px;
+  font-weight: 700;
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chat-log {
+  height: min(46vh, 520px);
+  min-height: 260px;
+  overflow: auto;
+  border: 1px solid #e1e4e8;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfcfd;
+}
+
+.chat-log p,
+.system-flow p {
+  margin: 0 0 10px;
+}
+
+.chat-log span {
+  display: block;
+  color: #647084;
+  font-size: 12px;
+}
+
+.chat-log .private {
+  color: #7a3e00;
+}
+
+.chat-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.system-flow {
+  height: 180px;
+  overflow: auto;
+  border-top: 1px solid #e1e4e8;
+  margin-top: 14px;
+  padding-top: 12px;
+  color: #485467;
+}
+
+.votes {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.vote {
+  border: 1px solid #e1e4e8;
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.arena > .panel,
+.home-grid > .panel,
+.home-grid > .stack,
+.lobby > .panel {
+  height: 100%;
+}
+
+.arena > .panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+@media (max-width: 980px) {
+  .home-grid,
+  .lobby,
+  .arena {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar,
+  .identity,
+  .teams {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .topbar {
+    display: grid;
+  }
+}
