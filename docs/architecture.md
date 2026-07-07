@@ -1,22 +1,26 @@
 # Luogu Duel Architecture
 
-Luogu Duel is designed as a pure static web app. It has no trusted self-hosted
-backend. Browsers form WebRTC rooms, use public Nostr relays only for WebRTC
-signalling, and derive all match state from a replicated signed event log.
+Luogu Duel is a pure static web app. It has no traditional self-hosted backend.
+All cross-network state is exchanged through a tiny cloud variable API:
+`https://vd.gengen.qzz.io`.
 
-## Static networking model
+## Static Networking Model
 
 - Static hosting: GitHub Pages, Cloudflare Pages, Netlify static, or any CDN can
   serve the compiled files.
-- Room discovery: the home screen joins a public P2P lobby topic and announces
-  open rooms. Private room links carry `room` and `secret` in the URL fragment.
-- Cross-network realtime: WebRTC data channels carry room events. Nostr relays
-  are used as disposable signalling media. App data is not persisted there.
-- NAT traversal: public STUN is enough for most users. Restrictive networks need
-  a third-party TURN service configured in the browser; the TURN relay transports
-  encrypted WebRTC packets and remains untrusted.
+- Room access: private room links carry `room` and `secret` in the URL fragment.
+  The cloud variable key is derived from both values, so the room id alone is
+  not enough to read the room log.
+- Synchronization: the API stores a signed event-log snapshot. Clients poll,
+  merge unseen signed events, and write back only when they have local dirty
+  events.
+- Request control: foreground arena pages poll every 4 seconds, lobbies every
+  6 seconds, the global room every 10 seconds, and hidden tabs every 30 seconds.
+  Local actions are debounced before POST.
+- No WebRTC: there is no Nostr signalling, STUN, TURN, or browser-to-browser
+  mesh. The API is the only room transport.
 
-## State synchronization
+## State Synchronization
 
 Every mutation is a signed `DuelEvent`:
 
@@ -24,43 +28,40 @@ Every mutation is a signed `DuelEvent`:
 2. A Luogu/CPAuth identity should be bound to that public key.
 3. Each event contains an actor id, room id, Lamport clock, wall time, and typed
    payload.
-4. Peers verify signatures, de-duplicate by event id, sort by Lamport clock and
-   id, then run the same reducer.
-5. When a peer joins, existing peers send their event logs as snapshots.
+4. Clients verify signatures, de-duplicate by event id, sort by Lamport clock
+   and id, then run the same reducer.
+5. A client keeps locally dirty event ids until a later GET confirms the server
+   snapshot contains them.
 
 The reducer is the authority. Network arrival order does not decide winners or
 votes. Accepted Luogu records are ordered by original record time; if two events
 claim the same problem, the earlier Luogu AC wins.
 
-## Anti-cheat and conflict policy
+## Conflict Policy
 
-No static client can be perfectly trusted, so the design avoids trusting any
-single client.
+The API is a last-writer-wins key-value store, not a compare-and-swap database.
+Concurrent POSTs can temporarily overwrite each other. To avoid permanent event
+loss, every client keeps its unsaved signed events locally and re-posts a merged
+snapshot when the next poll shows those event ids are missing.
 
-- Identity: CPAuth should issue a signed proof mapping Luogu username to the
-  browser public key. Other peers reject events without a valid proof.
-- Event integrity: events are signed and immutable; peers reject malformed or
-  unauthorized actions.
-- Judging: each peer periodically fetches Luogu record data and broadcasts only
-  raw observed records. A claim is valid only when the record is for an in-room
-  player, in the current problem list, and has `OK` status.
-- Conflicts: reducer tie-breakers are deterministic. Accepted records use Luogu
-  submission time first, then record id, then event id.
+- Event integrity: events are signed and immutable.
+- Merge rule: event id de-duplication plus deterministic Lamport/id ordering.
+- Dirty retry: local event ids are cleared only after the server returns them.
 - Votes: problem replacement/deletion and draw require every active participant.
   Surrender requires every player on the surrendering team.
-- Limit: a malicious modified browser can omit data it sees, but it cannot make
-  other honest peers accept an invalid AC if they can independently query Luogu.
 
-## Luogu records adapter
+## Judging
 
-The code includes a browser-side adapter for `https://www.luogu.com.cn/record/list`.
-If Luogu blocks cross-origin browser requests, the pure-static options are:
+Each active client can periodically fetch Luogu record data and emit raw
+observed records. A claim is valid only when the record is for an in-room player,
+in the current problem list, and has `OK` status.
+
+The code includes a browser-side adapter for
+`https://www.luogu.com.cn/record/list`. If Luogu blocks cross-origin browser
+requests, the pure-static options are:
 
 - use a CPAuth/official CORS-enabled records endpoint;
 - ship a companion browser extension/userscript that performs same-origin
   Luogu requests and posts results to the page;
 - require every participant to keep a Luogu tab/session available and manually
-  click judge, while all peers still validate records they can fetch.
-
-Do not add a custom Node/Python crawler server; that would break the project's
-core static constraint.
+  click judge, while all clients still validate records they can fetch.

@@ -12,7 +12,6 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@trystero-p2p/nostr": "^0.25.2",
     "typescript": "^6.0.3",
     "vite": "^8.1.3"
   }

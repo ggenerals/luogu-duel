@@ -10,9 +10,10 @@ import {
   visibleChats,
   winThreshold
 } from "./domain";
+import { loadCloudSnapshot, saveCloudSnapshot } from "./cloudStore";
 import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope, type LocalIdentity } from "./identity";
 import { fetchLuoguRecords } from "./luogu";
-import { createRoomSync, type RoomSync } from "./sync";
+import { completeCpOAuthLogin, loadCpSession, logoutCpSession, startCpOAuthLogin, type CpSession } from "./oauth";
 import type { DuelEvent, DuelState, Problem, SignedEnvelope, Team, VoteKind } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -23,19 +24,47 @@ let roomId = "global";
 let roomSecret = "public-lobby";
 let envelopes: SignedEnvelope[] = [];
 let state: DuelState = createInitialState(roomId);
-let sync: RoomSync | null = null;
-let connectedPeers: string[] = [];
 let judgeTimer: number | undefined;
 let judgeCursor = 0;
+let apiPollTimer: number | undefined;
+let apiSaveTimer: number | undefined;
+let apiBusy = false;
+let dirtyEventIds = new Set<string>();
 let statusText = "正在初始化";
+let cpSession: CpSession | null = null;
+let userMenuOpen = false;
 
 const storageKey = () => `luogu-duel.log.${roomId}`;
 const historyKey = "luogu-duel.history.v1";
 
 const boot = async () => {
   identity = await loadIdentity();
+  let oauthLuoguName: string | null = null;
+  try {
+    oauthLuoguName = await completeCpOAuthLogin();
+    if (oauthLuoguName) {
+      identity = await renameIdentity(identity, oauthLuoguName);
+      statusText = `已通过 CP OAuth 绑定 ${oauthLuoguName}`;
+    }
+  } catch (error) {
+    statusText = error instanceof Error ? error.message : "CP OAuth 登录失败";
+  }
+  cpSession = loadCpSession();
+  if (!cpSession && location.pathname !== "/callback") {
+    await startCpOAuthLogin();
+    return;
+  }
+  if (cpSession) {
+    identity = await renameIdentity(identity, cpSession.luoguName);
+  }
   await enterFromHash();
+  if (oauthLuoguName) {
+    await emit({ ...baseEvent("player.joined"), luoguName: oauthLuoguName, team: state.players[identity.id]?.team ?? pickTeam() });
+  }
   window.addEventListener("hashchange", enterFromHash);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void pullApiSnapshot("页面恢复");
+  });
   app.addEventListener("click", handleClick);
   app.addEventListener("submit", handleSubmit);
   render();
@@ -43,20 +72,19 @@ const boot = async () => {
 
 const enterFromHash = async () => {
   const params = new URLSearchParams(location.hash.slice(1));
-  const nextRoom = params.get("room") || "global";
-  const nextSecret = params.get("secret") || (nextRoom === "global" ? "public-lobby" : "");
-  roomId = nextRoom;
-  roomSecret = nextSecret || "public-room";
+  roomId = params.get("room") || "global";
+  roomSecret = params.get("secret") || (roomId === "global" ? "public-lobby" : "public-room");
+
+  stopApiSync();
   envelopes = loadLog();
   state = applyEvents(roomId, envelopes.map((item) => item.event));
-  await sync?.leave();
-  sync = createRoomSync(roomId, roomSecret, () => envelopes, receiveEnvelope, (peers) => {
-    connectedPeers = peers;
-    render();
-  });
+  dirtyEventIds = new Set();
+
+  await pullApiSnapshot("进入房间");
   await ensureJoined();
+  startApiSync();
   startJudgeLoop();
-  statusText = roomId === "global" ? "公共大厅已连接" : "房间已连接";
+  statusText = roomId === "global" ? "公共大厅已连接 API 同步" : "房间已连接 API 同步";
   render();
 };
 
@@ -72,7 +100,8 @@ const ensureJoined = async () => {
 const emit = async (event: DuelEvent) => {
   const envelope = await signEvent(identity, event);
   await receiveEnvelope(envelope);
-  await sync?.broadcast(envelope);
+  dirtyEventIds.add(event.id);
+  scheduleApiSave(350);
 };
 
 const receiveEnvelope = async (envelope: SignedEnvelope) => {
@@ -101,16 +130,77 @@ const maybeAutoStart = async () => {
   await emit(baseEvent("game.started") as DuelEvent);
 };
 
+const startApiSync = () => {
+  const loop = async () => {
+    await pullApiSnapshot("轮询同步");
+    apiPollTimer = window.setTimeout(loop, currentPollInterval());
+  };
+  apiPollTimer = window.setTimeout(loop, currentPollInterval());
+};
+
+const stopApiSync = () => {
+  if (apiPollTimer) window.clearTimeout(apiPollTimer);
+  if (apiSaveTimer) window.clearTimeout(apiSaveTimer);
+  apiPollTimer = undefined;
+  apiSaveTimer = undefined;
+  apiBusy = false;
+};
+
+const pullApiSnapshot = async (reason: string) => {
+  if (apiBusy) return;
+  apiBusy = true;
+  try {
+    const remote = await loadCloudSnapshot(cloudKey());
+    const remoteIds = new Set(remote.map((item) => item.event.id));
+    let added = 0;
+    for (const envelope of remote) {
+      if (!envelopes.some((item) => item.event.id === envelope.event.id)) {
+        await receiveEnvelope(envelope);
+        added += 1;
+      }
+    }
+    dirtyEventIds = new Set([...dirtyEventIds].filter((id) => !remoteIds.has(id)));
+    if (dirtyEventIds.size > 0) scheduleApiSave(900);
+    statusText = added > 0 ? `${reason}：合并 ${added} 条事件` : `${reason}：已是最新`;
+  } catch (error) {
+    statusText = error instanceof Error ? error.message : "API 同步失败";
+  } finally {
+    apiBusy = false;
+    render();
+  }
+};
+
+const scheduleApiSave = (delay: number) => {
+  if (apiSaveTimer) window.clearTimeout(apiSaveTimer);
+  apiSaveTimer = window.setTimeout(() => void flushApiSave(), delay);
+};
+
+const flushApiSave = async () => {
+  if (apiBusy || dirtyEventIds.size === 0) {
+    if (dirtyEventIds.size > 0) scheduleApiSave(1200);
+    return;
+  }
+  try {
+    await saveCloudSnapshot(cloudKey(), envelopes);
+    statusText = `API 已写入 ${dirtyEventIds.size} 条待确认事件`;
+  } catch (error) {
+    statusText = error instanceof Error ? error.message : "API 写入失败";
+    scheduleApiSave(3000);
+  }
+  render();
+};
+
+const currentPollInterval = (): number => {
+  return document.hidden ? 30_000 : 10_000;
+};
+
+const cloudKey = (): string => (roomId === "global" ? "global" : `${roomId}:${roomSecret}`);
+
 const handleSubmit = async (event: SubmitEvent) => {
   event.preventDefault();
   const form = event.target as HTMLFormElement;
   const action = form.dataset.action;
   const data = new FormData(form);
-
-  if (action === "identity") {
-    identity = await renameIdentity(identity, String(data.get("luoguName") || ""));
-    await emit({ ...baseEvent("player.joined"), luoguName: identity.luoguName, team: state.players[identity.id]?.team ?? "red" });
-  }
 
   if (action === "create-room") {
     const count = clamp(Number(data.get("count") || 9), 3, 21);
@@ -119,8 +209,7 @@ const handleSubmit = async (event: SubmitEvent) => {
     const nextSecret = compactId() + compactId();
     history.pushState(null, "", `#room=${nextRoom}&secret=${nextSecret}`);
     await enterFromHash();
-    const problems = makeProblemSet(count, nextRoom, manual);
-    await emit({ ...baseEvent("room.configured"), problems });
+    await emit({ ...baseEvent("room.configured"), problems: makeProblemSet(count, nextRoom, manual) });
   }
 
   if (action === "chat") {
@@ -145,6 +234,17 @@ const handleClick = async (event: MouseEvent) => {
 
   if (action === "home") location.hash = "";
   if (action === "copy-link") await navigator.clipboard.writeText(location.href);
+  if (action === "sync-now") await pullApiSnapshot("手动同步");
+  if (action === "toggle-user-menu") {
+    userMenuOpen = !userMenuOpen;
+    render();
+  }
+  if (action === "oauth-login") await startCpOAuthLogin();
+  if (action === "logout") {
+    logoutCpSession();
+    userMenuOpen = false;
+    await startCpOAuthLogin();
+  }
   if (action === "reset-id") {
     identity = await createIdentity(identity.luoguName);
     location.reload();
@@ -209,36 +309,54 @@ const render = () => {
 
 const shell = (content: string) => `
   <header class="topbar">
-    <div>
-      <button class="ghost" data-action="home">Luogu Duel</button>
-      <span class="muted">${escapeHtml(statusText)} · ${connectedPeers.length} peer(s)</span>
+    <div class="brand-row">
+      <button class="brand" data-action="home">Luogu Duel</button>
+      <span class="status-pill">${escapeHtml(statusText)}</span>
+      <span class="muted">待确认 ${dirtyEventIds.size}</span>
     </div>
-    <form class="identity" data-action="identity">
-      <input name="luoguName" value="${escapeHtml(identity.luoguName)}" aria-label="洛谷用户名" />
-      <button>绑定</button>
-      <button type="button" class="ghost" data-action="reset-id">重置密钥</button>
-    </form>
+    <div class="user-area">
+      <button class="user-button" data-action="toggle-user-menu">${escapeHtml(cpSession?.luoguName ?? identity.luoguName)}</button>
+      ${
+        userMenuOpen
+          ? `<div class="user-menu">
+              <button data-action="sync-now">立即同步</button>
+              <button data-action="reset-id">重置本机密钥</button>
+              <button data-action="logout">登出</button>
+            </div>`
+          : ""
+      }
+    </div>
   </header>
   ${content}
 `;
 
 const renderHome = () => `
   <main class="home-grid">
-    <section class="panel">
-      <h2>公共聊天室</h2>
+    <section class="panel chat-panel">
+      <div class="panel-title">
+        <span>公共聊天室</span>
+        <small>API 轮询同步</small>
+      </div>
       ${renderChat()}
     </section>
     <section class="stack">
-      <div class="panel">
-        <h2>创建房间</h2>
+      <div class="panel hero-panel">
+        <div>
+          <p class="eyebrow">LOCKOUT MATCH</p>
+          <h1>创建一场洛谷抢分对决</h1>
+          <p class="lead">生成题目、邀请队友、准备后自动开局。所有房间状态通过云变量事件日志同步。</p>
+        </div>
         <form class="create-form" data-action="create-room">
           <label>题目数量 <input type="number" name="count" min="3" max="21" value="9" /></label>
-          <label>手动题号 <textarea name="manual" placeholder="留空则随机，如 P1000 P1001"></textarea></label>
-          <button>创建 Lockout 房间</button>
+          <label>手动题号 <textarea name="manual" placeholder="留空则随机，例如 P1000 P1001"></textarea></label>
+          <button class="primary">创建房间</button>
         </form>
       </div>
       <div class="panel">
-        <h2>历史对局</h2>
+        <div class="panel-title">
+          <span>历史对局</span>
+          <small>本地记录</small>
+        </div>
         ${renderHistory()}
       </div>
     </section>
@@ -248,8 +366,8 @@ const renderHome = () => `
 const renderLobby = () => `
   <main class="lobby">
     <section class="panel">
-      <div class="section-head">
-        <h2>准备室</h2>
+      <div class="panel-title">
+        <span>准备室</span>
         <button data-action="copy-link">复制邀请链接</button>
       </div>
       <div class="teams">
@@ -259,12 +377,15 @@ const renderLobby = () => `
       <div class="actions">
         <button data-action="team" data-team="red">加入红方</button>
         <button data-action="team" data-team="blue">加入蓝方</button>
-        <button data-action="ready">${state.players[identity.id]?.ready ? "取消准备" : "准备就绪"}</button>
+        <button class="primary" data-action="ready">${state.players[identity.id]?.ready ? "取消准备" : "准备就绪"}</button>
       </div>
       <p class="muted">所有人准备，且红蓝双方都有人后，会自动进入对决页。</p>
     </section>
     <section class="panel">
-      <h2>题目池</h2>
+      <div class="panel-title">
+        <span>题目池</span>
+        <small>${state.problems.length} 题</small>
+      </div>
       ${renderProblems(false)}
     </section>
   </main>
@@ -286,13 +407,19 @@ const renderArena = () => `
       </div>
       ${renderVotes()}
     </section>
-    <section class="panel">
-      <h2>房间通讯</h2>
+    <section class="panel chat-panel">
+      <div class="panel-title">
+        <span>房间通讯</span>
+        <small>/ 开头为队内</small>
+      </div>
       ${renderChat()}
       <div class="system-flow">${state.system.slice(-10).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}</div>
     </section>
     <section class="panel">
-      <h2>实时提交实况</h2>
+      <div class="panel-title">
+        <span>实时提交实况</span>
+        <small>${state.feed.length} 条</small>
+      </div>
       ${renderFeed()}
     </section>
   </main>
