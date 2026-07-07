@@ -174,8 +174,8 @@ th {
 
 .user-button {
   min-width: 150px;
-  border-color: #244a9b;
-  background: #244a9b;
+  border-color: #244a9b!important;
+  background: #244a9b!important;
   color: #ffffff;
   font-weight: 800;
   text-align: left;
