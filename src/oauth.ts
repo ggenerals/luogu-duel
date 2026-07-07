@@ -67,7 +67,7 @@ export const completeCpOAuthLogin = async (): Promise<string | null> => {
     throw new Error("CP OAuth 回调校验失败");
   }
 
-  const tokenResponse = await fetch(new URL("/oauth/token", oauthBase), {
+  const tokenResponse = await fetch(new URL("/api/oauth/token", oauthBase), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -81,7 +81,7 @@ export const completeCpOAuthLogin = async (): Promise<string | null> => {
   if (!tokenResponse.ok) throw new Error(`CP OAuth token failed: ${tokenResponse.status}`);
   const token = (await tokenResponse.json()) as OAuthTokenResponse;
 
-  const userResponse = await fetch(new URL("/oauth/userinfo", oauthBase), {
+  const userResponse = await fetch(new URL("/api/oauth/userinfo", oauthBase), {
     headers: { authorization: `Bearer ${token.access_token}` }
   });
   if (!userResponse.ok) throw new Error(`CP OAuth userinfo failed: ${userResponse.status}`);
