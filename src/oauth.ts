@@ -1,5 +1,6 @@
 const clientId = "85694b6a-9167-48dc-9e00-343d23d826ef";
 const oauthBase = "https://www.cpoauth.com";
+const oauthProxy = "https://oauth.gengen.qzz.io/";
 const scope = "openid profile link:luogu";
 const verifierKey = "luogu-duel.oauth.verifier";
 const stateKey = "luogu-duel.oauth.state";
@@ -67,6 +68,14 @@ export const completeCpOAuthLogin = async (): Promise<string | null> => {
     throw new Error("CP OAuth 回调校验失败");
   }
 
+  if (oauthProxy) {
+    const luoguName = await completeViaProxy(code, verifier);
+    cleanupOAuthStorage();
+    history.replaceState(null, "", returnTo);
+    if (luoguName) saveCpSession(luoguName);
+    return luoguName;
+  }
+
   const tokenResponse = await fetch(new URL("/api/oauth/token", oauthBase), {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -87,13 +96,27 @@ export const completeCpOAuthLogin = async (): Promise<string | null> => {
   if (!userResponse.ok) throw new Error(`CP OAuth userinfo failed: ${userResponse.status}`);
   const userInfo = (await userResponse.json()) as UserInfo;
 
-  sessionStorage.removeItem(verifierKey);
-  sessionStorage.removeItem(stateKey);
-  sessionStorage.removeItem(returnKey);
+  cleanupOAuthStorage();
   history.replaceState(null, "", returnTo);
   const luoguName = extractLuoguName(userInfo);
   if (luoguName) saveCpSession(luoguName);
   return luoguName;
+};
+
+const completeViaProxy = async (code: string, codeVerifier: string): Promise<string | null> => {
+  const response = await fetch(oauthProxy, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      code,
+      code_verifier: codeVerifier,
+      redirect_uri: redirectUri(),
+      client_id: clientId
+    })
+  });
+  if (!response.ok) throw new Error(`CP OAuth proxy failed: ${response.status}`);
+  const data = (await response.json()) as { luoguName?: string; username?: string; userinfo?: UserInfo };
+  return data.luoguName || data.username || (data.userinfo ? extractLuoguName(data.userinfo) : null);
 };
 
 export const loadCpSession = (): CpSession | null => {
@@ -109,6 +132,10 @@ export const saveCpSession = (luoguName: string): CpSession => {
 
 export const logoutCpSession = () => {
   localStorage.removeItem(sessionKey);
+  cleanupOAuthStorage();
+};
+
+const cleanupOAuthStorage = () => {
   sessionStorage.removeItem(verifierKey);
   sessionStorage.removeItem(stateKey);
   sessionStorage.removeItem(returnKey);

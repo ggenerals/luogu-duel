@@ -33,13 +33,22 @@ let dirtyEventIds = new Set<string>();
 let statusText = "正在初始化";
 let cpSession: CpSession | null = null;
 let userMenuOpen = false;
+let authErrorText = "";
 
 const storageKey = () => `luogu-duel.log.${roomId}`;
 const historyKey = "luogu-duel.history.v1";
 
 const boot = async () => {
   identity = await loadIdentity();
+  window.addEventListener("hashchange", enterFromHash);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void pullApiSnapshot("页面恢复");
+  });
+  app.addEventListener("click", handleClick);
+  app.addEventListener("submit", handleSubmit);
+
   let oauthLuoguName: string | null = null;
+  let oauthFailed = false;
   try {
     oauthLuoguName = await completeCpOAuthLogin();
     if (oauthLuoguName) {
@@ -47,11 +56,22 @@ const boot = async () => {
       statusText = `已通过 CP OAuth 绑定 ${oauthLuoguName}`;
     }
   } catch (error) {
-    statusText = error instanceof Error ? error.message : "CP OAuth 登录失败";
+    authErrorText = error instanceof Error ? error.message : "CP OAuth 登录失败";
+    statusText = authErrorText;
+    oauthFailed = true;
   }
   cpSession = loadCpSession();
+  if (!cpSession && oauthFailed) {
+    renderAuthGate();
+    return;
+  }
   if (!cpSession && location.pathname !== "/callback") {
     await startCpOAuthLogin();
+    return;
+  }
+  if (!cpSession) {
+    authErrorText = "CP OAuth 未能完成登录";
+    renderAuthGate();
     return;
   }
   if (cpSession) {
@@ -61,12 +81,6 @@ const boot = async () => {
   if (oauthLuoguName) {
     await emit({ ...baseEvent("player.joined"), luoguName: oauthLuoguName, team: state.players[identity.id]?.team ?? pickTeam() });
   }
-  window.addEventListener("hashchange", enterFromHash);
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) void pullApiSnapshot("页面恢复");
-  });
-  app.addEventListener("click", handleClick);
-  app.addEventListener("submit", handleSubmit);
   render();
 };
 
@@ -305,6 +319,21 @@ const render = () => {
     return;
   }
   app.innerHTML = shell(state.phase === "arena" || state.phase === "finished" ? renderArena() : renderLobby());
+};
+
+const renderAuthGate = () => {
+  app.innerHTML = `
+    <main class="auth-gate">
+      <section class="panel auth-card">
+        <p class="eyebrow">CP OAUTH</p>
+        <h1>登录没有完成</h1>
+        <p class="lead">${escapeHtml(authErrorText || "需要通过 CP OAuth 绑定洛谷用户名后继续。")}</p>
+        <div class="actions">
+          <button class="primary" data-action="oauth-login">重新登录</button>
+        </div>
+      </section>
+    </main>
+  `;
 };
 
 const shell = (content: string) => `

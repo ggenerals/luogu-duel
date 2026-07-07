@@ -210,6 +210,17 @@ th {
   padding: 16px;
 }
 
+.auth-gate {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+}
+
+.auth-card {
+  width: min(560px, 100%);
+}
+
 .home-grid {
   grid-template-columns: minmax(300px, 0.9fr) minmax(440px, 1.8fr);
   grid-template-rows: minmax(0, 1fr);
