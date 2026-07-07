@@ -27,8 +27,7 @@ export const fetchLuoguRecords = async (pid: string, users: string[]): Promise<F
   url.searchParams.set("pid", pid);
   url.searchParams.set("_contentOnly", "1");
 
-  const response = await fetch(url, {
-    credentials: "include",
+  const response = await fetch(`https://jiashu.1win.eu.org/${url.toString()}`, {
     headers: { accept: "application/json" }
   });
   if (!response.ok) throw new Error(`Luogu records request failed: ${response.status}`);

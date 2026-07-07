@@ -239,7 +239,7 @@ th {
 .panel {
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   border: 1px solid #dce2ea;
   border-radius: 8px;
   background: #ffffff;
@@ -415,6 +415,23 @@ tr.blue {
   padding: 12px;
 }
 
+.table-scroll {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #e0e5ec;
+  border-radius: 8px;
+}
+
+.table-scroll table th,
+.table-scroll table td {
+  white-space: nowrap;
+}
+
+.problem-scroll,
+.feed-scroll {
+  flex: 1;
+}
+
 .chat-log p,
 .system-flow p {
   margin: 0 0 10px;
@@ -484,6 +501,16 @@ tr.blue {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.lobby > .panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.lobby .table-scroll {
+  flex: 1;
 }
 
 @media (max-width: 1080px) {

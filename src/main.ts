@@ -173,7 +173,10 @@ const pullApiSnapshot = async (reason: string) => {
         added += 1;
       }
     }
-    dirtyEventIds = new Set([...dirtyEventIds].filter((id) => !remoteIds.has(id)));
+    dirtyEventIds = new Set([
+      ...[...dirtyEventIds].filter((id) => !remoteIds.has(id)),
+      ...envelopes.filter((item) => item.event.roomId === roomId && !remoteIds.has(item.event.id)).map((item) => item.event.id)
+    ]);
     if (dirtyEventIds.size > 0) scheduleApiSave(900);
     statusText = added > 0 ? `${reason}：合并 ${added} 条事件` : `${reason}：已是最新`;
   } catch (error) {
@@ -230,10 +233,11 @@ const handleSubmit = async (event: SubmitEvent) => {
     const raw = String(data.get("message") || "").trim();
     if (!raw) return;
     form.reset();
+    const teamMessage = roomId !== "global" && raw.startsWith("/");
     await emit({
       ...baseEvent("chat.sent"),
-      text: raw.startsWith("/") ? raw.slice(1).trim() : raw,
-      visibility: raw.startsWith("/") ? "team" : "all"
+      text: teamMessage ? raw.slice(1).trim() : raw,
+      visibility: teamMessage ? "team" : "all"
     });
   }
 };
@@ -314,11 +318,73 @@ const startJudgeLoop = () => {
 };
 
 const render = () => {
+  const uiState = captureUiState();
   if (roomId === "global") {
     app.innerHTML = shell(renderHome());
+    restoreUiState(uiState);
     return;
   }
   app.innerHTML = shell(state.phase === "arena" || state.phase === "finished" ? renderArena() : renderLobby());
+  restoreUiState(uiState);
+};
+
+type UiState = {
+  field?: {
+    formAction?: string;
+    name: string;
+    value: string;
+    selectionStart: number | null;
+    selectionEnd: number | null;
+  };
+  scrolls: Array<{
+    key: string;
+    top: number;
+    left: number;
+    atBottom: boolean;
+  }>;
+};
+
+const captureUiState = (): UiState => {
+  const active = document.activeElement;
+  const field =
+    active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement
+      ? {
+          formAction: active.closest("form")?.dataset.action,
+          name: active.name,
+          value: active.value,
+          selectionStart: active.selectionStart,
+          selectionEnd: active.selectionEnd
+        }
+      : undefined;
+
+  const scrolls = [...app.querySelectorAll<HTMLElement>("[data-scroll-key]")].map((element) => ({
+    key: element.dataset.scrollKey || "",
+    top: element.scrollTop,
+    left: element.scrollLeft,
+    atBottom: element.scrollHeight - element.clientHeight - element.scrollTop < 12
+  }));
+
+  return { field, scrolls };
+};
+
+const restoreUiState = (uiState: UiState) => {
+  for (const scroll of uiState.scrolls) {
+    const element = app.querySelector<HTMLElement>(`[data-scroll-key="${scroll.key}"]`);
+    if (!element) continue;
+    element.scrollTop = scroll.atBottom ? element.scrollHeight : scroll.top;
+    element.scrollLeft = scroll.left;
+  }
+
+  const field = uiState.field;
+  if (!field?.name) return;
+  const formSelector = field.formAction ? `form[data-action="${field.formAction}"] ` : "";
+  const element = app.querySelector<HTMLInputElement | HTMLTextAreaElement>(`${formSelector}[name="${field.name}"]`);
+  if (!element) return;
+  element.value = field.value;
+  element.focus();
+  if (field.selectionStart !== null && field.selectionEnd !== null) {
+    element.setSelectionRange(field.selectionStart, field.selectionEnd);
+  }
 };
 
 const renderAuthGate = () => {
@@ -415,7 +481,7 @@ const renderLobby = () => `
         <span>题目池</span>
         <small>${state.problems.length} 题</small>
       </div>
-      ${renderProblems(false)}
+      <div class="table-scroll" data-scroll-key="lobby-problems">${renderProblems(false)}</div>
     </section>
   </main>
 `;
@@ -429,7 +495,7 @@ const renderArena = () => `
         <strong class="blue">蓝 ${scoreOf(state, "blue")}</strong>
       </div>
       ${state.winner ? `<div class="result">${state.winner === "draw" ? "平局" : `${state.winner === "red" ? "红方" : "蓝方"}获胜`}</div>` : ""}
-      ${renderProblems(true)}
+      <div class="table-scroll problem-scroll" data-scroll-key="arena-problems">${renderProblems(true)}</div>
       <div class="actions">
         <button data-action="vote-surrender">投降</button>
         <button data-action="vote-draw">平局</button>
@@ -442,14 +508,14 @@ const renderArena = () => `
         <small>/ 开头为队内</small>
       </div>
       ${renderChat()}
-      <div class="system-flow">${state.system.slice(-10).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}</div>
+      <div class="system-flow" data-scroll-key="system">${state.system.slice(-10).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}</div>
     </section>
     <section class="panel">
       <div class="panel-title">
         <span>实时提交实况</span>
         <small>${state.feed.length} 条</small>
       </div>
-      ${renderFeed()}
+      <div class="table-scroll feed-scroll" data-scroll-key="feed">${renderFeed()}</div>
     </section>
   </main>
 `;
@@ -492,8 +558,8 @@ const renderProblems = (withActions: boolean) => `
 `;
 
 const renderChat = () => `
-  <div class="chat-log">
-    ${visibleChats(state, identity.id)
+  <div class="chat-log" data-scroll-key="chat">
+    ${(roomId === "global" ? state.chats.filter((chat) => chat.visibility === "all") : visibleChats(state, identity.id))
       .slice(-80)
       .map(
         (chat) => `
@@ -505,7 +571,7 @@ const renderChat = () => `
       .join("")}
   </div>
   <form class="chat-form" data-action="chat">
-    <input name="message" placeholder="输入消息，/ 开头为队内私聊" />
+    <input name="message" placeholder="${roomId === "global" ? "输入公共消息" : "输入消息，/ 开头为队内私聊"}" />
     <button>发送</button>
   </form>
 `;
