@@ -4,6 +4,7 @@ import type {
   DuelState,
   FeedRecord,
   JudgeStatus,
+  ModerationRecord,
   Player,
   Problem,
   Seat,
@@ -39,6 +40,8 @@ export type SystemChatCommand =
   | { kind: "judge.recordSeen"; record: FeedRecord }
   | { kind: "player.muted"; targetId: string }
   | { kind: "player.unmuted"; targetId: string }
+  | { kind: "player.kicked"; targetId: string; reason: string }
+  | { kind: "player.unkicked"; targetName: string }
   | { kind: "room.closed"; reason: string };
 
 export const encodeSystemChatCommand = (command: SystemChatCommand): string =>
@@ -54,6 +57,8 @@ export const createInitialState = (roomId: string): DuelState => ({
   votes: {},
   system: [],
   muted: {},
+  kicked: {},
+  banned: {},
   lamport: 0
 });
 
@@ -106,20 +111,26 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
 
     case "player.joined":
       {
-        const team = next.phase === "lobby" ? event.team : "spectator";
-      next.players[event.actorId] = {
-        id: event.actorId,
-        luoguName: event.luoguName.trim() || shortId(event.actorId),
-        team,
-        ready: team === "spectator" ? false : (next.players[event.actorId]?.ready ?? false),
-        online: true
-      };
-      next.system.push(`[系统] ${event.luoguName} 加入 ${teamName(team)}。`);
+        const banned = next.banned[normalizeName(event.luoguName)];
+        const team = banned || next.phase !== "lobby" ? "spectator" : event.team;
+        next.players[event.actorId] = {
+          id: event.actorId,
+          luoguName: event.luoguName.trim() || shortId(event.actorId),
+          team,
+          ready: team === "spectator" ? false : (next.players[event.actorId]?.ready ?? false),
+          online: !banned
+        };
+        if (banned) {
+          next.kicked[event.actorId] = banned;
+          next.system.push(`[系统] 已阻止被封禁用户 ${event.luoguName} 加入：${banned.reason}`);
+        } else {
+          next.system.push(`[系统] ${event.luoguName} 加入 ${teamName(team)}。`);
+        }
       }
       break;
 
     case "player.teamChanged":
-      if (next.players[event.actorId] && next.phase === "lobby") {
+      if (next.players[event.actorId] && next.phase === "lobby" && !isRestricted(next, event.actorId)) {
         next.players[event.actorId].team = event.team;
         next.players[event.actorId].ready = false;
         next.system.push(`[系统] ${nameOf(next, event.actorId)} 切换到 ${teamName(event.team)}。`);
@@ -127,7 +138,7 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
       break;
 
     case "player.readyChanged":
-      if (next.players[event.actorId] && next.phase === "lobby" && isTeam(next.players[event.actorId].team)) {
+      if (next.players[event.actorId] && next.phase === "lobby" && isTeam(next.players[event.actorId].team) && !isRestricted(next, event.actorId)) {
         next.players[event.actorId].ready = event.ready;
       }
       break;
@@ -190,7 +201,8 @@ export const visibleChats = (state: DuelState, viewerId: string): ChatMessage[] 
   return state.chats.filter((chat) => chat.visibility === "all" || (isTeam(viewer?.team) && chat.team === viewer.team));
 };
 
-export const participants = (state: DuelState): Player[] => Object.values(state.players).filter((player) => isTeam(player.team));
+export const participants = (state: DuelState): Player[] =>
+  Object.values(state.players).filter((player) => isTeam(player.team) && !isRestricted(state, player.id));
 
 export const participantIds = (state: DuelState): string[] =>
   participants(state)
@@ -256,12 +268,14 @@ const cloneState = (state: DuelState): DuelState => ({
   ),
   system: [...state.system],
   muted: { ...state.muted },
+  kicked: cloneModerationMap(state.kicked),
+  banned: cloneModerationMap(state.banned),
   closed: state.closed ? { ...state.closed } : undefined
 });
 
 const pushChat = (state: DuelState, event: Extract<DuelEvent, { type: "chat.sent" }>) => {
   const player = state.players[event.actorId];
-  if (state.muted[event.actorId]) return;
+  if (state.muted[event.actorId] || isRestricted(state, event.actorId)) return;
   if (!player || event.text.trim().length === 0) return;
   state.chats.push({
     id: event.id,
@@ -287,26 +301,32 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
       return true;
     case "player.joined":
       {
-        const team = state.phase === "lobby" ? command.team : "spectator";
-      state.players[event.actorId] = {
-        id: event.actorId,
-        luoguName: command.luoguName.trim() || shortId(event.actorId),
-        team,
-        ready: team === "spectator" ? false : (state.players[event.actorId]?.ready ?? false),
-        online: true
-      };
-      state.system.push(`[系统] ${command.luoguName} 加入 ${teamName(team)}。`);
+        const banned = state.banned[normalizeName(command.luoguName)];
+        const team = banned || state.phase !== "lobby" ? "spectator" : command.team;
+        state.players[event.actorId] = {
+          id: event.actorId,
+          luoguName: command.luoguName.trim() || shortId(event.actorId),
+          team,
+          ready: team === "spectator" ? false : (state.players[event.actorId]?.ready ?? false),
+          online: !banned
+        };
+        if (banned) {
+          state.kicked[event.actorId] = banned;
+          state.system.push(`[系统] 已阻止被封禁用户 ${command.luoguName} 加入：${banned.reason}`);
+        } else {
+          state.system.push(`[系统] ${command.luoguName} 加入 ${teamName(team)}。`);
+        }
       }
       return true;
     case "player.teamChanged":
-      if (state.players[event.actorId] && state.phase === "lobby") {
+      if (state.players[event.actorId] && state.phase === "lobby" && !isRestricted(state, event.actorId)) {
         state.players[event.actorId].team = command.team;
         state.players[event.actorId].ready = false;
         state.system.push(`[系统] ${nameOf(state, event.actorId)} 切换到 ${teamName(command.team)}。`);
       }
       return true;
     case "player.readyChanged":
-      if (state.players[event.actorId] && state.phase === "lobby" && isTeam(state.players[event.actorId].team)) {
+      if (state.players[event.actorId] && state.phase === "lobby" && isTeam(state.players[event.actorId].team) && !isRestricted(state, event.actorId)) {
         state.players[event.actorId].ready = command.ready;
       }
       return true;
@@ -342,6 +362,38 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
         state.system.push(`[系统] 管理员已解除 ${nameOf(state, command.targetId)} 的禁言。`);
       }
       return true;
+    case "player.kicked":
+      if (isAdminName(nameOf(state, event.actorId))) {
+        const target = state.players[command.targetId];
+        if (target && !isAdminName(target.luoguName)) {
+          const record: ModerationRecord = {
+            reason: command.reason.trim() || "管理员移出房间",
+            by: nameOf(state, event.actorId),
+            at: event.issuedAt
+          };
+          state.kicked[target.id] = record;
+          state.banned[normalizeName(target.luoguName)] = record;
+          target.team = "spectator";
+          target.ready = false;
+          target.online = false;
+          delete state.muted[target.id];
+          state.system.push(`[系统] 管理员已踢出并封禁 ${target.luoguName}：${record.reason}`);
+        }
+      }
+      return true;
+    case "player.unkicked":
+      if (isAdminName(nameOf(state, event.actorId))) {
+        const normalizedTarget = normalizeName(command.targetName);
+        delete state.banned[normalizedTarget];
+        for (const player of Object.values(state.players)) {
+          if (normalizeName(player.luoguName) === normalizedTarget) {
+            delete state.kicked[player.id];
+            player.online = true;
+          }
+        }
+        state.system.push(`[系统] 管理员已取消封禁 ${command.targetName}。`);
+      }
+      return true;
     case "room.closed":
       if (isAdminName(nameOf(state, event.actorId))) {
         state.phase = "finished";
@@ -367,7 +419,7 @@ const openVote = (
   createdAt: number,
   actorId: string
 ) => {
-  if (!isTeam(state.players[actorId]?.team) || state.votes[voteInput.id]) return;
+  if (!isTeam(state.players[actorId]?.team) || isRestricted(state, actorId) || state.votes[voteInput.id]) return;
   const vote: Vote = {
     ...voteInput,
     approvals: { [actorId]: true },
@@ -515,4 +567,11 @@ const isTeam = (team: Seat | undefined): team is Team => team === "red" || team 
 const isAdminName = (name: string): boolean => adminNames.has(name);
 const teamName = (team: Seat): string => (team === "red" ? "红方" : team === "blue" ? "蓝方" : "观赛席");
 const nameOf = (state: DuelState, id: string): string => state.players[id]?.luoguName ?? shortId(id);
+const normalizeName = (name: string): string => name.trim().toLowerCase();
+const isRestricted = (state: DuelState, id: string): boolean => {
+  const player = state.players[id];
+  return Boolean(state.kicked[id] || (player && state.banned[normalizeName(player.luoguName)]));
+};
+const cloneModerationMap = (map: Record<string, ModerationRecord>): Record<string, ModerationRecord> =>
+  Object.fromEntries(Object.entries(map).map(([key, value]) => [key, { ...value }]));
 const shortId = (id: string): string => id.slice(0, 6);

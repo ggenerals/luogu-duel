@@ -13,9 +13,17 @@ export type Player = {
   online: boolean;
 };
 
+export type ModerationRecord = {
+  reason: string;
+  by: string;
+  at: number;
+};
+
 export type Problem = {
   pid: string;
   score: number;
+  title?: string;
+  difficulty?: number;
   solvedBy?: {
     team: Team;
     playerId: string;
@@ -66,6 +74,8 @@ export type DuelState = {
     at: number;
   };
   muted: Record<string, true>;
+  kicked: Record<string, ModerationRecord>;
+  banned: Record<string, ModerationRecord>;
   players: Record<string, Player>;
   problems: Problem[];
   chats: ChatMessage[];
