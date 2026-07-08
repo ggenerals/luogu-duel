@@ -23,6 +23,22 @@ const statusRank: Record<JudgeStatus, number> = {
   PD: 8
 };
 
+export const SYSTEM_CHAT_PREFIX = "@@luogu-duel-system:";
+
+export type SystemChatCommand =
+  | { kind: "room.configured"; problems: Problem[] }
+  | { kind: "player.joined"; luoguName: string; team: Team }
+  | { kind: "player.teamChanged"; team: Team }
+  | { kind: "player.readyChanged"; ready: boolean }
+  | { kind: "game.started" }
+  | { kind: "vote.opened"; vote: Omit<Vote, "approvals" | "rejections" | "status" | "createdAt"> }
+  | { kind: "vote.cast"; voteId: string; approve: boolean }
+  | { kind: "vote.cancelled"; voteId: string }
+  | { kind: "judge.recordSeen"; record: FeedRecord };
+
+export const encodeSystemChatCommand = (command: SystemChatCommand): string =>
+  `${SYSTEM_CHAT_PREFIX}${encodeURIComponent(JSON.stringify(command))}`;
+
 export const createInitialState = (roomId: string): DuelState => ({
   roomId,
   phase: roomId === "global" ? "home" : "lobby",
@@ -115,6 +131,7 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
       break;
 
     case "chat.sent":
+      if (applySystemChatCommand(next, event)) break;
       pushChat(next, event);
       break;
 
@@ -237,6 +254,70 @@ const pushChat = (state: DuelState, event: Extract<DuelEvent, { type: "chat.sent
     text: event.text.trim().slice(0, 500),
     at: event.issuedAt
   });
+};
+
+const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { type: "chat.sent" }>): boolean => {
+  const command = decodeSystemChatCommand(event.text);
+  if (!command) return false;
+
+  switch (command.kind) {
+    case "room.configured":
+      if (state.problems.length === 0 && command.problems.length > 0) {
+        state.problems = command.problems.map((p) => ({ ...p }));
+        state.system.push(`[系统] 房间题目已生成，共 ${command.problems.length} 题。`);
+      }
+      return true;
+    case "player.joined":
+      state.players[event.actorId] = {
+        id: event.actorId,
+        luoguName: command.luoguName.trim() || shortId(event.actorId),
+        team: command.team,
+        ready: state.players[event.actorId]?.ready ?? false,
+        online: true
+      };
+      state.system.push(`[系统] ${command.luoguName} 加入 ${teamName(command.team)}。`);
+      return true;
+    case "player.teamChanged":
+      if (state.players[event.actorId] && state.phase === "lobby") {
+        state.players[event.actorId].team = command.team;
+        state.players[event.actorId].ready = false;
+        state.system.push(`[系统] ${nameOf(state, event.actorId)} 切换到 ${teamName(command.team)}。`);
+      }
+      return true;
+    case "player.readyChanged":
+      if (state.players[event.actorId] && state.phase === "lobby") {
+        state.players[event.actorId].ready = command.ready;
+      }
+      return true;
+    case "game.started":
+      if (canStart(state)) {
+        state.phase = "arena";
+        state.system.push(`[系统] ${matchTitle(state)} 对决开始。`);
+      }
+      return true;
+    case "vote.opened":
+      openVote(state, command.vote, event.issuedAt, event.actorId);
+      return true;
+    case "vote.cast":
+      castVote(state, command.voteId, event.actorId, command.approve);
+      return true;
+    case "vote.cancelled":
+      cancelVote(state, command.voteId, event.actorId);
+      return true;
+    case "judge.recordSeen":
+      pushFeed(state, command.record);
+      claimIfAccepted(state, command.record, event.id);
+      return true;
+  }
+};
+
+const decodeSystemChatCommand = (text: string): SystemChatCommand | null => {
+  if (!text.startsWith(SYSTEM_CHAT_PREFIX)) return null;
+  try {
+    return JSON.parse(decodeURIComponent(text.slice(SYSTEM_CHAT_PREFIX.length))) as SystemChatCommand;
+  } catch {
+    return null;
+  }
 };
 
 const openVote = (

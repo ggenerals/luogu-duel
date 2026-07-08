@@ -5,12 +5,14 @@ import {
   canStart,
   createInitialState,
   createReplacementProblem,
+  encodeSystemChatCommand,
   makeProblemSet,
   scoreOf,
   visibleChats,
-  winThreshold
+  winThreshold,
+  type SystemChatCommand
 } from "./domain";
-import { loadCloudSnapshot, saveCloudSnapshot } from "./cloudStore";
+import { deleteCloudSnapshot, loadCloudSnapshot, saveCloudSnapshot } from "./cloudStore";
 import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope, type LocalIdentity } from "./identity";
 import { fetchLuoguRecords } from "./luogu";
 import { completeCpOAuthLogin, loadCpSession, logoutCpSession, startCpOAuthLogin, type CpSession } from "./oauth";
@@ -34,6 +36,8 @@ let statusText = "正在初始化";
 let cpSession: CpSession | null = null;
 let userMenuOpen = false;
 let authErrorText = "";
+let cleanupTimer: number | undefined;
+let cleanupKey = "";
 
 const storageKey = () => `luogu-duel.log.${roomId}`;
 const historyKey = "luogu-duel.history.v1";
@@ -79,7 +83,7 @@ const boot = async () => {
   }
   await enterFromHash();
   if (oauthLuoguName) {
-    await emit({ ...baseEvent("player.joined"), luoguName: oauthLuoguName, team: state.players[identity.id]?.team ?? pickTeam() });
+    await emitCommand({ kind: "player.joined", luoguName: oauthLuoguName, team: state.players[identity.id]?.team ?? pickTeam() });
   }
   render();
 };
@@ -90,6 +94,9 @@ const enterFromHash = async () => {
   roomSecret = params.get("secret") || (roomId === "global" ? "public-lobby" : "public-room");
 
   stopApiSync();
+  if (cleanupTimer) window.clearTimeout(cleanupTimer);
+  cleanupTimer = undefined;
+  cleanupKey = "";
   envelopes = loadLog();
   state = applyEvents(roomId, envelopes.map((item) => item.event));
   dirtyEventIds = new Set();
@@ -103,9 +110,15 @@ const enterFromHash = async () => {
 };
 
 const ensureJoined = async () => {
-  if (envelopes.some((item) => item.event.type === "player.joined" && item.event.actorId === identity.id)) return;
-  await emit({
-    ...baseEvent("player.joined"),
+  const alreadyJoined = envelopes.some(
+    (item) =>
+      item.event.actorId === identity.id &&
+      (item.event.type === "player.joined" ||
+        (item.event.type === "chat.sent" && item.event.text.includes('"kind":"player.joined"')))
+  );
+  if (alreadyJoined) return;
+  await emitCommand({
+    kind: "player.joined",
     luoguName: identity.luoguName,
     team: pickTeam()
   });
@@ -118,6 +131,14 @@ const emit = async (event: DuelEvent) => {
   scheduleApiSave(350);
 };
 
+const emitChat = async (text: string, visibility: "all" | "team") => {
+  await emit({ ...baseEvent("chat.sent"), text, visibility });
+};
+
+const emitCommand = async (command: SystemChatCommand) => {
+  await emitChat(encodeSystemChatCommand(command), "all");
+};
+
 const receiveEnvelope = async (envelope: SignedEnvelope) => {
   if (envelopes.some((item) => item.event.id === envelope.event.id)) return;
   if (!(await verifyEnvelope(envelope))) return;
@@ -125,6 +146,7 @@ const receiveEnvelope = async (envelope: SignedEnvelope) => {
   saveLog();
   state = applyEvents(roomId, envelopes.map((item) => item.event));
   saveHistory();
+  scheduleCleanupIfFinished();
   render();
   maybeAutoStart();
 };
@@ -140,8 +162,8 @@ const baseEvent = <T extends DuelEvent["type"]>(type: T) => ({
 
 const maybeAutoStart = async () => {
   if (!canStart(state)) return;
-  if (envelopes.some((item) => item.event.type === "game.started")) return;
-  await emit(baseEvent("game.started") as DuelEvent);
+  if (envelopes.some((item) => item.event.type === "game.started" || (item.event.type === "chat.sent" && item.event.text.includes('"kind":"game.started"')))) return;
+  await emitCommand({ kind: "game.started" });
 };
 
 const startApiSync = () => {
@@ -207,6 +229,24 @@ const flushApiSave = async () => {
   render();
 };
 
+const scheduleCleanupIfFinished = () => {
+  if (roomId === "global" || state.phase !== "finished") return;
+  const key = cloudKey();
+  if (cleanupTimer && cleanupKey === key) return;
+  if (cleanupTimer) window.clearTimeout(cleanupTimer);
+  cleanupKey = key;
+  cleanupTimer = window.setTimeout(async () => {
+    try {
+      await deleteCloudSnapshot(key);
+      statusText = "对局已结束，云端房间快照已删除";
+      render();
+    } catch (error) {
+      statusText = error instanceof Error ? error.message : "云端房间删除失败";
+      render();
+    }
+  }, 30_000);
+};
+
 const currentPollInterval = (): number => {
   return document.hidden ? 30_000 : 10_000;
 };
@@ -226,7 +266,7 @@ const handleSubmit = async (event: SubmitEvent) => {
     const nextSecret = compactId() + compactId();
     history.pushState(null, "", `#room=${nextRoom}&secret=${nextSecret}`);
     await enterFromHash();
-    await emit({ ...baseEvent("room.configured"), problems: makeProblemSet(count, nextRoom, manual) });
+    await emitCommand({ kind: "room.configured", problems: makeProblemSet(count, nextRoom, manual) });
   }
 
   if (action === "chat") {
@@ -234,11 +274,7 @@ const handleSubmit = async (event: SubmitEvent) => {
     if (!raw) return;
     form.reset();
     const teamMessage = roomId !== "global" && raw.startsWith("/");
-    await emit({
-      ...baseEvent("chat.sent"),
-      text: teamMessage ? raw.slice(1).trim() : raw,
-      visibility: teamMessage ? "team" : "all"
-    });
+    await emitChat(teamMessage ? raw.slice(1).trim() : raw, teamMessage ? "team" : "all");
   }
 };
 
@@ -268,10 +304,10 @@ const handleClick = async (event: MouseEvent) => {
     location.reload();
   }
   if (action === "team" && button.dataset.team) {
-    await emit({ ...baseEvent("player.teamChanged"), team: button.dataset.team as Team });
+    await emitCommand({ kind: "player.teamChanged", team: button.dataset.team as Team });
   }
   if (action === "ready") {
-    await emit({ ...baseEvent("player.readyChanged"), ready: !(player?.ready ?? false) });
+    await emitCommand({ kind: "player.readyChanged", ready: !(player?.ready ?? false) });
   }
   if (action === "judge" && pid) await judgeProblem(pid);
   if (action === "vote-replace" && pid && player) {
@@ -280,15 +316,15 @@ const handleClick = async (event: MouseEvent) => {
   if (action === "vote-delete" && pid) await openVote("delete-problem", pid);
   if (action === "vote-draw") await openVote("draw");
   if (action === "vote-surrender") await openVote("surrender");
-  if (action === "vote-yes" && voteId) await emit({ ...baseEvent("vote.cast"), voteId, approve: true });
-  if (action === "vote-no" && voteId) await emit({ ...baseEvent("vote.cast"), voteId, approve: false });
-  if (action === "vote-cancel" && voteId) await emit({ ...baseEvent("vote.cancelled"), voteId });
+  if (action === "vote-yes" && voteId) await emitCommand({ kind: "vote.cast", voteId, approve: true });
+  if (action === "vote-no" && voteId) await emitCommand({ kind: "vote.cast", voteId, approve: false });
+  if (action === "vote-cancel" && voteId) await emitCommand({ kind: "vote.cancelled", voteId });
 };
 
 const openVote = async (kind: VoteKind, targetPid?: string, replacement?: Problem) => {
   const player = state.players[identity.id];
   if (!player) return;
-  await emit({ ...baseEvent("vote.opened"), vote: buildVote(kind, player, targetPid, replacement) });
+  await emitCommand({ kind: "vote.opened", vote: buildVote(kind, player, targetPid, replacement) });
 };
 
 const judgeProblem = async (pid: string) => {
@@ -298,7 +334,7 @@ const judgeProblem = async (pid: string) => {
     render();
     const records = await fetchLuoguRecords(pid, users);
     for (const record of records) {
-      await emit({ ...baseEvent("judge.recordSeen"), record });
+      await emitCommand({ kind: "judge.recordSeen", record });
     }
     statusText = records.length > 0 ? `${pid} 同步到 ${records.length} 条记录` : `${pid} 暂无参赛者提交`;
   } catch (error) {
@@ -329,13 +365,15 @@ const render = () => {
 };
 
 type UiState = {
-  field?: {
+  activeKey?: string;
+  fields: Array<{
+    key: string;
     formAction?: string;
     name: string;
     value: string;
     selectionStart: number | null;
     selectionEnd: number | null;
-  };
+  }>;
   scrolls: Array<{
     key: string;
     top: number;
@@ -346,15 +384,21 @@ type UiState = {
 
 const captureUiState = (): UiState => {
   const active = document.activeElement;
-  const field =
+  const fields = [...app.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input[name], textarea[name]")].map((element, index) => {
+    const formAction = element.closest("form")?.dataset.action;
+    const key = `${formAction || "none"}:${element.name}:${index}`;
+    return {
+      key,
+      formAction,
+      name: element.name,
+      value: element.value,
+      selectionStart: element.selectionStart,
+      selectionEnd: element.selectionEnd
+    };
+  });
+  const activeKey =
     active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement
-      ? {
-          formAction: active.closest("form")?.dataset.action,
-          name: active.name,
-          value: active.value,
-          selectionStart: active.selectionStart,
-          selectionEnd: active.selectionEnd
-        }
+      ? fields.find((field) => field.formAction === active.closest("form")?.dataset.action && field.name === active.name)?.key
       : undefined;
 
   const scrolls = [...app.querySelectorAll<HTMLElement>("[data-scroll-key]")].map((element) => ({
@@ -364,7 +408,7 @@ const captureUiState = (): UiState => {
     atBottom: element.scrollHeight - element.clientHeight - element.scrollTop < 12
   }));
 
-  return { field, scrolls };
+  return { activeKey, fields, scrolls };
 };
 
 const restoreUiState = (uiState: UiState) => {
@@ -375,16 +419,19 @@ const restoreUiState = (uiState: UiState) => {
     element.scrollLeft = scroll.left;
   }
 
-  const field = uiState.field;
-  if (!field?.name) return;
-  const formSelector = field.formAction ? `form[data-action="${field.formAction}"] ` : "";
-  const element = app.querySelector<HTMLInputElement | HTMLTextAreaElement>(`${formSelector}[name="${field.name}"]`);
-  if (!element) return;
-  element.value = field.value;
-  element.focus();
-  if (field.selectionStart !== null && field.selectionEnd !== null) {
-    element.setSelectionRange(field.selectionStart, field.selectionEnd);
-  }
+  const elements = [...app.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input[name], textarea[name]")];
+  uiState.fields.forEach((field) => {
+    const index = Number(field.key.split(":").at(-1));
+    const element = elements[index];
+    if (!element || element.name !== field.name || element.closest("form")?.dataset.action !== field.formAction) return;
+    element.value = field.value;
+    if (field.key === uiState.activeKey) {
+      element.focus();
+      if (field.selectionStart !== null && field.selectionEnd !== null) {
+        element.setSelectionRange(field.selectionStart, field.selectionEnd);
+      }
+    }
+  });
 };
 
 const renderAuthGate = () => {

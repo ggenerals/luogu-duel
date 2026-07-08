@@ -143,7 +143,7 @@ const cleanupOAuthStorage = () => {
 
 const extractLuoguName = (userInfo: UserInfo): string | null => {
   const linked = userInfo.linked_accounts?.find((account) => account.platform?.toLowerCase() === "luogu");
-  return linked?.username || linked?.name || userInfo.luogu?.username || userInfo.luogu?.name || userInfo.username || null;
+  return linked?.username || linked?.name || userInfo.luogu?.username || userInfo.luogu?.name || null;
 };
 
 const redirectUri = (): string => import.meta.env.VITE_CP_OAUTH_REDIRECT_URI || `${location.origin}/callback`;

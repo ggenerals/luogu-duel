@@ -1,4 +1,4 @@
 /.agents
 /.codex
 /node_modules
-/.dist
+/dist

@@ -22,12 +22,15 @@ const statusMap: Record<string, JudgeStatus> = {
   Accepted: "OK"
 };
 
+const recordsProxy = "https://vd.gengen.qzz.io/luogu/records";
+
 export const fetchLuoguRecords = async (pid: string, users: string[]): Promise<FeedRecord[]> => {
   const url = new URL("https://www.luogu.com.cn/record/list");
   url.searchParams.set("pid", pid);
   url.searchParams.set("_contentOnly", "1");
+  const requestUrl = recordsProxy ? `${recordsProxy}?pid=${encodeURIComponent(pid)}` : `https://jiashu.1win.eu.org/${url.toString()}`;
 
-  const response = await fetch(`https://jiashu.1win.eu.org/${url.toString()}`, {
+  const response = await fetch(requestUrl, {
     headers: { accept: "application/json" }
   });
   if (!response.ok) throw new Error(`Luogu records request failed: ${response.status}`);

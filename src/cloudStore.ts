@@ -41,6 +41,14 @@ export const saveCloudSnapshot = async (roomId: string, envelopes: SignedEnvelop
   if (!response.ok) throw new Error(`cloud set failed: ${response.status}`);
 };
 
+export const deleteCloudSnapshot = async (roomId: string): Promise<void> => {
+  const response = await fetch(`${endpoint}/del?key=${encodeURIComponent(roomKey(roomId))}`, {
+    method: "DELETE",
+    keepalive: true
+  });
+  if (!response.ok) throw new Error(`cloud delete failed: ${response.status}`);
+};
+
 const roomKey = (roomId: string): string => `${namespace}:room:${roomId}`;
 
 const unwrapValue = (text: string): string => {
