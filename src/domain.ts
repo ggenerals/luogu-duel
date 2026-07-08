@@ -6,6 +6,7 @@ import type {
   JudgeStatus,
   Player,
   Problem,
+  Seat,
   Team,
   Vote,
   VoteKind
@@ -22,19 +23,23 @@ const statusRank: Record<JudgeStatus, number> = {
   UKE: 7,
   PD: 8
 };
+const adminNames = new Set(["General826", "Gcend", "GCSG01"]);
 
 export const SYSTEM_CHAT_PREFIX = "@@luogu-duel-system:";
 
 export type SystemChatCommand =
   | { kind: "room.configured"; problems: Problem[] }
-  | { kind: "player.joined"; luoguName: string; team: Team }
-  | { kind: "player.teamChanged"; team: Team }
+  | { kind: "player.joined"; luoguName: string; team: Seat }
+  | { kind: "player.teamChanged"; team: Seat }
   | { kind: "player.readyChanged"; ready: boolean }
   | { kind: "game.started" }
   | { kind: "vote.opened"; vote: Omit<Vote, "approvals" | "rejections" | "status" | "createdAt"> }
   | { kind: "vote.cast"; voteId: string; approve: boolean }
   | { kind: "vote.cancelled"; voteId: string }
-  | { kind: "judge.recordSeen"; record: FeedRecord };
+  | { kind: "judge.recordSeen"; record: FeedRecord }
+  | { kind: "player.muted"; targetId: string }
+  | { kind: "player.unmuted"; targetId: string }
+  | { kind: "room.closed"; reason: string };
 
 export const encodeSystemChatCommand = (command: SystemChatCommand): string =>
   `${SYSTEM_CHAT_PREFIX}${encodeURIComponent(JSON.stringify(command))}`;
@@ -48,6 +53,7 @@ export const createInitialState = (roomId: string): DuelState => ({
   feed: [],
   votes: {},
   system: [],
+  muted: {},
   lamport: 0
 });
 
@@ -63,7 +69,7 @@ export const makeProblemSet = (count: number, seed: string, manualInput: string)
     .filter(Boolean);
 
   if (manual.length > 0) {
-    return manual.map((pid, index) => ({ pid, score: scoreForIndex(index) }));
+    return manual.slice(0, count).map((pid, index) => ({ pid, score: scoreForIndex(index) }));
   }
 
   const used = new Set<string>();
@@ -99,14 +105,17 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
       break;
 
     case "player.joined":
+      {
+        const team = next.phase === "lobby" ? event.team : "spectator";
       next.players[event.actorId] = {
         id: event.actorId,
         luoguName: event.luoguName.trim() || shortId(event.actorId),
-        team: event.team,
-        ready: next.players[event.actorId]?.ready ?? false,
+        team,
+        ready: team === "spectator" ? false : (next.players[event.actorId]?.ready ?? false),
         online: true
       };
-      next.system.push(`[系统] ${event.luoguName} 加入 ${teamName(event.team)}。`);
+      next.system.push(`[系统] ${event.luoguName} 加入 ${teamName(team)}。`);
+      }
       break;
 
     case "player.teamChanged":
@@ -118,7 +127,7 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
       break;
 
     case "player.readyChanged":
-      if (next.players[event.actorId] && next.phase === "lobby") {
+      if (next.players[event.actorId] && next.phase === "lobby" && isTeam(next.players[event.actorId].team)) {
         next.players[event.actorId].ready = event.ready;
       }
       break;
@@ -165,7 +174,7 @@ export const winThreshold = (state: DuelState): number =>
   Math.ceil(state.problems.reduce((sum, problem) => sum + problem.score, 0) / 2);
 
 export const canStart = (state: DuelState): boolean => {
-  const players = Object.values(state.players);
+  const players = participants(state);
   return (
     state.phase === "lobby" &&
     state.problems.length > 0 &&
@@ -178,10 +187,15 @@ export const canStart = (state: DuelState): boolean => {
 
 export const visibleChats = (state: DuelState, viewerId: string): ChatMessage[] => {
   const viewer = state.players[viewerId];
-  return state.chats.filter((chat) => chat.visibility === "all" || chat.team === viewer?.team);
+  return state.chats.filter((chat) => chat.visibility === "all" || (isTeam(viewer?.team) && chat.team === viewer.team));
 };
 
-export const participantIds = (state: DuelState): string[] => Object.keys(state.players).sort();
+export const participants = (state: DuelState): Player[] => Object.values(state.players).filter((player) => isTeam(player.team));
+
+export const participantIds = (state: DuelState): string[] =>
+  participants(state)
+    .map((player) => player.id)
+    .sort();
 
 export const requiredVoters = (state: DuelState, vote: Vote): string[] => {
   if (vote.kind === "surrender" && vote.team) {
@@ -212,7 +226,7 @@ export const buildVote = (
   id: crypto.randomUUID(),
   kind,
   proposerId: proposer.id,
-  team: kind === "surrender" ? proposer.team : undefined,
+  team: kind === "surrender" && isTeam(proposer.team) ? proposer.team : undefined,
   targetPid,
   replacement
 });
@@ -240,11 +254,14 @@ const cloneState = (state: DuelState): DuelState => ({
       }
     ])
   ),
-  system: [...state.system]
+  system: [...state.system],
+  muted: { ...state.muted },
+  closed: state.closed ? { ...state.closed } : undefined
 });
 
 const pushChat = (state: DuelState, event: Extract<DuelEvent, { type: "chat.sent" }>) => {
   const player = state.players[event.actorId];
+  if (state.muted[event.actorId]) return;
   if (!player || event.text.trim().length === 0) return;
   state.chats.push({
     id: event.id,
@@ -269,14 +286,17 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
       }
       return true;
     case "player.joined":
+      {
+        const team = state.phase === "lobby" ? command.team : "spectator";
       state.players[event.actorId] = {
         id: event.actorId,
         luoguName: command.luoguName.trim() || shortId(event.actorId),
-        team: command.team,
-        ready: state.players[event.actorId]?.ready ?? false,
+        team,
+        ready: team === "spectator" ? false : (state.players[event.actorId]?.ready ?? false),
         online: true
       };
-      state.system.push(`[系统] ${command.luoguName} 加入 ${teamName(command.team)}。`);
+      state.system.push(`[系统] ${command.luoguName} 加入 ${teamName(team)}。`);
+      }
       return true;
     case "player.teamChanged":
       if (state.players[event.actorId] && state.phase === "lobby") {
@@ -286,7 +306,7 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
       }
       return true;
     case "player.readyChanged":
-      if (state.players[event.actorId] && state.phase === "lobby") {
+      if (state.players[event.actorId] && state.phase === "lobby" && isTeam(state.players[event.actorId].team)) {
         state.players[event.actorId].ready = command.ready;
       }
       return true;
@@ -310,6 +330,25 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
       pushFeed(state, command.record);
       claimIfAccepted(state, command.record, event.id);
       return true;
+    case "player.muted":
+      if (isAdminName(nameOf(state, event.actorId)) && state.players[command.targetId] && !isAdminName(nameOf(state, command.targetId))) {
+        state.muted[command.targetId] = true;
+        state.system.push(`[系统] 管理员已禁言 ${nameOf(state, command.targetId)}。`);
+      }
+      return true;
+    case "player.unmuted":
+      if (isAdminName(nameOf(state, event.actorId)) && state.players[command.targetId]) {
+        delete state.muted[command.targetId];
+        state.system.push(`[系统] 管理员已解除 ${nameOf(state, command.targetId)} 的禁言。`);
+      }
+      return true;
+    case "room.closed":
+      if (isAdminName(nameOf(state, event.actorId))) {
+        state.phase = "finished";
+        state.closed = { reason: command.reason || "管理员关闭房间", at: event.issuedAt };
+        state.system.push(`[系统] 房间已关闭：${state.closed.reason}`);
+      }
+      return true;
   }
 };
 
@@ -328,7 +367,7 @@ const openVote = (
   createdAt: number,
   actorId: string
 ) => {
-  if (!state.players[actorId] || state.votes[voteInput.id]) return;
+  if (!isTeam(state.players[actorId]?.team) || state.votes[voteInput.id]) return;
   const vote: Vote = {
     ...voteInput,
     approvals: { [actorId]: true },
@@ -406,7 +445,7 @@ const claimIfAccepted = (state: DuelState, record: FeedRecord, eventId: string) 
   if (record.status !== "OK") return;
   const player = Object.values(state.players).find((p) => p.luoguName === record.luoguName);
   const problem = state.problems.find((p) => p.pid === record.pid);
-  if (!player || !problem) return;
+  if (!player || !problem || !isTeam(player.team)) return;
 
   const candidate = {
     team: player.team,
@@ -454,11 +493,11 @@ const seeded = (seed: string): (() => number) => {
 };
 
 const matchTitle = (state: DuelState): string => {
-  const red = Object.values(state.players)
+  const red = participants(state)
     .filter((p) => p.team === "red")
     .map((p) => p.luoguName)
     .join(" / ");
-  const blue = Object.values(state.players)
+  const blue = participants(state)
     .filter((p) => p.team === "blue")
     .map((p) => p.luoguName)
     .join(" / ");
@@ -472,6 +511,8 @@ const voteLabel = (vote: Pick<Vote, "kind" | "targetPid">): string => {
   return "投降";
 };
 
-const teamName = (team: Team): string => (team === "red" ? "红方" : "蓝方");
+const isTeam = (team: Seat | undefined): team is Team => team === "red" || team === "blue";
+const isAdminName = (name: string): boolean => adminNames.has(name);
+const teamName = (team: Seat): string => (team === "red" ? "红方" : team === "blue" ? "蓝方" : "观赛席");
 const nameOf = (state: DuelState, id: string): string => state.players[id]?.luoguName ?? shortId(id);
 const shortId = (id: string): string => id.slice(0, 6);

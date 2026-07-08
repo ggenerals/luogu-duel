@@ -1,4 +1,5 @@
 export type Team = "red" | "blue";
+export type Seat = Team | "spectator";
 export type Phase = "home" | "lobby" | "arena" | "finished";
 export type JudgeStatus = "OK" | "WA" | "TL" | "RE" | "CE" | "MLE" | "OLE" | "UKE" | "PD";
 export type VoteKind = "replace-problem" | "delete-problem" | "draw" | "surrender";
@@ -7,7 +8,7 @@ export type VoteStatus = "open" | "passed" | "rejected" | "cancelled";
 export type Player = {
   id: string;
   luoguName: string;
-  team: Team;
+  team: Seat;
   ready: boolean;
   online: boolean;
 };
@@ -28,7 +29,7 @@ export type ChatMessage = {
   id: string;
   actorId: string;
   luoguName: string;
-  team: Team;
+  team: Seat;
   visibility: "all" | "team";
   text: string;
   at: number;
@@ -60,6 +61,11 @@ export type DuelState = {
   roomId: string;
   phase: Phase;
   startedAt?: number;
+  closed?: {
+    reason: string;
+    at: number;
+  };
+  muted: Record<string, true>;
   players: Record<string, Player>;
   problems: Problem[];
   chats: ChatMessage[];
@@ -88,7 +94,7 @@ export type DuelEvent =
       lamport: number;
       issuedAt: number;
       luoguName: string;
-      team: Team;
+      team: Seat;
     }
   | {
       type: "player.teamChanged";
@@ -97,7 +103,7 @@ export type DuelEvent =
       id: string;
       lamport: number;
       issuedAt: number;
-      team: Team;
+      team: Seat;
     }
   | {
       type: "player.readyChanged";

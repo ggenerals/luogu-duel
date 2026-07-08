@@ -17,6 +17,8 @@ export type RoomListing = {
   host: string;
   createdAt: number;
   problemCount: number;
+  status?: "lobby" | "arena";
+  startedAt?: number;
 };
 
 type RoomDirectory = {
@@ -85,7 +87,7 @@ export const saveRoomDirectory = async (rooms: RoomListing[]): Promise<void> => 
     version: 1,
     savedAt: Date.now(),
     rooms: rooms
-      .filter((room) => Date.now() - room.createdAt < 2 * 60 * 60 * 1000)
+      .filter((room) => Date.now() - room.createdAt < (room.status === "arena" ? 6 : 2) * 60 * 60 * 1000)
       .slice(-60)
   };
 

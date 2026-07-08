@@ -22,7 +22,8 @@ body,
 body {
   margin: 0;
   background:
-    radial-gradient(circle at top left, rgb(49 94 209 / 0.08), transparent 300px),
+    radial-gradient(circle at top left, rgb(49 94 209 / 0.1), transparent 320px),
+    radial-gradient(circle at bottom right, rgb(194 58 50 / 0.06), transparent 360px),
     linear-gradient(180deg, #fbfcfe 0, #eef1f5 320px),
     #eef1f5;
 }
@@ -53,8 +54,8 @@ button:hover {
 }
 
 button.primary {
-  border-color: #244a9b;
-  background: #244a9b;
+  border-color: #1f4ca8;
+  background: linear-gradient(180deg, #2f63d7, #204da9);
   color: #ffffff;
   font-weight: 700;
 }
@@ -131,9 +132,9 @@ th {
   gap: 18px;
   min-height: 66px;
   border-bottom: 1px solid #dde3ea;
-  background: #ffffff;
+  background: rgb(255 255 255 / 0.96);
   padding: 10px 18px;
-  box-shadow: 0 1px 3px rgb(20 28 40 / 0.05);
+  box-shadow: 0 8px 28px rgb(20 28 40 / 0.08);
 }
 
 .brand-row,
@@ -244,11 +245,11 @@ th {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  border: 1px solid #dce2ea;
+  border: 1px solid #d8e0ea;
   border-radius: 8px;
-  background: #ffffff;
+  background: linear-gradient(180deg, #ffffff, #fbfcfe);
   padding: 16px;
-  box-shadow: 0 12px 30px rgb(26 36 54 / 0.07);
+  box-shadow: 0 14px 34px rgb(26 36 54 / 0.09);
 }
 
 .panel-title {
@@ -342,7 +343,7 @@ h3 {
 
 .teams {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 14px;
 }
@@ -397,6 +398,28 @@ h3 {
   border-left: 5px solid #2865d5;
 }
 
+.team.spectator {
+  border-left: 5px solid #7a8798;
+}
+
+.room-card em {
+  display: inline-block;
+  border: 1px solid #d8deea;
+  border-radius: 999px;
+  margin-left: 6px;
+  padding: 1px 7px;
+  color: #526174;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 850;
+}
+
+.room-card em.live {
+  border-color: #cfe0ff;
+  background: #eef5ff;
+  color: #1459c8;
+}
+
 .red {
   color: #b3261e;
 }
@@ -428,6 +451,41 @@ tr.blue {
 .scoreboard span {
   color: #536174;
   font-weight: 800;
+}
+
+.seat-badge,
+.admin-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #dce2ea;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 10px 12px;
+}
+
+.seat-badge span,
+.admin-tools span {
+  color: #69778a;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.seat-badge strong {
+  font-size: 18px;
+}
+
+.seat-badge.red {
+  border-left: 5px solid #c23a32;
+}
+
+.seat-badge.blue {
+  border-left: 5px solid #2865d5;
+}
+
+.seat-badge.spectator {
+  border-left: 5px solid #7a8798;
 }
 
 .result {
@@ -566,6 +624,39 @@ tr.blue {
   padding: 10px 0;
 }
 
+.player button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.end-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background:
+    radial-gradient(circle at 50% 30%, rgb(255 255 255 / 0.92), rgb(239 243 249 / 0.88)),
+    rgb(10 17 28 / 0.3);
+  padding: 24px;
+}
+
+.end-card {
+  width: min(560px, 100%);
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 30px;
+  text-align: center;
+  box-shadow: 0 28px 70px rgb(11 19 32 / 0.2);
+}
+
+.end-card h1 {
+  max-width: none;
+  font-size: 44px;
+}
+
 .arena > .panel,
 .home-grid > .panel,
 .home-grid > .stack,
@@ -589,11 +680,17 @@ tr.blue {
   flex: 1;
 }
 
-@media (max-width: 1080px) {
+@media (max-width: 1280px) {
+  #app {
+    overflow: auto;
+  }
+
   .home-grid,
   .lobby,
   .arena {
     grid-template-columns: 1fr;
+    height: auto;
+    min-height: calc(100vh - 66px);
   }
 
   .hero-panel {
@@ -602,6 +699,17 @@ tr.blue {
 
   .home-bottom {
     grid-template-columns: 1fr;
+  }
+
+  .home-grid > .panel,
+  .home-grid > .stack,
+  .lobby > .panel,
+  .arena > .panel {
+    min-height: 360px;
+  }
+
+  .chat-log {
+    min-height: 240px;
   }
 
   .topbar {
@@ -620,5 +728,31 @@ tr.blue {
 
   .status-pill {
     max-width: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .home-grid,
+  .arena,
+  .lobby {
+    gap: 12px;
+    padding: 12px;
+  }
+
+  .topbar {
+    padding: 10px 12px;
+  }
+
+  .teams {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-form {
+    grid-template-columns: 1fr;
+  }
+
+  h1,
+  .end-card h1 {
+    font-size: 28px;
   }
 }

@@ -24,7 +24,7 @@ import {
 import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope, type LocalIdentity } from "./identity";
 import { fetchLuoguRecords } from "./luogu";
 import { completeCpOAuthLogin, loadCpSession, logoutCpSession, startCpOAuthLogin, type CpSession } from "./oauth";
-import type { DuelEvent, DuelState, Problem, SignedEnvelope, Team, VoteKind } from "./types";
+import type { DuelEvent, DuelState, Problem, Seat, SignedEnvelope, Team, VoteKind } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("Missing #app");
@@ -44,12 +44,16 @@ let userMenuOpen = false;
 let authErrorText = "";
 let cleanupTimer: number | undefined;
 let cleanupKey = "";
+let finishReturnTimer: number | undefined;
 let waitingRooms: RoomListing[] = [];
 let composing = false;
 let renderQueued = false;
 
 const storageKey = () => `luogu-duel.log.${roomId}`;
+const roomSeatKey = () => `luogu-duel.seat.${roomId}`;
+const activeRoomKey = "luogu-duel.active-room.v1";
 const historyKey = "luogu-duel.history.v1";
+const adminNames = new Set(["General826", "Gcend", "GCSG01"]);
 
 const boot = async () => {
   identity = await loadIdentity();
@@ -59,6 +63,7 @@ const boot = async () => {
   });
   app.addEventListener("click", handleClick);
   app.addEventListener("submit", handleSubmit);
+  app.addEventListener("input", handleInput);
   app.addEventListener("compositionstart", () => {
     composing = true;
   });
@@ -104,8 +109,10 @@ const boot = async () => {
     identity = await renameIdentity(identity, cpSession.luoguName);
   }
   await enterFromHash();
-  if (oauthLuoguName) {
-    await emitCommand({ kind: "player.joined", luoguName: oauthLuoguName, team: state.players[identity.id]?.team ?? pickTeam() });
+  if (oauthLuoguName && !state.players[identity.id]) {
+    const seat = preferredSeat();
+    await emitCommand({ kind: "player.joined", luoguName: oauthLuoguName, team: seat });
+    rememberSeat(seat);
   }
   render();
 };
@@ -117,20 +124,29 @@ const enterFromHash = async () => {
 
   stopApiSync();
   if (cleanupTimer) window.clearTimeout(cleanupTimer);
+  if (finishReturnTimer) window.clearTimeout(finishReturnTimer);
   cleanupTimer = undefined;
+  finishReturnTimer = undefined;
   cleanupKey = "";
   envelopes = loadLog();
   state = applyEvents(roomId, envelopes.map((item) => item.event));
   dirtyEventIds = new Set();
+  scheduleCleanupIfFinished();
 
   await pullApiSnapshot("进入房间");
+  if (await closeStaleSoloRoom()) return;
   await ensureJoined();
+  rememberActiveRoomIfNeeded();
   startApiSync();
   statusText = roomId === "global" ? "公共大厅已连接 API 同步" : "房间已连接 API 同步";
   render();
 };
 
 const ensureJoined = async () => {
+  if (state.players[identity.id]) {
+    rememberSeat(state.players[identity.id].team);
+    return;
+  }
   const alreadyJoined = envelopes.some(
     (item) =>
       item.event.actorId === identity.id &&
@@ -138,11 +154,13 @@ const ensureJoined = async () => {
         (item.event.type === "chat.sent" && item.event.text.includes('"kind":"player.joined"')))
   );
   if (alreadyJoined) return;
+  const seat = preferredSeat();
   await emitCommand({
     kind: "player.joined",
     luoguName: identity.luoguName,
-    team: pickTeam()
+    team: seat
   });
+  rememberSeat(seat);
 };
 
 const emit = async (event: DuelEvent) => {
@@ -185,7 +203,7 @@ const maybeAutoStart = async () => {
   if (!canStart(state)) return;
   if (envelopes.some((item) => item.event.type === "game.started" || (item.event.type === "chat.sent" && item.event.text.includes('"kind":"game.started"')))) return;
   await emitCommand({ kind: "game.started" });
-  await unpublishWaitingRoom(roomId);
+  await publishActiveRoom();
 };
 
 const startApiSync = () => {
@@ -242,6 +260,27 @@ const publishWaitingRoom = async (listing: RoomListing) => {
   }
 };
 
+const publishActiveRoom = async () => {
+  if (roomId === "global") return;
+  try {
+    const rooms = await loadRoomDirectory();
+    const current = rooms.find((room) => room.roomId === roomId);
+    const listing: RoomListing = {
+      roomId,
+      secret: roomSecret,
+      host: current?.host ?? Object.values(state.players)[0]?.luoguName ?? identity.luoguName,
+      createdAt: current?.createdAt ?? Date.now(),
+      problemCount: state.problems.length,
+      status: "arena",
+      startedAt: state.startedAt ?? Date.now()
+    };
+    waitingRooms = rooms.filter((room) => room.roomId !== roomId).concat(listing);
+    await saveRoomDirectory(waitingRooms);
+  } catch {
+    // 对局目录更新失败不影响房间内同步。
+  }
+};
+
 const unpublishWaitingRoom = async (targetRoomId: string) => {
   try {
     const rooms = await loadRoomDirectory();
@@ -252,6 +291,19 @@ const unpublishWaitingRoom = async (targetRoomId: string) => {
   } catch {
     // 房间目录只是发现入口，失败不影响对局本身。
   }
+};
+
+const closeStaleSoloRoom = async (): Promise<boolean> => {
+  if (roomId === "global" || state.phase !== "lobby") return false;
+  const firstEventAt = envelopes.filter((item) => item.event.roomId === roomId).sort((a, b) => a.event.issuedAt - b.event.issuedAt)[0]?.event.issuedAt;
+  if (!firstEventAt || Date.now() - firstEventAt < 300_000) return false;
+  if (Object.keys(state.players).length > 1) return false;
+  await deleteCloudSnapshot(cloudKey());
+  await unpublishWaitingRoom(roomId);
+  localStorage.removeItem(storageKey());
+  statusText = "房间 300 秒内无人加入，已自动关闭";
+  location.hash = "";
+  return true;
 };
 
 const mergeRemoteEnvelopes = async (remote: SignedEnvelope[]): Promise<number> => {
@@ -300,11 +352,16 @@ const flushApiSave = async () => {
 
 const scheduleCleanupIfFinished = () => {
   if (roomId === "global" || state.phase !== "finished") return;
+  localStorage.removeItem(activeRoomKey);
   void unpublishWaitingRoom(roomId);
   const key = cloudKey();
   if (cleanupTimer && cleanupKey === key) return;
   if (cleanupTimer) window.clearTimeout(cleanupTimer);
+  if (finishReturnTimer) window.clearTimeout(finishReturnTimer);
   cleanupKey = key;
+  finishReturnTimer = window.setTimeout(() => {
+    location.hash = "";
+  }, 10_000);
   cleanupTimer = window.setTimeout(async () => {
     try {
       await deleteCloudSnapshot(key);
@@ -314,7 +371,7 @@ const scheduleCleanupIfFinished = () => {
       statusText = error instanceof Error ? error.message : "云端房间删除失败";
       render();
     }
-  }, 30_000);
+  }, 10_000);
 };
 
 const currentPollInterval = (): number => {
@@ -331,7 +388,12 @@ const handleSubmit = async (event: SubmitEvent) => {
   const data = new FormData(form);
 
   if (action === "create-room") {
-    const count = clamp(Number(data.get("count") || 9), 3, 21);
+    if (hasBlockingActiveRoom()) {
+      statusText = "你已经在一场比赛中，不能创建新房间";
+      render();
+      return;
+    }
+    const count = clamp(Number(data.get("count") || 9), 1, 21);
     const manual = String(data.get("manual") || "");
     const nextRoom = compactId();
     const nextSecret = compactId() + compactId();
@@ -344,7 +406,8 @@ const handleSubmit = async (event: SubmitEvent) => {
       secret: nextSecret,
       host: identity.luoguName,
       createdAt: Date.now(),
-      problemCount: problems.length
+      problemCount: problems.length,
+      status: "lobby"
     });
   }
 
@@ -352,10 +415,45 @@ const handleSubmit = async (event: SubmitEvent) => {
     const raw = String(data.get("message") || "").trim();
     if (!raw) return;
     form.reset();
+    if (await handleAdminChatCommand(raw)) {
+      render(true);
+      return;
+    }
     const teamMessage = roomId !== "global" && raw.startsWith("/");
     await emitChat(teamMessage ? raw.slice(1).trim() : raw, teamMessage ? "team" : "all");
     render(true);
   }
+};
+
+const handleAdminChatCommand = async (raw: string): Promise<boolean> => {
+  const match = raw.match(/^\/(ban|unban)\s+(.+)$/i);
+  if (!match) return false;
+  if (!isAdmin(identity.luoguName)) {
+    statusText = "只有管理员可以使用禁言命令";
+    return true;
+  }
+  const targetName = match[2].trim();
+  const target = Object.values(state.players).find((player) => player.luoguName.toLowerCase() === targetName.toLowerCase());
+  if (!target) {
+    statusText = `没有找到用户 ${targetName}`;
+    return true;
+  }
+  if (match[1].toLowerCase() === "ban" && isAdmin(target.luoguName)) {
+    statusText = "管理员不能禁言管理员";
+    return true;
+  }
+  await emitCommand({ kind: match[1].toLowerCase() === "ban" ? "player.muted" : "player.unmuted", targetId: target.id });
+  return true;
+};
+
+const handleInput = (event: Event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLTextAreaElement) || target.name !== "manual") return;
+  const form = target.closest<HTMLFormElement>('form[data-action="create-room"]');
+  const countInput = form?.querySelector<HTMLInputElement>('input[name="count"]');
+  if (!countInput) return;
+  const manualCount = parseManualProblemCount(target.value);
+  if (manualCount > 0) countInput.value = String(clamp(manualCount, 1, 21));
 };
 
 const handleClick = async (event: MouseEvent) => {
@@ -368,6 +466,11 @@ const handleClick = async (event: MouseEvent) => {
 
   if (action === "home") location.hash = "";
   if (action === "join-room" && button.dataset.room && button.dataset.secret) {
+    if (hasBlockingActiveRoom(button.dataset.room)) {
+      statusText = "你已经在一场比赛中，不能加入其他房间";
+      render();
+      return;
+    }
     location.hash = `room=${button.dataset.room}&secret=${button.dataset.secret}`;
   }
   if (action === "copy-link") await navigator.clipboard.writeText(location.href);
@@ -387,9 +490,13 @@ const handleClick = async (event: MouseEvent) => {
     location.reload();
   }
   if (action === "team" && button.dataset.team) {
-    await emitCommand({ kind: "player.teamChanged", team: button.dataset.team as Team });
+    const seat = button.dataset.team as Seat;
+    rememberSeat(seat);
+    await emitCommand({ kind: "player.teamChanged", team: seat });
+    rememberActiveRoomIfNeeded();
   }
   if (action === "ready") {
+    if (!isParticipant(player?.team)) return;
     await emitCommand({ kind: "player.readyChanged", ready: !(player?.ready ?? false) });
   }
   if (action === "judge" && pid) await judgeProblem(pid);
@@ -402,16 +509,27 @@ const handleClick = async (event: MouseEvent) => {
   if (action === "vote-yes" && voteId) await emitCommand({ kind: "vote.cast", voteId, approve: true });
   if (action === "vote-no" && voteId) await emitCommand({ kind: "vote.cast", voteId, approve: false });
   if (action === "vote-cancel" && voteId) await emitCommand({ kind: "vote.cancelled", voteId });
+  if (action === "admin-mute" && button.dataset.player && isAdmin(identity.luoguName)) {
+    const target = state.players[button.dataset.player];
+    if (target && !isAdmin(target.luoguName)) await emitCommand({ kind: "player.muted", targetId: target.id });
+  }
+  if (action === "admin-close" && isAdmin(identity.luoguName)) {
+    await emitCommand({ kind: "room.closed", reason: "管理员强制删除房间" });
+    await deleteCloudSnapshot(cloudKey());
+    await unpublishWaitingRoom(roomId);
+  }
 };
 
 const openVote = async (kind: VoteKind, targetPid?: string, replacement?: Problem) => {
   const player = state.players[identity.id];
-  if (!player) return;
+  if (!player || !isParticipant(player.team)) return;
   await emitCommand({ kind: "vote.opened", vote: buildVote(kind, player, targetPid, replacement) });
 };
 
 const judgeProblem = async (pid: string) => {
-  const users = Object.values(state.players).map((p) => p.luoguName);
+  const users = Object.values(state.players)
+    .filter((player) => isParticipant(player.team))
+    .map((p) => p.luoguName);
   if (!state.startedAt) {
     statusText = "对局尚未正式开赛，不能判题";
     render();
@@ -443,7 +561,7 @@ const render = (force = false) => {
     restoreUiState(uiState);
     return;
   }
-  app.innerHTML = shell(state.phase === "arena" || state.phase === "finished" ? renderArena() : renderLobby());
+  app.innerHTML = shell(`${state.phase === "arena" || state.phase === "finished" ? renderArena() : renderLobby()}${renderEndOverlay()}`);
   restoreUiState(uiState);
 };
 
@@ -583,7 +701,7 @@ const renderHome = () => `
           <p class="lead">生成题目，等待对手加入。正式开赛前题目不会展示，判题只统计开赛后的提交。</p>
         </div>
         <form class="create-form" data-action="create-room">
-          <label>题目数量 <input type="number" name="count" min="3" max="21" value="9" /></label>
+          <label>题目数量 <input type="number" name="count" min="1" max="21" value="9" /></label>
           <label>手动题号 <textarea name="manual" placeholder="留空则随机，例如 P1000 P1001"></textarea></label>
           <button class="primary">创建房间</button>
         </form>
@@ -618,13 +736,16 @@ const renderLobby = () => `
       <div class="teams">
         ${renderTeam("red")}
         ${renderTeam("blue")}
+        ${renderTeam("spectator")}
       </div>
       <div class="actions">
         <button data-action="team" data-team="red">加入红方</button>
         <button data-action="team" data-team="blue">加入蓝方</button>
-        <button class="primary" data-action="ready">${state.players[identity.id]?.ready ? "取消准备" : "准备就绪"}</button>
+        <button data-action="team" data-team="spectator">观赛席</button>
+        ${isParticipant(currentSeat()) ? `<button class="primary" data-action="ready">${state.players[identity.id]?.ready ? "取消准备" : "准备就绪"}</button>` : ""}
       </div>
-      <p class="muted">所有人准备，且红蓝双方都有人后，会自动进入对决页。</p>
+      <p class="muted">红蓝参赛选手全部准备后自动开赛；观赛席不参与准备、投票和计分。</p>
+      ${renderAdminTools()}
     </section>
     <section class="panel">
       <div class="panel-title">
@@ -639,6 +760,7 @@ const renderLobby = () => `
 const renderArena = () => `
   <main class="arena">
     <section class="panel">
+      ${renderSeatBadge()}
       <div class="scoreboard">
         <strong class="red">红 ${scoreOf(state, "red")}</strong>
         <span>胜利线 ${winThreshold(state)}</span>
@@ -647,9 +769,9 @@ const renderArena = () => `
       ${state.winner ? `<div class="result">${state.winner === "draw" ? "平局" : `${state.winner === "red" ? "红方" : "蓝方"}获胜`}</div>` : ""}
       <div class="table-scroll problem-scroll" data-scroll-key="arena-problems">${renderProblems(true)}</div>
       <div class="actions">
-        <button data-action="vote-surrender">投降</button>
-        <button data-action="vote-draw">平局</button>
+        ${isParticipant(currentSeat()) ? '<button data-action="vote-surrender">投降</button><button data-action="vote-draw">平局</button>' : ""}
       </div>
+      ${renderAdminTools()}
       ${renderVotes()}
     </section>
     <section class="panel chat-panel">
@@ -670,13 +792,57 @@ const renderArena = () => `
   </main>
 `;
 
-const renderTeam = (team: Team) => `
+const renderEndOverlay = () => {
+  if (state.phase !== "finished") return "";
+  const mine = currentSeat();
+  const title = state.closed
+    ? "房间已关闭"
+    : state.winner === "draw"
+      ? "平局"
+      : state.winner === mine
+        ? "胜利"
+        : isParticipant(mine)
+          ? "失败"
+          : `${state.winner === "red" ? "红方" : "蓝方"}获胜`;
+  const detail = state.closed?.reason ?? "10 秒后返回主页";
+  return `
+    <div class="end-overlay">
+      <div class="end-card ${state.winner ?? "closed"}">
+        <p class="eyebrow">MATCH END</p>
+        <h1>${escapeHtml(title)}</h1>
+        <p class="lead">${escapeHtml(detail)}</p>
+        <button class="primary" data-action="home">返回主页</button>
+      </div>
+    </div>
+  `;
+};
+
+const renderTeam = (team: Seat) => `
   <div class="team ${team}">
-    <h3>${team === "red" ? "红方" : "蓝方"}</h3>
+    <h3>${teamName(team)}</h3>
     ${Object.values(state.players)
       .filter((p) => p.team === team)
-      .map((p) => `<div class="player"><span>${escapeHtml(p.luoguName)}</span><span>${p.ready ? "已准备" : "未准备"}</span></div>`)
-      .join("") || '<p class="muted">等待玩家</p>'}
+      .map(
+        (p) =>
+          `<div class="player">
+            <span>${escapeHtml(p.luoguName)}</span>
+            <span>${team === "spectator" ? "观赛" : p.ready ? "已准备" : "未准备"}</span>
+            ${isAdmin(identity.luoguName) && !isAdmin(p.luoguName) ? `<button data-action="admin-mute" data-player="${p.id}">禁言</button>` : ""}
+          </div>`
+      )
+      .join("") || `<p class="muted">${team === "spectator" ? "暂无观赛者" : "等待玩家"}</p>`}
+  </div>
+`;
+
+const renderAdminTools = () =>
+  isAdmin(identity.luoguName) && roomId !== "global"
+    ? `<div class="admin-tools"><span>管理员</span><button data-action="admin-close">强制删除房间</button></div>`
+    : "";
+
+const renderSeatBadge = () => `
+  <div class="seat-badge ${currentSeat()}">
+    <span>我的身份</span>
+    <strong>${teamName(currentSeat())}</strong>
   </div>
 `;
 
@@ -692,11 +858,15 @@ const renderProblems = (withActions: boolean) => `
           <td><a href="https://www.luogu.com.cn/problem/${p.pid}" target="_blank" rel="noreferrer">${p.pid}</a></td>
           <td>${p.score}</td>
           <td>${p.solvedBy ? escapeHtml(p.solvedBy.luoguName) : "未抢占"}</td>
-          <td class="row-actions">
-            <button data-action="judge" data-pid="${p.pid}">判题</button>
-            <button data-action="vote-replace" data-pid="${p.pid}">换题</button>
-            <button data-action="vote-delete" data-pid="${p.pid}">删除</button>
-          </td>
+          ${
+            isParticipant(currentSeat())
+              ? `<td class="row-actions">
+                  <button data-action="judge" data-pid="${p.pid}">判题</button>
+                  <button data-action="vote-replace" data-pid="${p.pid}">换题</button>
+                  <button data-action="vote-delete" data-pid="${p.pid}">删除</button>
+                </td>`
+              : '<td class="muted">观赛中</td>'
+          }
         </tr>`
             : `
         <tr>
@@ -732,16 +902,16 @@ const renderChat = () => `
 const renderVotes = () => {
   const openVotes = Object.values(state.votes).filter((vote) => vote.status === "open");
   if (openVotes.length === 0) return "";
+  const canVote = isParticipant(currentSeat());
   return `<div class="votes">
     ${openVotes
       .map(
         (vote) => `
       <div class="vote">
         <span>${vote.kind} ${vote.targetPid ?? ""}</span>
-        <span>${Object.keys(vote.approvals).length}/${Object.keys(state.players).length}</span>
-        <button data-action="vote-yes" data-vote="${vote.id}">同意</button>
-        <button data-action="vote-no" data-vote="${vote.id}">拒绝</button>
-        ${vote.proposerId === identity.id ? `<button data-action="vote-cancel" data-vote="${vote.id}">取消</button>` : ""}
+        <span>${Object.keys(vote.approvals).length}/${participantCount()}</span>
+        ${canVote ? `<button data-action="vote-yes" data-vote="${vote.id}">同意</button><button data-action="vote-no" data-vote="${vote.id}">拒绝</button>` : ""}
+        ${canVote && vote.proposerId === identity.id ? `<button data-action="vote-cancel" data-vote="${vote.id}">取消</button>` : ""}
       </div>`
       )
       .join("")}
@@ -769,7 +939,7 @@ const renderFeed = () => `
 
 const renderWaitingRooms = () => {
   const freshRooms = waitingRooms
-    .filter((room) => Date.now() - room.createdAt < 2 * 60 * 60 * 1000)
+    .filter((room) => Date.now() - room.createdAt < (room.status === "arena" ? 6 : 2) * 60 * 60 * 1000)
     .sort((a, b) => b.createdAt - a.createdAt)
     .slice(0, 12);
 
@@ -780,10 +950,10 @@ const renderWaitingRooms = () => {
         (room) => `
       <div class="room-card">
         <div>
-          <strong>${escapeHtml(room.host)}</strong>
-          <span>${room.problemCount} 题 · ${timeAgo(room.createdAt)}</span>
+          <strong>${escapeHtml(room.host)} <em class="${room.status === "arena" ? "live" : ""}">${room.status === "arena" ? "进行中" : "准备中"}</em></strong>
+          <span>${room.problemCount} 题 · ${room.status === "arena" && room.startedAt ? `开赛 ${timeAgo(room.startedAt)}` : timeAgo(room.createdAt)}</span>
         </div>
-        <button data-action="join-room" data-room="${escapeHtml(room.roomId)}" data-secret="${escapeHtml(room.secret)}">加入</button>
+        <button data-action="join-room" data-room="${escapeHtml(room.roomId)}" data-secret="${escapeHtml(room.secret)}">${room.status === "arena" ? "观赛" : "加入"}</button>
       </div>`
       )
       .join("")}
@@ -820,6 +990,43 @@ const pickTeam = (): Team => {
   const blue = Object.values(state.players).filter((p) => p.team === "blue").length;
   return red <= blue ? "red" : "blue";
 };
+
+const preferredSeat = (): Seat => {
+  if (state.phase !== "lobby") return "spectator";
+  const remembered = localStorage.getItem(roomSeatKey()) as Seat | null;
+  if (remembered === "red" || remembered === "blue" || remembered === "spectator") return remembered;
+  return pickTeam();
+};
+
+const rememberSeat = (seat: Seat) => localStorage.setItem(roomSeatKey(), seat);
+const currentSeat = (): Seat => state.players[identity.id]?.team ?? preferredSeat();
+const isParticipant = (seat: Seat | undefined): seat is Team => seat === "red" || seat === "blue";
+const participantCount = (): number => Object.values(state.players).filter((player) => isParticipant(player.team)).length;
+const teamName = (seat: Seat): string => (seat === "red" ? "红方" : seat === "blue" ? "蓝方" : "观赛席");
+const isAdmin = (name: string): boolean => adminNames.has(name);
+const rememberActiveRoomIfNeeded = () => {
+  const seat = state.players[identity.id]?.team;
+  if (roomId !== "global" && isParticipant(seat) && state.phase !== "finished") {
+    localStorage.setItem(activeRoomKey, JSON.stringify({ roomId, secret: roomSecret }));
+  }
+  if (state.phase === "finished") localStorage.removeItem(activeRoomKey);
+};
+const hasBlockingActiveRoom = (allowedRoomId?: string): boolean => {
+  const raw = localStorage.getItem(activeRoomKey);
+  if (!raw) return false;
+  try {
+    const active = JSON.parse(raw) as { roomId?: string };
+    return Boolean(active.roomId && active.roomId !== allowedRoomId);
+  } catch {
+    localStorage.removeItem(activeRoomKey);
+    return false;
+  }
+};
+const parseManualProblemCount = (value: string): number =>
+  value
+    .split(/[\s,，]+/)
+    .map((pid) => pid.trim().toUpperCase())
+    .filter((pid) => /^P\d{1,5}$/.test(pid)).length;
 
 const compactId = () => crypto.randomUUID().replaceAll("-", "").slice(0, 10);
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, Number.isFinite(n) ? n : min));
