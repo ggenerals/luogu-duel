@@ -22,7 +22,8 @@ body,
 body {
   margin: 0;
   background:
-    linear-gradient(180deg, #f9fafb 0, #eef1f5 260px),
+    radial-gradient(circle at top left, rgb(49 94 209 / 0.08), transparent 300px),
+    linear-gradient(180deg, #fbfcfe 0, #eef1f5 320px),
     #eef1f5;
 }
 
@@ -34,7 +35,7 @@ textarea {
 
 button {
   min-height: 34px;
-  border: 1px solid #c8ced8;
+  border: 1px solid #cfd6e1;
   border-radius: 6px;
   background: #ffffff;
   color: #222832;
@@ -47,8 +48,8 @@ button {
 }
 
 button:hover {
-  border-color: #7d899a;
-  background: #f7f9fc;
+  border-color: #8d99aa;
+  background: #f6f8fb;
 }
 
 button.primary {
@@ -247,7 +248,7 @@ th {
   border-radius: 8px;
   background: #ffffff;
   padding: 16px;
-  box-shadow: 0 10px 28px rgb(26 36 54 / 0.06);
+  box-shadow: 0 12px 30px rgb(26 36 54 / 0.07);
 }
 
 .panel-title {
@@ -271,6 +272,18 @@ th {
   gap: 16px;
   min-height: 0;
   grid-template-rows: auto minmax(0, 1fr);
+}
+
+.home-bottom {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(240px, 2fr);
+  gap: 16px;
+  min-height: 0;
+}
+
+.home-bottom > .panel {
+  height: 100%;
+  min-height: 0;
 }
 
 .hero-panel {
@@ -339,6 +352,41 @@ h3 {
   border-radius: 8px;
   padding: 14px;
   background: #fbfcfe;
+}
+
+.room-list {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  height: calc(100% - 42px);
+  overflow: auto;
+}
+
+.room-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #e0e5ec;
+  border-radius: 8px;
+  background: #fbfcfe;
+  padding: 12px;
+}
+
+.room-card strong,
+.room-card span {
+  display: block;
+}
+
+.room-card strong {
+  color: #172033;
+  font-size: 15px;
+}
+
+.room-card span {
+  color: #69778a;
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .team.red {
@@ -423,6 +471,31 @@ tr.blue {
   overflow: auto;
   border: 1px solid #e0e5ec;
   border-radius: 8px;
+}
+
+.masked-problems {
+  position: relative;
+}
+
+.masked-problems::after {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(255 255 255 / 0.52);
+  color: #2d3748;
+  content: "题目已封存，开赛后公开";
+  font-weight: 900;
+  letter-spacing: 0;
+  pointer-events: none;
+}
+
+.blur-token {
+  display: inline-block;
+  min-width: 72px;
+  filter: blur(22px);
+  opacity: 0.88;
+  user-select: none;
 }
 
 .table-scroll table th,
@@ -524,6 +597,10 @@ tr.blue {
   }
 
   .hero-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .home-bottom {
     grid-template-columns: 1fr;
   }
 

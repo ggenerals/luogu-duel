@@ -126,6 +126,7 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
     case "game.started":
       if (canStart(next)) {
         next.phase = "arena";
+        next.startedAt = event.issuedAt;
         next.system.push(`[系统] ${matchTitle(next)} 对决开始。`);
       }
       break;
@@ -292,6 +293,7 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
     case "game.started":
       if (canStart(state)) {
         state.phase = "arena";
+        state.startedAt = event.issuedAt;
         state.system.push(`[系统] ${matchTitle(state)} 对决开始。`);
       }
       return true;

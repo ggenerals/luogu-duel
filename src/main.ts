@@ -13,7 +13,14 @@ import {
   winThreshold,
   type SystemChatCommand
 } from "./domain";
-import { deleteCloudSnapshot, loadCloudSnapshot, saveCloudSnapshot } from "./cloudStore";
+import {
+  deleteCloudSnapshot,
+  loadCloudSnapshot,
+  loadRoomDirectory,
+  saveCloudSnapshot,
+  saveRoomDirectory,
+  type RoomListing
+} from "./cloudStore";
 import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope, type LocalIdentity } from "./identity";
 import { fetchLuoguRecords } from "./luogu";
 import { completeCpOAuthLogin, loadCpSession, logoutCpSession, startCpOAuthLogin, type CpSession } from "./oauth";
@@ -27,8 +34,6 @@ let roomId = "global";
 let roomSecret = "public-lobby";
 let envelopes: SignedEnvelope[] = [];
 let state: DuelState = createInitialState(roomId);
-let judgeTimer: number | undefined;
-let judgeCursor = 0;
 let apiPollTimer: number | undefined;
 let apiSaveTimer: number | undefined;
 let apiBusy = false;
@@ -39,6 +44,9 @@ let userMenuOpen = false;
 let authErrorText = "";
 let cleanupTimer: number | undefined;
 let cleanupKey = "";
+let waitingRooms: RoomListing[] = [];
+let composing = false;
+let renderQueued = false;
 
 const storageKey = () => `luogu-duel.log.${roomId}`;
 const historyKey = "luogu-duel.history.v1";
@@ -51,6 +59,18 @@ const boot = async () => {
   });
   app.addEventListener("click", handleClick);
   app.addEventListener("submit", handleSubmit);
+  app.addEventListener("compositionstart", () => {
+    composing = true;
+  });
+  app.addEventListener("compositionend", () => {
+    composing = false;
+    if (renderQueued) render(true);
+  });
+  app.addEventListener("focusout", () => {
+    window.setTimeout(() => {
+      if (renderQueued && !shouldDeferRender()) render(true);
+    }, 0);
+  });
 
   let oauthLuoguName: string | null = null;
   let oauthFailed = false;
@@ -106,7 +126,6 @@ const enterFromHash = async () => {
   await pullApiSnapshot("进入房间");
   await ensureJoined();
   startApiSync();
-  startJudgeLoop();
   statusText = roomId === "global" ? "公共大厅已连接 API 同步" : "房间已连接 API 同步";
   render();
 };
@@ -166,6 +185,7 @@ const maybeAutoStart = async () => {
   if (!canStart(state)) return;
   if (envelopes.some((item) => item.event.type === "game.started" || (item.event.type === "chat.sent" && item.event.text.includes('"kind":"game.started"')))) return;
   await emitCommand({ kind: "game.started" });
+  await unpublishWaitingRoom(roomId);
 };
 
 const startApiSync = () => {
@@ -188,6 +208,13 @@ const pullApiSnapshot = async (reason: string) => {
   if (apiBusy) return;
   apiBusy = true;
   try {
+    if (roomId === "global") {
+      try {
+        waitingRooms = await loadRoomDirectory();
+      } catch {
+        waitingRooms = [];
+      }
+    }
     const remote = await loadCloudSnapshot(cloudKey());
     const remoteIds = new Set(remote.map((item) => item.event.id));
     const added = await mergeRemoteEnvelopes(remote);
@@ -202,6 +229,28 @@ const pullApiSnapshot = async (reason: string) => {
   } finally {
     apiBusy = false;
     render();
+  }
+};
+
+const publishWaitingRoom = async (listing: RoomListing) => {
+  try {
+    const rooms = await loadRoomDirectory();
+    waitingRooms = rooms.filter((room) => room.roomId !== listing.roomId).concat(listing);
+    await saveRoomDirectory(waitingRooms);
+  } catch (error) {
+    statusText = error instanceof Error ? error.message : "房间列表写入失败";
+  }
+};
+
+const unpublishWaitingRoom = async (targetRoomId: string) => {
+  try {
+    const rooms = await loadRoomDirectory();
+    const next = rooms.filter((room) => room.roomId !== targetRoomId);
+    if (next.length === rooms.length) return;
+    await saveRoomDirectory(next);
+    if (roomId === "global") waitingRooms = next;
+  } catch {
+    // 房间目录只是发现入口，失败不影响对局本身。
   }
 };
 
@@ -251,6 +300,7 @@ const flushApiSave = async () => {
 
 const scheduleCleanupIfFinished = () => {
   if (roomId === "global" || state.phase !== "finished") return;
+  void unpublishWaitingRoom(roomId);
   const key = cloudKey();
   if (cleanupTimer && cleanupKey === key) return;
   if (cleanupTimer) window.clearTimeout(cleanupTimer);
@@ -287,7 +337,15 @@ const handleSubmit = async (event: SubmitEvent) => {
     const nextSecret = compactId() + compactId();
     history.pushState(null, "", `#room=${nextRoom}&secret=${nextSecret}`);
     await enterFromHash();
-    await emitCommand({ kind: "room.configured", problems: makeProblemSet(count, nextRoom, manual) });
+    const problems = makeProblemSet(count, nextRoom, manual);
+    await emitCommand({ kind: "room.configured", problems });
+    await publishWaitingRoom({
+      roomId: nextRoom,
+      secret: nextSecret,
+      host: identity.luoguName,
+      createdAt: Date.now(),
+      problemCount: problems.length
+    });
   }
 
   if (action === "chat") {
@@ -296,6 +354,7 @@ const handleSubmit = async (event: SubmitEvent) => {
     form.reset();
     const teamMessage = roomId !== "global" && raw.startsWith("/");
     await emitChat(teamMessage ? raw.slice(1).trim() : raw, teamMessage ? "team" : "all");
+    render(true);
   }
 };
 
@@ -308,6 +367,9 @@ const handleClick = async (event: MouseEvent) => {
   const player = state.players[identity.id];
 
   if (action === "home") location.hash = "";
+  if (action === "join-room" && button.dataset.room && button.dataset.secret) {
+    location.hash = `room=${button.dataset.room}&secret=${button.dataset.secret}`;
+  }
   if (action === "copy-link") await navigator.clipboard.writeText(location.href);
   if (action === "sync-now") await pullApiSnapshot("手动同步");
   if (action === "toggle-user-menu") {
@@ -350,10 +412,15 @@ const openVote = async (kind: VoteKind, targetPid?: string, replacement?: Proble
 
 const judgeProblem = async (pid: string) => {
   const users = Object.values(state.players).map((p) => p.luoguName);
+  if (!state.startedAt) {
+    statusText = "对局尚未正式开赛，不能判题";
+    render();
+    return;
+  }
   try {
     statusText = `正在抓取 ${pid} 的洛谷提交`;
     render();
-    const records = await fetchLuoguRecords(pid, users);
+    const records = await fetchLuoguRecords(pid, users, state.startedAt);
     for (const record of records) {
       await emitCommand({ kind: "judge.recordSeen", record });
     }
@@ -364,17 +431,12 @@ const judgeProblem = async (pid: string) => {
   render();
 };
 
-const startJudgeLoop = () => {
-  if (judgeTimer) window.clearInterval(judgeTimer);
-  judgeTimer = window.setInterval(() => {
-    if (state.phase !== "arena" || state.problems.length === 0) return;
-    const problem = state.problems[judgeCursor % state.problems.length];
-    judgeCursor += 1;
-    void judgeProblem(problem.pid);
-  }, 10_000);
-};
-
-const render = () => {
+const render = (force = false) => {
+  if (!force && shouldDeferRender()) {
+    renderQueued = true;
+    return;
+  }
+  renderQueued = false;
   const uiState = captureUiState();
   if (roomId === "global") {
     app.innerHTML = shell(renderHome());
@@ -383,6 +445,11 @@ const render = () => {
   }
   app.innerHTML = shell(state.phase === "arena" || state.phase === "finished" ? renderArena() : renderLobby());
   restoreUiState(uiState);
+};
+
+const shouldDeferRender = (): boolean => {
+  const active = document.activeElement;
+  return composing || active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement;
 };
 
 type UiState = {
@@ -438,6 +505,12 @@ const restoreUiState = (uiState: UiState) => {
     if (!element) continue;
     element.scrollTop = scroll.atBottom ? element.scrollHeight : scroll.top;
     element.scrollLeft = scroll.left;
+  }
+  const restoredScrolls = new Set(uiState.scrolls.map((scroll) => scroll.key));
+  for (const element of app.querySelectorAll<HTMLElement>("[data-stick-bottom][data-scroll-key]")) {
+    if (!restoredScrolls.has(element.dataset.scrollKey || "")) {
+      element.scrollTop = element.scrollHeight;
+    }
   }
 
   const elements = [...app.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input[name], textarea[name]")];
@@ -498,7 +571,7 @@ const renderHome = () => `
     <section class="panel chat-panel">
       <div class="panel-title">
         <span>公共聊天室</span>
-        <small>API 轮询同步</small>
+        <small>默认停在最新消息</small>
       </div>
       ${renderChat()}
     </section>
@@ -507,7 +580,7 @@ const renderHome = () => `
         <div>
           <p class="eyebrow">LOCKOUT MATCH</p>
           <h1>创建一场洛谷抢分对决</h1>
-          <p class="lead">生成题目、邀请队友、准备后自动开局。所有房间状态通过云变量事件日志同步。</p>
+          <p class="lead">生成题目，等待对手加入。正式开赛前题目不会展示，判题只统计开赛后的提交。</p>
         </div>
         <form class="create-form" data-action="create-room">
           <label>题目数量 <input type="number" name="count" min="3" max="21" value="9" /></label>
@@ -515,12 +588,21 @@ const renderHome = () => `
           <button class="primary">创建房间</button>
         </form>
       </div>
-      <div class="panel">
-        <div class="panel-title">
-          <span>历史对局</span>
-          <small>本地记录</small>
+      <div class="home-bottom">
+        <div class="panel">
+          <div class="panel-title">
+            <span>实时对局</span>
+            <small>等待开赛</small>
+          </div>
+          ${renderWaitingRooms()}
         </div>
-        ${renderHistory()}
+        <div class="panel">
+          <div class="panel-title">
+            <span>历史对局</span>
+            <small>本地记录</small>
+          </div>
+          ${renderHistory()}
+        </div>
       </div>
     </section>
   </main>
@@ -547,9 +629,9 @@ const renderLobby = () => `
     <section class="panel">
       <div class="panel-title">
         <span>题目池</span>
-        <small>${state.problems.length} 题</small>
+        <small>开赛后公开</small>
       </div>
-      <div class="table-scroll" data-scroll-key="lobby-problems">${renderProblems(false)}</div>
+      <div class="table-scroll masked-problems" data-scroll-key="lobby-problems">${renderProblems(false)}</div>
     </section>
   </main>
 `;
@@ -576,7 +658,7 @@ const renderArena = () => `
         <small>/ 开头为队内</small>
       </div>
       ${renderChat()}
-      <div class="system-flow" data-scroll-key="system">${state.system.slice(-10).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}</div>
+      <div class="system-flow" data-scroll-key="system" data-stick-bottom>${state.system.slice(-10).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}</div>
     </section>
     <section class="panel">
       <div class="panel-title">
@@ -603,21 +685,24 @@ const renderProblems = (withActions: boolean) => `
     <thead><tr><th>题目</th><th>分数</th><th>解题选手</th>${withActions ? "<th>操作</th>" : ""}</tr></thead>
     <tbody>
       ${state.problems
-        .map(
-          (p) => `
+        .map((p, index) =>
+          withActions
+            ? `
         <tr class="${p.solvedBy?.team ?? ""}">
           <td><a href="https://www.luogu.com.cn/problem/${p.pid}" target="_blank" rel="noreferrer">${p.pid}</a></td>
           <td>${p.score}</td>
           <td>${p.solvedBy ? escapeHtml(p.solvedBy.luoguName) : "未抢占"}</td>
-          ${
-            withActions
-              ? `<td class="row-actions">
-                  <button data-action="judge" data-pid="${p.pid}">判题</button>
-                  <button data-action="vote-replace" data-pid="${p.pid}">换题</button>
-                  <button data-action="vote-delete" data-pid="${p.pid}">删除</button>
-                </td>`
-              : ""
-          }
+          <td class="row-actions">
+            <button data-action="judge" data-pid="${p.pid}">判题</button>
+            <button data-action="vote-replace" data-pid="${p.pid}">换题</button>
+            <button data-action="vote-delete" data-pid="${p.pid}">删除</button>
+          </td>
+        </tr>`
+            : `
+        <tr>
+          <td><span class="blur-token">P${String(index + 1).padStart(4, "0")}</span></td>
+          <td><span class="blur-token">${p.score}</span></td>
+          <td><span class="muted">开赛后公开</span></td>
         </tr>`
         )
         .join("")}
@@ -626,7 +711,7 @@ const renderProblems = (withActions: boolean) => `
 `;
 
 const renderChat = () => `
-  <div class="chat-log" data-scroll-key="chat">
+  <div class="chat-log" data-scroll-key="chat" data-stick-bottom>
     ${(roomId === "global" ? state.chats.filter((chat) => chat.visibility === "all") : visibleChats(state, identity.id))
       .slice(-80)
       .map(
@@ -682,6 +767,29 @@ const renderFeed = () => `
   </table>
 `;
 
+const renderWaitingRooms = () => {
+  const freshRooms = waitingRooms
+    .filter((room) => Date.now() - room.createdAt < 2 * 60 * 60 * 1000)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 12);
+
+  if (freshRooms.length === 0) return '<p class="muted">暂无等待中的公开房间。</p>';
+  return `<div class="room-list" data-scroll-key="waiting-rooms">
+    ${freshRooms
+      .map(
+        (room) => `
+      <div class="room-card">
+        <div>
+          <strong>${escapeHtml(room.host)}</strong>
+          <span>${room.problemCount} 题 · ${timeAgo(room.createdAt)}</span>
+        </div>
+        <button data-action="join-room" data-room="${escapeHtml(room.roomId)}" data-secret="${escapeHtml(room.secret)}">加入</button>
+      </div>`
+      )
+      .join("")}
+  </div>`;
+};
+
 const renderHistory = () => {
   const history = JSON.parse(localStorage.getItem(historyKey) || "[]") as Array<{
     roomId: string;
@@ -716,6 +824,12 @@ const pickTeam = (): Team => {
 const compactId = () => crypto.randomUUID().replaceAll("-", "").slice(0, 10);
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, Number.isFinite(n) ? n : min));
 const formatTime = (time: number) => new Date(time).toLocaleString("zh-CN", { hour12: false });
+const timeAgo = (time: number): string => {
+  const minutes = Math.max(0, Math.floor((Date.now() - time) / 60_000));
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  return `${Math.floor(minutes / 60)} 小时前`;
+};
 const escapeHtml = (value: string) =>
   value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char);
 

@@ -24,11 +24,12 @@ const statusMap: Record<string, JudgeStatus> = {
 
 const recordsProxy = "https://oauth.gengen.qzz.io/luogu/records";
 
-export const fetchLuoguRecords = async (pid: string, users: string[]): Promise<FeedRecord[]> => {
+export const fetchLuoguRecords = async (pid: string, users: string[], startedAt: number): Promise<FeedRecord[]> => {
   const url = new URL("https://www.luogu.com.cn/record/list");
   url.searchParams.set("pid", pid);
   url.searchParams.set("_contentOnly", "1");
-  const requestUrl = recordsProxy ? `${recordsProxy}?pid=${encodeURIComponent(pid)}` : `https://jiashu.1win.eu.org/${url.toString()}`;
+  const requestUrl = new URL(recordsProxy);
+  requestUrl.searchParams.set("pid", pid);
 
   const response = await fetch(requestUrl, {
     headers: { accept: "application/json" }
@@ -36,7 +37,7 @@ export const fetchLuoguRecords = async (pid: string, users: string[]): Promise<F
   if (!response.ok) throw new Error(`Luogu records request failed: ${response.status}`);
 
   const data = await response.json();
-  const records = findRecords(data);
+  const records = findRecords(data, startedAt);
   const userSet = new Set(users);
 
   return records
@@ -44,12 +45,13 @@ export const fetchLuoguRecords = async (pid: string, users: string[]): Promise<F
       const luoguName = record.user?.name;
       const status = normalizeStatus(record.status);
       const recordPid = record.problem?.pid ?? pid;
+      const submittedAt = normalizeTime(record.submitTime);
       if (!luoguName || !status || !userSet.has(luoguName) || recordPid !== pid) return null;
       return {
         id: crypto.randomUUID(),
         luoguName,
         pid,
-        at: normalizeTime(record.submitTime),
+        at: submittedAt,
         status,
         recordId: String(record.id ?? `${luoguName}-${pid}-${record.submitTime ?? Date.now()}`)
       };
@@ -57,15 +59,18 @@ export const fetchLuoguRecords = async (pid: string, users: string[]): Promise<F
     .filter((record): record is FeedRecord => Boolean(record));
 };
 
-const findRecords = (value: unknown): LuoguRecord[] => {
+const findRecords = (value: unknown, startedAt: number): LuoguRecord[] => {
   if (!value || typeof value !== "object") return [];
-  if (Array.isArray(value)) return value.flatMap(findRecords);
+  if (Array.isArray(value)) return value.flatMap((item) => findRecords(item, startedAt));
   const object = value as Record<string, unknown>;
-  if (Array.isArray(object.records)) return object.records as LuoguRecord[];
-  if (Array.isArray(object.result)) return object.result as LuoguRecord[];
-  if (Array.isArray(object.data)) return object.data as LuoguRecord[];
-  return Object.values(object).flatMap(findRecords);
+  if (Array.isArray(object.records)) return filterStartedRecords(object.records as LuoguRecord[], startedAt);
+  if (Array.isArray(object.result)) return filterStartedRecords(object.result as LuoguRecord[], startedAt);
+  if (Array.isArray(object.data)) return filterStartedRecords(object.data as LuoguRecord[], startedAt);
+  return Object.values(object).flatMap((item) => findRecords(item, startedAt));
 };
+
+const filterStartedRecords = (records: LuoguRecord[], startedAt: number): LuoguRecord[] =>
+  records.filter((record) => normalizeTime(record.submitTime) > startedAt);
 
 const normalizeStatus = (status: LuoguRecord["status"]): JudgeStatus | null => {
   if (status === undefined) return null;

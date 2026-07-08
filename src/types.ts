@@ -59,6 +59,7 @@ export type Vote = {
 export type DuelState = {
   roomId: string;
   phase: Phase;
+  startedAt?: number;
   players: Record<string, Player>;
   problems: Problem[];
   chats: ChatMessage[];

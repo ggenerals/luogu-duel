@@ -11,6 +11,20 @@ type CloudSnapshot = {
   envelopes: SignedEnvelope[];
 };
 
+export type RoomListing = {
+  roomId: string;
+  secret: string;
+  host: string;
+  createdAt: number;
+  problemCount: number;
+};
+
+type RoomDirectory = {
+  version: 1;
+  savedAt: number;
+  rooms: RoomListing[];
+};
+
 export const loadCloudSnapshot = async (roomId: string): Promise<SignedEnvelope[]> => {
   const response = await fetch(`${endpoint}/get?key=${encodeURIComponent(roomKey(roomId))}`, {
     cache: "no-store",
@@ -53,7 +67,40 @@ export const deleteCloudSnapshot = async (roomId: string): Promise<void> => {
   if (!response.ok) throw new Error(`cloud delete failed: ${response.status}`);
 };
 
+export const loadRoomDirectory = async (): Promise<RoomListing[]> => {
+  const response = await fetch(`${endpoint}/get?key=${encodeURIComponent(directoryKey())}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(requestTimeoutMs)
+  });
+  if (!response.ok) throw new Error(`directory get failed: ${response.status}`);
+
+  const value = unwrapValue(await response.text());
+  if (!value) return [];
+  const directory = JSON.parse(value) as RoomDirectory;
+  return Array.isArray(directory.rooms) ? directory.rooms : [];
+};
+
+export const saveRoomDirectory = async (rooms: RoomListing[]): Promise<void> => {
+  const directory: RoomDirectory = {
+    version: 1,
+    savedAt: Date.now(),
+    rooms: rooms
+      .filter((room) => Date.now() - room.createdAt < 2 * 60 * 60 * 1000)
+      .slice(-60)
+  };
+
+  const response = await fetch(`${endpoint}/set?key=${encodeURIComponent(directoryKey())}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(directory),
+    keepalive: true,
+    signal: AbortSignal.timeout(requestTimeoutMs)
+  });
+  if (!response.ok) throw new Error(`directory set failed: ${response.status}`);
+};
+
 const roomKey = (roomId: string): string => `${namespace}:room:${roomId}`;
+const directoryKey = (): string => `${namespace}:rooms:waiting`;
 
 const unwrapValue = (text: string): string => {
   const trimmed = text.trim();
