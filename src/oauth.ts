@@ -1,7 +1,7 @@
 const clientId = "85694b6a-9167-48dc-9e00-343d23d826ef";
 const oauthBase = "https://www.cpoauth.com";
 const oauthProxy = "https://oauth.gengen.qzz.io/oauth/callback";
-const scope = "openid profile link:luogu";
+const scope = "openid profile cp:linked link:luogu";
 const verifierKey = "luogu-duel.oauth.verifier";
 const stateKey = "luogu-duel.oauth.state";
 const returnKey = "luogu-duel.oauth.return";

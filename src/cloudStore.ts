@@ -2,6 +2,7 @@ import type { SignedEnvelope } from "./types";
 
 const endpoint = "https://vd.gengen.qzz.io";
 const namespace = "luogu-duel:v1";
+const requestTimeoutMs = 6500;
 
 type CloudSnapshot = {
   version: 1;
@@ -12,7 +13,8 @@ type CloudSnapshot = {
 
 export const loadCloudSnapshot = async (roomId: string): Promise<SignedEnvelope[]> => {
   const response = await fetch(`${endpoint}/get?key=${encodeURIComponent(roomKey(roomId))}`, {
-    cache: "no-store"
+    cache: "no-store",
+    signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`cloud get failed: ${response.status}`);
 
@@ -36,7 +38,8 @@ export const saveCloudSnapshot = async (roomId: string, envelopes: SignedEnvelop
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(snapshot),
-    keepalive: true
+    keepalive: true,
+    signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`cloud set failed: ${response.status}`);
 };
@@ -44,7 +47,8 @@ export const saveCloudSnapshot = async (roomId: string, envelopes: SignedEnvelop
 export const deleteCloudSnapshot = async (roomId: string): Promise<void> => {
   const response = await fetch(`${endpoint}/del?key=${encodeURIComponent(roomKey(roomId))}`, {
     method: "DELETE",
-    keepalive: true
+    keepalive: true,
+    signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`cloud delete failed: ${response.status}`);
 };

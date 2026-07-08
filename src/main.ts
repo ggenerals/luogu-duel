@@ -1,5 +1,6 @@
 import "./style.css";
 import {
+  applyEvent,
   applyEvents,
   buildVote,
   canStart,
@@ -63,9 +64,10 @@ const boot = async () => {
     authErrorText = error instanceof Error ? error.message : "CP OAuth 登录失败";
     statusText = authErrorText;
     oauthFailed = true;
+    logoutCpSession();
   }
   cpSession = loadCpSession();
-  if (!cpSession && oauthFailed) {
+  if (oauthFailed) {
     renderAuthGate();
     return;
   }
@@ -188,13 +190,7 @@ const pullApiSnapshot = async (reason: string) => {
   try {
     const remote = await loadCloudSnapshot(cloudKey());
     const remoteIds = new Set(remote.map((item) => item.event.id));
-    let added = 0;
-    for (const envelope of remote) {
-      if (!envelopes.some((item) => item.event.id === envelope.event.id)) {
-        await receiveEnvelope(envelope);
-        added += 1;
-      }
-    }
+    const added = await mergeRemoteEnvelopes(remote);
     dirtyEventIds = new Set([
       ...[...dirtyEventIds].filter((id) => !remoteIds.has(id)),
       ...envelopes.filter((item) => item.event.roomId === roomId && !remoteIds.has(item.event.id)).map((item) => item.event.id)
@@ -207,6 +203,29 @@ const pullApiSnapshot = async (reason: string) => {
     apiBusy = false;
     render();
   }
+};
+
+const mergeRemoteEnvelopes = async (remote: SignedEnvelope[]): Promise<number> => {
+  const known = new Set(envelopes.map((item) => item.event.id));
+  const accepted: SignedEnvelope[] = [];
+
+  for (const envelope of remote) {
+    if (known.has(envelope.event.id) || envelope.event.roomId !== roomId) continue;
+    if (!(await verifyEnvelope(envelope))) continue;
+    known.add(envelope.event.id);
+    accepted.push(envelope);
+  }
+
+  if (accepted.length === 0) return 0;
+  accepted.sort((a, b) => a.event.lamport - b.event.lamport || a.event.issuedAt - b.event.issuedAt || a.event.id.localeCompare(b.event.id));
+  envelopes.push(...accepted);
+  envelopes.sort((a, b) => a.event.lamport - b.event.lamport || a.event.issuedAt - b.event.issuedAt || a.event.id.localeCompare(b.event.id));
+  saveLog();
+  state = accepted.reduce((next, envelope) => applyEvent(next, envelope.event), state);
+  saveHistory();
+  scheduleCleanupIfFinished();
+  void maybeAutoStart();
+  return accepted.length;
 };
 
 const scheduleApiSave = (delay: number) => {
@@ -222,6 +241,7 @@ const flushApiSave = async () => {
   try {
     await saveCloudSnapshot(cloudKey(), envelopes);
     statusText = `API 已写入 ${dirtyEventIds.size} 条待确认事件`;
+    dirtyEventIds.clear();
   } catch (error) {
     statusText = error instanceof Error ? error.message : "API 写入失败";
     scheduleApiSave(3000);
@@ -248,7 +268,8 @@ const scheduleCleanupIfFinished = () => {
 };
 
 const currentPollInterval = (): number => {
-  return document.hidden ? 30_000 : 10_000;
+  if (document.hidden) return 30_000;
+  return roomId === "global" ? 10_000 : 6_000;
 };
 
 const cloudKey = (): string => (roomId === "global" ? "global" : `${roomId}:${roomSecret}`);
