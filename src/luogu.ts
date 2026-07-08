@@ -22,7 +22,7 @@ const statusMap: Record<string, JudgeStatus> = {
   Accepted: "OK"
 };
 
-const recordsProxy = "https://vd.gengen.qzz.io/luogu/records";
+const recordsProxy = "https:/oauth.gengen.qzz.io/luogu/records";
 
 export const fetchLuoguRecords = async (pid: string, users: string[]): Promise<FeedRecord[]> => {
   const url = new URL("https://www.luogu.com.cn/record/list");
