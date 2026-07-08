@@ -55,14 +55,14 @@ button:hover {
 
 button.primary {
   border-color: #1f4ca8;
-  background: linear-gradient(180deg, #2f63d7, #204da9);
+  background: linear-gradient(180deg, #2f63d7, #204da9)!important;
   color: #ffffff;
   font-weight: 700;
 }
 
 button.primary:hover {
   border-color: #1b3c83;
-  background: #1b3c83;
+  background: #1b3c83!important;
 }
 
 button.ghost,
