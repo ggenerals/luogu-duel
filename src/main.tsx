@@ -39,6 +39,7 @@ let roomId = "global";
 let roomSecret = "public-lobby";
 let envelopes: SignedEnvelope[] = [];
 let state: DuelState = createInitialState(roomId);
+let globalModeration: DuelState = createInitialState("global");
 let apiPollTimer: number | undefined;
 let apiSaveTimer: number | undefined;
 let apiBusy = false;
@@ -143,6 +144,7 @@ const enterFromHash = async () => {
 
   envelopes = loadLog();
   state = applyEvents(roomId, envelopes.map((item) => item.event));
+  if (roomId === "global") globalModeration = state;
   dirtyEventIds = new Set();
   scheduleCleanupIfFinished();
   notify();
@@ -198,6 +200,7 @@ const receiveEnvelope = async (envelope: SignedEnvelope) => {
   envelopes.push(envelope);
   saveLog();
   state = applyEvents(roomId, envelopes.map((item) => item.event));
+  if (roomId === "global") globalModeration = state;
   saveHistory();
   scheduleCleanupIfFinished();
   notify();
@@ -256,6 +259,11 @@ const pullApiSnapshot = async (reason: string) => {
     const remote = await loadCloudSnapshot(cloudKey());
     const remoteIds = new Set(remote.map((item) => item.event.id));
     const added = await mergeRemoteEnvelopes(remote);
+    if (roomId === "global") {
+      globalModeration = state;
+    } else {
+      await refreshGlobalModeration();
+    }
     dirtyEventIds = new Set([
       ...[...dirtyEventIds].filter((id) => !remoteIds.has(id)),
       ...envelopes.filter((item) => item.event.roomId === roomId && !remoteIds.has(item.event.id)).map((item) => item.event.id)
@@ -345,10 +353,20 @@ const mergeRemoteEnvelopes = async (remote: SignedEnvelope[]): Promise<number> =
   envelopes.sort(compareEnvelopes);
   saveLog();
   state = accepted.reduce((next, envelope) => applyEvent(next, envelope.event), state);
+  if (roomId === "global") globalModeration = state;
   saveHistory();
   scheduleCleanupIfFinished();
   void maybeAutoStart();
   return accepted.length;
+};
+
+const refreshGlobalModeration = async () => {
+  try {
+    const globalRemote = await loadCloudSnapshot("global");
+    globalModeration = applyEvents("global", globalRemote.map((item) => item.event));
+  } catch {
+    // Room sync should keep working even when the global moderation snapshot is temporarily unavailable.
+  }
 };
 
 const scheduleApiSave = (delay: number) => {
@@ -398,9 +416,9 @@ const scheduleCleanupIfFinished = () => {
 };
 
 const currentPollInterval = (): number => {
-  const base = roomId === "global" ? 10_000 : 6_000;
-  if (document.hidden) return 30_000;
-  return Math.min(45_000, base + apiFailureCount * 5_000);
+  const base = 20_000;
+  if (document.hidden) return 45_000;
+  return Math.min(60_000, base + apiFailureCount * 5_000);
 };
 
 const submitCreateRoom = async (event: Event) => {
@@ -449,7 +467,7 @@ const submitChat = async (event: Event) => {
   event.preventDefault();
   const raw = draft.chat.trim();
   if (!raw) return;
-  if (state.muted[identity.id]) {
+  if (isMuted(identity.id)) {
     setStatus("你已被禁言，暂时不能发送消息");
     return;
   }
@@ -473,6 +491,10 @@ const handleAdminChatCommand = async (raw: string): Promise<boolean> => {
   const kickMatch = raw.match(/^\/kick\s+(\S+)(?:\s+(.+))?$/i);
   const unkickMatch = raw.match(/^\/unkick\s+(\S+)$/i);
   if (!muteMatch && !kickMatch && !unkickMatch) return false;
+  if (roomId !== "global") {
+    statusText = "管理命令请回到主页执行；房间内 / 开头仍作为队内消息";
+    return true;
+  }
   if (!isAdmin(identity.luoguName)) {
     statusText = "只有管理员可以使用管理命令";
     return true;
@@ -562,11 +584,41 @@ const adminUnkick = async (player: Player) => {
   await emitCommand({ kind: "player.unkicked", targetName: player.luoguName });
 };
 
-const adminCloseRoom = async () => {
-  if (!isAdmin(identity.luoguName)) return;
-  await emitCommand({ kind: "room.closed", reason: "管理员强制关闭房间" });
-  await deleteCloudSnapshot(cloudKey());
+const closeCurrentRoom = async (force: boolean) => {
+  if (roomId === "global") return;
+  if (!force && state.phase !== "lobby") {
+    setStatus("比赛已经正式开始，普通关闭不可用");
+    return;
+  }
+  if (force && !isAdmin(identity.luoguName)) return;
+  await emitCommand({ kind: "room.closed", reason: force ? "管理员强制关闭房间" : "玩家关闭未开赛房间" });
   await unpublishWaitingRoom(roomId);
+};
+
+const forceCloseListing = async (listing: RoomListing) => {
+  if (!isAdmin(identity.luoguName)) return;
+  try {
+    const targetKey = `${listing.roomId}:${listing.secret}`;
+    const remote = await loadCloudSnapshot(targetKey);
+    const lamport = Math.max(0, ...remote.map((item) => item.event.lamport)) + 1;
+    const event: DuelEvent = {
+      type: "chat.sent",
+      roomId: listing.roomId,
+      actorId: identity.id,
+      id: crypto.randomUUID(),
+      lamport,
+      issuedAt: Date.now(),
+      text: encodeSystemChatCommand({ kind: "room.closed", reason: "管理员强制关闭房间", actorName: identity.luoguName }),
+      visibility: "all"
+    };
+    const envelope = await signEvent(identity, event);
+    await saveCloudSnapshot(targetKey, remote.concat(envelope).slice(-1000));
+    await unpublishWaitingRoom(listing.roomId);
+    statusText = `已向房间 ${listing.roomId} 发送强制关闭`;
+  } catch (error) {
+    statusText = friendlyCloudError(error, "强制关闭房间失败");
+  }
+  notify();
 };
 
 const App = () => {
@@ -675,11 +727,7 @@ const Home = () => (
               }}
             />
           </label>
-          <div class="difficulty-row">
-            <DifficultySelect label="低难度" value={draft.difficultyLow} onChange={(value) => ((draft.difficultyLow = value), notify())} />
-            <span class="range-arrow">→</span>
-            <DifficultySelect label="高难度" value={draft.difficultyHigh} onChange={(value) => ((draft.difficultyHigh = value), notify())} />
-          </div>
+          <DifficultyRangeSlider />
           <label>
             手动题号
             <textarea
@@ -701,6 +749,11 @@ const Home = () => (
           <button class="primary">创建房间</button>
         </form>
       </section>
+      {isAdmin(identity.luoguName) ? (
+        <section class="panel lift-in">
+          <AdminTools />
+        </section>
+      ) : null}
       <section class="home-bottom">
         <section class="panel lift-in">
           <PanelTitle title="实时对局" subtitle="等待或进行中" />
@@ -722,9 +775,12 @@ const Lobby = () => (
         title="准备室"
         subtitle="红蓝双方都准备后自动开赛"
         action={
-          <button onClick={() => void navigator.clipboard.writeText(location.href)}>
-            复制邀请链接
-          </button>
+          <div class="title-actions">
+            <button onClick={() => void navigator.clipboard.writeText(location.href)}>复制邀请链接</button>
+            <button class="danger" onClick={() => void closeCurrentRoom(false)}>
+              关闭房间
+            </button>
+          </div>
         }
       />
       <RestrictionBanner />
@@ -745,8 +801,7 @@ const Lobby = () => (
           </button>
         ) : null}
       </div>
-      <p class="muted">观赛席不参与准备、投票和计分。管理员操作会在下方清晰展示。</p>
-      <AdminTools />
+      <p class="muted">观赛席不参与准备、投票和计分。未正式开始前，普通玩家也可以关闭房间。</p>
     </section>
     <section class="panel lift-in">
       <PanelTitle title="题目池" subtitle="开赛后公开" />
@@ -785,7 +840,6 @@ const Arena = () => (
       <Roster compact />
       <Chat />
       <SystemFlow />
-      <AdminTools compact />
     </section>
     <section class="panel lift-in">
       <PanelTitle title="实时提交实况" subtitle={`${state.feed.length} 条`} />
@@ -806,22 +860,58 @@ const PanelTitle = ({ title, subtitle, action }: { title: string; subtitle?: str
   </div>
 );
 
-const DifficultySelect = ({ label, value, onChange }: { label: string; value: DifficultyLevel; onChange: (value: DifficultyLevel) => void }) => {
-  const current = difficultyMeta.find((item) => item.value === value) ?? difficultyMeta[0];
+const DifficultyRangeSlider = () => {
+  const low = Math.min(draft.difficultyLow, draft.difficultyHigh) as DifficultyLevel;
+  const high = Math.max(draft.difficultyLow, draft.difficultyHigh) as DifficultyLevel;
+  const setLow = (value: DifficultyLevel) => {
+    draft.difficultyLow = value;
+    if (draft.difficultyLow > draft.difficultyHigh) draft.difficultyHigh = draft.difficultyLow;
+    notify();
+  };
+  const setHigh = (value: DifficultyLevel) => {
+    draft.difficultyHigh = value;
+    if (draft.difficultyHigh < draft.difficultyLow) draft.difficultyLow = draft.difficultyHigh;
+    notify();
+  };
   return (
-    <label class="difficulty-field" style={{ "--difficulty-color": current.color } as preact.JSX.CSSProperties}>
-      {label}
-      <span class="difficulty-input">
-        <span class="difficulty-dot" />
-        <select value={value} onInput={(event) => onChange(Number(event.currentTarget.value) as DifficultyLevel)}>
-          {difficultyMeta.map((item) => (
-            <option value={item.value} key={item.value}>
-              {item.label}
-            </option>
-          ))}
-        </select>
-      </span>
-    </label>
+    <div class="difficulty-range">
+      <div class="difficulty-range-head">
+        <span>
+          低难度 <strong>{difficultyName(low)}</strong>
+        </span>
+        <span>
+          高难度 <strong>{difficultyName(high)}</strong>
+        </span>
+      </div>
+      <div class="difficulty-track-wrap">
+        <div class="difficulty-track" />
+        <input
+          class="difficulty-range-input low"
+          type="range"
+          min="1"
+          max="8"
+          step="1"
+          value={draft.difficultyLow}
+          aria-label="低难度端点"
+          onInput={(event) => setLow(Number(event.currentTarget.value) as DifficultyLevel)}
+        />
+        <input
+          class="difficulty-range-input high"
+          type="range"
+          min="1"
+          max="8"
+          step="1"
+          value={draft.difficultyHigh}
+          aria-label="高难度端点"
+          onInput={(event) => setHigh(Number(event.currentTarget.value) as DifficultyLevel)}
+        />
+      </div>
+      <div class="difficulty-scale">
+        {difficultyMeta.map((item) => (
+          <span key={item.value}>{item.short}</span>
+        ))}
+      </div>
+    </div>
   );
 };
 
@@ -843,17 +933,24 @@ const WaitingRooms = () => {
               {room.problemCount} 题 · {room.status === "arena" && room.startedAt ? `开赛 ${timeAgo(room.startedAt)}` : timeAgo(room.createdAt)}
             </span>
           </div>
-          <button
-            onClick={() => {
-              if (hasBlockingActiveRoom(room.roomId)) {
-                setStatus("你已经在一场比赛中，不能加入其他房间");
-                return;
-              }
-              location.hash = `room=${room.roomId}&secret=${room.secret}`;
-            }}
-          >
-            {room.status === "arena" ? "观赛" : "加入"}
-          </button>
+          <div class="room-actions">
+            <button
+              onClick={() => {
+                if (hasBlockingActiveRoom(room.roomId)) {
+                  setStatus("你已经在一场比赛中，不能加入其他房间");
+                  return;
+                }
+                location.hash = `room=${room.roomId}&secret=${room.secret}`;
+              }}
+            >
+              {room.status === "arena" ? "观赛" : "加入"}
+            </button>
+            {isAdmin(identity.luoguName) ? (
+              <button class="danger" onClick={() => void forceCloseListing(room)}>
+                强制关房
+              </button>
+            ) : null}
+          </div>
         </div>
       ))}
     </div>
@@ -901,8 +998,8 @@ const TeamCard = ({ team }: { team: Seat }) => {
 };
 
 const PlayerRow = ({ player, team }: { player: Player; team: Seat }) => {
-  const muted = Boolean(state.muted[player.id]);
-  const kicked = state.kicked[player.id] || state.banned[normalizeName(player.luoguName)];
+  const muted = isMuted(player.id);
+  const kicked = moderationRecordForPlayer(player);
   return (
     <div class={`player ${kicked ? "restricted" : ""}`}>
       <span class="player-name">{player.luoguName}</span>
@@ -918,8 +1015,8 @@ const PlayerRow = ({ player, team }: { player: Player; team: Seat }) => {
 };
 
 const RestrictionBanner = () => {
-  const record = state.kicked[identity.id] || state.banned[normalizeName(identity.luoguName)];
-  if (!record && !state.muted[identity.id]) return null;
+  const record = moderationRecordForPlayer(state.players[identity.id]) || moderationRecordForName(identity.luoguName);
+  if (!record && !isMuted(identity.id)) return null;
   return (
     <div class="restriction-banner">
       {record ? (
@@ -940,20 +1037,18 @@ const RestrictionBanner = () => {
 };
 
 const AdminTools = ({ compact = false }: { compact?: boolean }) => {
-  if (!isAdmin(identity.luoguName) || roomId === "global") return null;
+  if (!isAdmin(identity.luoguName) || roomId !== "global") return null;
   const players = Object.values(state.players).sort((a, b) => a.luoguName.localeCompare(b.luoguName));
   return (
     <div class={`admin-tools ${compact ? "compact" : ""}`}>
       <div class="admin-head">
-        <span>管理员面板</span>
-        <button class="danger" onClick={() => void adminCloseRoom()}>
-          强制关闭房间
-        </button>
+        <span>全局管理员面板</span>
+        <small>禁言影响全部房间发言，踢出会按用户名封禁。</small>
       </div>
       <div class="admin-list">
         {players.map((player) => {
-          const muted = Boolean(state.muted[player.id]);
-          const kicked = Boolean(state.kicked[player.id] || state.banned[normalizeName(player.luoguName)]);
+          const muted = isMuted(player.id);
+          const kicked = Boolean(moderationRecordForPlayer(player));
           const protectedUser = isAdmin(player.luoguName);
           return (
             <div class="admin-row" key={player.id}>
@@ -1086,13 +1181,13 @@ const Chat = () => {
           placeholder={roomId === "global" ? "输入公共消息" : "输入消息，/ 开头为队内私聊"}
           autoComplete="new-password"
           spellcheck={false}
-          disabled={Boolean(state.muted[identity.id] || isRestricted(identity.id))}
+          disabled={Boolean(isMuted(identity.id) || isRestricted(identity.id))}
           onInput={(event) => {
             draft.chat = event.currentTarget.value;
             notify();
           }}
         />
-        <button disabled={Boolean(state.muted[identity.id] || isRestricted(identity.id))}>发送</button>
+        <button disabled={Boolean(isMuted(identity.id) || isRestricted(identity.id))}>发送</button>
       </form>
     </>
   );
@@ -1222,10 +1317,14 @@ const participantCount = (): number => Object.values(state.players).filter((play
 const teamName = (seat: Seat): string => (seat === "red" ? "红方" : seat === "blue" ? "蓝方" : "观赛席");
 const isAdmin = (name: string): boolean => adminNames.has(name);
 const normalizeName = (name: string): string => name.trim().toLowerCase();
-const isBannedName = (name: string): boolean => Boolean(state.banned[normalizeName(name)]);
+const moderationRecordForName = (name: string) => state.banned[normalizeName(name)] || globalModeration.banned[normalizeName(name)];
+const moderationRecordForPlayer = (player: Player | undefined) =>
+  player ? state.kicked[player.id] || globalModeration.kicked[player.id] || moderationRecordForName(player.luoguName) : undefined;
+const isBannedName = (name: string): boolean => Boolean(moderationRecordForName(name));
+const isMuted = (id: string): boolean => Boolean(state.muted[id] || globalModeration.muted[id]);
 const isRestricted = (id: string): boolean => {
   const player = state.players[id];
-  return Boolean(state.kicked[id] || (player && state.banned[normalizeName(player.luoguName)]));
+  return Boolean(moderationRecordForPlayer(player));
 };
 const findPlayerByName = (name: string): Player | undefined =>
   Object.values(state.players).find((player) => normalizeName(player.luoguName) === normalizeName(name));

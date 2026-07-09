@@ -42,7 +42,7 @@ export type SystemChatCommand =
   | { kind: "player.unmuted"; targetId: string }
   | { kind: "player.kicked"; targetId: string; reason: string }
   | { kind: "player.unkicked"; targetName: string }
-  | { kind: "room.closed"; reason: string };
+  | { kind: "room.closed"; reason: string; actorName?: string };
 
 export const encodeSystemChatCommand = (command: SystemChatCommand): string =>
   `${SYSTEM_CHAT_PREFIX}${encodeURIComponent(JSON.stringify(command))}`;
@@ -395,7 +395,7 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
       }
       return true;
     case "room.closed":
-      if (isAdminName(nameOf(state, event.actorId))) {
+      if (isAdminName(command.actorName ?? nameOf(state, event.actorId)) || state.phase === "lobby") {
         state.phase = "finished";
         state.closed = { reason: command.reason || "管理员关闭房间", at: event.issuedAt };
         state.system.push(`[系统] 房间已关闭：${state.closed.reason}`);
