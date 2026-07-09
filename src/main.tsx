@@ -571,7 +571,10 @@ const judgeProblem = async (pid: string) => {
 
 const adminMute = async (player: Player, muted: boolean) => {
   if (!isAdmin(identity.luoguName) || isAdmin(player.luoguName)) return;
-  await emitCommand({ kind: muted ? "player.unmuted" : "player.muted", targetId: player.id });
+  const sameNamePlayers = playersByNormalizedName(player.luoguName);
+  for (const target of sameNamePlayers) {
+    await emitCommand({ kind: muted ? "player.unmuted" : "player.muted", targetId: target.id });
+  }
 };
 
 const adminKick = async (player: Player) => {
@@ -704,6 +707,7 @@ const Home = () => (
     <section class="panel chat-panel lift-in">
       <PanelTitle title="公共聊天室" subtitle="公共大厅消息" />
       <Chat />
+      <AdminTools />
     </section>
     <section class="stack">
       <section class="panel hero-panel lift-in">
@@ -749,11 +753,6 @@ const Home = () => (
           <button class="primary">创建房间</button>
         </form>
       </section>
-      {isAdmin(identity.luoguName) ? (
-        <section class="panel lift-in">
-          <AdminTools />
-        </section>
-      ) : null}
       <section class="home-bottom">
         <section class="panel lift-in">
           <PanelTitle title="实时对局" subtitle="等待或进行中" />
@@ -1038,7 +1037,7 @@ const RestrictionBanner = () => {
 
 const AdminTools = ({ compact = false }: { compact?: boolean }) => {
   if (!isAdmin(identity.luoguName) || roomId !== "global") return null;
-  const players = Object.values(state.players).sort((a, b) => a.luoguName.localeCompare(b.luoguName));
+  const players = uniquePlayersByName();
   return (
     <div class={`admin-tools ${compact ? "compact" : ""}`}>
       <div class="admin-head">
@@ -1047,11 +1046,12 @@ const AdminTools = ({ compact = false }: { compact?: boolean }) => {
       </div>
       <div class="admin-list">
         {players.map((player) => {
-          const muted = isMuted(player.id);
+          const sameNamePlayers = playersByNormalizedName(player.luoguName);
+          const muted = sameNamePlayers.some((target) => isMuted(target.id));
           const kicked = Boolean(moderationRecordForPlayer(player));
           const protectedUser = isAdmin(player.luoguName);
           return (
-            <div class="admin-row" key={player.id}>
+            <div class="admin-row" key={normalizeName(player.luoguName)}>
               <div>
                 <strong>{player.luoguName}</strong>
                 <span>
@@ -1170,7 +1170,7 @@ const Chat = () => {
   return (
     <>
       <div class="chat-log">
-        {chats.slice(-80).map((chat) => (
+        {chats.slice(-80).reverse().map((chat) => (
           <ChatLine chat={chat} key={chat.id} />
         ))}
       </div>
@@ -1328,6 +1328,19 @@ const isRestricted = (id: string): boolean => {
 };
 const findPlayerByName = (name: string): Player | undefined =>
   Object.values(state.players).find((player) => normalizeName(player.luoguName) === normalizeName(name));
+const playersByNormalizedName = (name: string): Player[] =>
+  Object.values(state.players).filter((player) => normalizeName(player.luoguName) === normalizeName(name));
+const uniquePlayersByName = (): Player[] => {
+  const byName = new Map<string, Player>();
+  for (const player of Object.values(state.players)) {
+    const key = normalizeName(player.luoguName);
+    const current = byName.get(key);
+    if (!current || isAdmin(player.luoguName) || player.luoguName.localeCompare(current.luoguName) < 0) {
+      byName.set(key, player);
+    }
+  }
+  return [...byName.values()].sort((a, b) => a.luoguName.localeCompare(b.luoguName));
+};
 
 const rememberActiveRoomIfNeeded = () => {
   const seat = state.players[identity.id]?.team;

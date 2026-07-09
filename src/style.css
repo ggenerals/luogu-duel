@@ -449,6 +449,12 @@ h3 {
   box-shadow: none;
 }
 
+.difficulty-range-input::-webkit-slider-runnable-track {
+  height: 34px;
+  border: 0;
+  background: transparent;
+}
+
 .difficulty-range-input::-webkit-slider-thumb {
   width: 20px;
   height: 20px;
@@ -459,6 +465,16 @@ h3 {
   cursor: pointer;
   pointer-events: auto;
   appearance: none;
+}
+
+.difficulty-range-input::-moz-range-track {
+  height: 34px;
+  border: 0;
+  background: transparent;
+}
+
+.difficulty-range-input::-moz-range-progress {
+  background: transparent;
 }
 
 .difficulty-range-input.high::-webkit-slider-thumb {
@@ -782,6 +798,8 @@ tr.blue {
 }
 
 .chat-log {
+  display: flex;
+  flex-direction: column-reverse;
   min-height: 280px;
   flex: 1;
   overflow: auto;
@@ -893,12 +911,18 @@ tr.blue {
 
 .admin-tools {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
   border: 1px solid #dce5ef;
   border-radius: 8px;
   background: #f8fafc;
   margin-top: 12px;
   padding: 12px;
+}
+
+.chat-panel .admin-tools {
+  flex: 0 0 auto;
+  max-height: min(42vh, 360px);
 }
 
 .admin-tools.compact {
@@ -919,6 +943,9 @@ tr.blue {
 .admin-list {
   display: grid;
   gap: 8px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
 }
 
 .admin-row {
