@@ -56,8 +56,6 @@ button {
 }
 
 button:hover:not(:disabled) {
-  border-color: #9aa8ba;
-  background: linear-gradient(180deg, #ffffff, #edf2f8);
   box-shadow: 0 7px 18px rgb(35 48 70 / 0.12);
   transform: translateY(-1px);
 }

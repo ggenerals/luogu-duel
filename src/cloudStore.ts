@@ -54,7 +54,7 @@ export const saveCloudSnapshot = async (roomId: string, envelopes: SignedEnvelop
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(snapshot),
-    keepalive: true,
+    // keepalive: true,
     signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`cloud set failed: ${response.status}`);
@@ -63,7 +63,7 @@ export const saveCloudSnapshot = async (roomId: string, envelopes: SignedEnvelop
 export const deleteCloudSnapshot = async (roomId: string): Promise<void> => {
   const response = await fetch(`${endpoint}/del?key=${encodeURIComponent(roomKey(roomId))}`, {
     method: "DELETE",
-    keepalive: true,
+    // keepalive: true,
     signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`cloud delete failed: ${response.status}`);
@@ -95,7 +95,7 @@ export const saveRoomDirectory = async (rooms: RoomListing[]): Promise<void> => 
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(directory),
-    keepalive: true,
+    // keepalive: true,
     signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`directory set failed: ${response.status}`);
