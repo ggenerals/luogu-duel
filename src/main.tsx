@@ -715,7 +715,7 @@ const Home = () => (
         <div>
           <p class="eyebrow">LOCKOUT MATCH</p>
           <h1>创建一场洛谷抢分对决</h1>
-          <p class="lead">选择难度端点，自动缓存公开题库并抽题。正式开赛前题目封存，判题只统计开赛后的提交。</p>
+          <p class="lead">欢迎加入洛谷抢分对决！自定义难度，智能抽题封存。赛后提交计分，公平竞技，速来挑战你的算法极限！。</p>
         </div>
         <form class="create-form" autocomplete="off" onSubmit={(event) => void submitCreateRoom(event)}>
           <label>
