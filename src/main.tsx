@@ -65,10 +65,11 @@ const draft = {
   adminReasons: {} as Record<string, string>
 };
 
-const storageKey = () => `luogu-duel.log.${roomId}`;
-const roomSeatKey = () => `luogu-duel.seat.${roomId}`;
-const activeRoomKey = "luogu-duel.active-room.v1";
-const historyKey = "luogu-duel.history.v1";
+const dataVersion = "v2";
+const storageKey = () => `luogu-duel.${dataVersion}.log.${roomId}`;
+const roomSeatKey = () => `luogu-duel.${dataVersion}.seat.${roomId}`;
+const activeRoomKey = `luogu-duel.active-room.${dataVersion}`;
+const historyKey = `luogu-duel.history.${dataVersion}`;
 const adminNames = new Set(["General826", "Gcend", "GCSG01"]);
 
 const notify = () => render(<App />, app);

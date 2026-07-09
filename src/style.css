@@ -45,24 +45,11 @@ button {
   cursor: pointer;
   font-weight: 760;
   white-space: nowrap;
-  box-shadow: 0 1px 0 rgb(255 255 255 / 0.78) inset;
   transition:
     box-shadow 150ms ease,
     background 150ms ease,
     border-color 150ms ease,
     color 150ms ease;
-}
-
-button:hover:not(:disabled) {
-  border-color: #9aa8ba;
-  background: linear-gradient(180deg, #ffffff, #edf2f8);
-  box-shadow:
-    0 1px 0 rgb(255 255 255 / 0.8) inset,
-    0 5px 16px rgb(35 48 70 / 0.1);
-}
-
-button:active:not(:disabled) {
-  box-shadow: 0 2px 8px rgb(35 48 70 / 0.1);
 }
 
 button:disabled {

@@ -1,7 +1,7 @@
 import type { SignedEnvelope } from "./types";
 
 const endpoint = "https://vd.gengen.qzz.io";
-const namespace = "luogu-duel:v1";
+const namespace = "luogu-duel:v2";
 const requestTimeoutMs = 6500;
 
 type CloudSnapshot = {
