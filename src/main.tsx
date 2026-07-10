@@ -540,7 +540,7 @@ const Home = () => (
         <Terminal size={18} />
         <div>
           <h1>创建 Luogu Duel</h1>
-          <p>极简房间、实时状态、房间级 Durable Object。</p>
+          <p>与你的朋友产生一次情切的对决！</p>
         </div>
       </div>
       <form class="create-form" onSubmit={(event) => void submitCreateRoom(event)}>

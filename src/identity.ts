@@ -74,11 +74,14 @@ const keyId = async (publicKey: JsonWebKey): Promise<string> => {
 };
 
 const stableStringify = (value: unknown): string => {
+  if (value === undefined) return "null";
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  return `{${Object.keys(value as Record<string, unknown>)
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object)
+    .filter((key) => object[key] !== undefined)
     .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`)
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(object[key])}`)
     .join(",")}}`;
 };
 
