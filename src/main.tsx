@@ -924,7 +924,7 @@ const PlayerRow = ({ player }: { player: Player }) => {
   const muted = isMutedPlayer(player);
   return (
     <div class={`player-row ${banned ? "banned" : ""}`}>
-      <div class="avatar">{avatarText(player.luoguName)}</div>
+      <UserAvatar name={player.luoguName} className="avatar" />
       <div class="player-main">
         <span>{player.luoguName}</span>
         <small>{ratingFor(player.luoguName)}</small>
@@ -1044,11 +1044,16 @@ const ChatLine = ({ item }: { item: ChatStreamItem }) => {
   const chat = item.chat;
   return (
     <p class={chat.visibility === "team" ? "private" : ""}>
-      <span class="chat-avatar">{avatarText(chat.luoguName)}</span>
+      <UserAvatar name={chat.luoguName} className="chat-avatar" />
       <span>{chat.visibility === "team" ? "TEAM" : "ALL"} / {chat.luoguName}</span>
       <span class="chat-text">{chat.text}</span>
     </p>
   );
+};
+
+const UserAvatar = ({ name, className }: { name: string; className: string }) => {
+  const url = avatarUrlFor(name);
+  return url ? <img class={className} src={url} alt="" loading="lazy" /> : <span class={className}>{avatarText(name)}</span>;
 };
 
 const ToastStack = () => {
@@ -1219,6 +1224,21 @@ const isMutedPlayer = (player: Player): boolean => isMutedByIdentity(player.id, 
 const isMutedByIdentity = (id: string, name: string): boolean => {
   const nameKey = `name:${normalizeName(name)}`;
   return Boolean(state.muted[id] || state.muted[nameKey] || globalModeration.muted[id] || globalModeration.muted[nameKey]);
+};
+const avatarUrlFor = (name: string): string => {
+  const key = normalizeName(name);
+  if (!key || avatarCache[key]) return avatarCache[key] || "";
+  if (!avatarLoading.has(key)) {
+    avatarLoading.add(key);
+    void fetchLuoguUser(name).then((user) => {
+      if (user?.avatar) avatarCache[key] = user.avatar;
+      avatarLoading.delete(key);
+      notify();
+    }).catch(() => {
+      avatarLoading.delete(key);
+    });
+  }
+  return "";
 };
 const currentSeat = (): Seat => state.players[identity.id]?.team ?? preferredSeat();
 const preferredSeat = (): Seat => {

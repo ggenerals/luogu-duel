@@ -629,7 +629,7 @@ code {
 
 .segmented {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: auto repeat(3, 1fr);
   gap: 6px;
 }
 
@@ -689,6 +689,16 @@ code {
 .chat-avatar {
   width: 22px;
   height: 22px;
+}
+
+img.avatar,
+img.chat-avatar {
+  object-fit: cover;
+}
+
+.segmented .leave-seat {
+  border-color: var(--red);
+  color: #ffd8d0;
 }
 
 .player-main {
@@ -990,16 +1000,6 @@ code {
   overflow-wrap: anywhere;
 }
 
-.leave-room-button {
-  position: fixed;
-  left: 16px;
-  bottom: 16px;
-  z-index: 45;
-  border-color: var(--line);
-  background: rgb(13 17 23 / 0.92);
-  box-shadow: 0 12px 28px rgb(0 0 0 / 0.34);
-  animation: float-in 220ms ease both;
-}
 
 .end-card,
 .ban-overlay > div {
