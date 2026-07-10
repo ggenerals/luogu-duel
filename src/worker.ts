@@ -190,6 +190,7 @@ export default {
     if (url.pathname === "/api/auth/callback") return authCallback(request, env);
     if (url.pathname === "/api/auth/exchange" && request.method === "POST") return exchangeOAuthCode(request, env);
     if (url.pathname === "/api/luogu/records") return fetchLuoguRecords(url, env);
+    if (url.pathname === "/api/luogu/user/search") return fetchLuoguUserSearch(url, env);
     if (url.pathname === "/api/rooms") return env.DUEL_ROOM.getByName("__directory").fetch("https://duel.internal/directory");
 
     const roomMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/(ws|snapshot|event)$/);
@@ -334,6 +335,26 @@ const fetchLuoguRecords = async (url: URL, env: Env): Promise<Response> => {
     headers: {
       "content-type": response.headers.get("content-type") || "application/json; charset=utf-8",
       "cache-control": "no-store"
+    }
+  });
+};
+
+const fetchLuoguUserSearch = async (url: URL, env: Env): Promise<Response> => {
+  const keyword = (url.searchParams.get("keyword") || "").trim();
+  if (!keyword || keyword.length > 40) return jsonError("invalid keyword", 400);
+  const target = new URL("https://www.luogu.com.cn/api/user/search");
+  target.searchParams.set("keyword", keyword);
+  const response = await fetch(target, {
+    headers: {
+      accept: "application/json",
+      cookie: env.LUOGU_COOKIE || "_uid=1058607; __client_id=yi3r6uea6ccsp2ns6z4v6x6guyyx6bykinni6go5aene2r4z"
+    }
+  });
+  return new Response(await response.text(), {
+    status: response.status,
+    headers: {
+      "content-type": response.headers.get("content-type") || "application/json; charset=utf-8",
+      "cache-control": "public, max-age=300"
     }
   });
 };

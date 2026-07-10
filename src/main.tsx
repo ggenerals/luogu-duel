@@ -5,6 +5,8 @@ import {
   Ban,
   Bot,
   Check,
+  ChevronDown,
+  ChevronRight,
   CircleDot,
   Crown,
   DoorClosed,
@@ -35,7 +37,6 @@ import {
   canCloseRoom,
   canStart,
   createInitialState,
-  createReplacementProblem,
   isAdminName,
   isTeam,
   makeProblemSet,
@@ -47,8 +48,8 @@ import {
   winThreshold
 } from "./domain";
 import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope, type LocalIdentity } from "./identity";
-import { fetchLuoguRecords } from "./luogu";
-import { cachedProblemCount, difficultyMeta, pickLuoguProblems, type DifficultyLevel } from "./problemPicker";
+import { fetchLuoguRecords, fetchLuoguUser } from "./luogu";
+import { cachedProblemCount, difficultyMeta, pickLuoguProblems, pickLuoguReplacementProblem, type DifficultyLevel } from "./problemPicker";
 import { completeCpOAuthLogin, consumeCpOAuthError, loadCpSession, logoutCpSession, startCpOAuthLogin, type CpSession } from "./oauth";
 import { fetchRooms, fetchSnapshot, publishEnvelope, roomWebSocketUrl, type RoomListing, type ServerMessage } from "./realtimeStore";
 import type { ChatMessage, DuelEvent, DuelState, Player, Problem, Seat, SignedEnvelope, VoteKind } from "./types";
@@ -77,6 +78,10 @@ let syncTimer: number | undefined;
 let statusText = "booting...";
 let statusTone: "info" | "error" = "info";
 let authErrorText = "";
+let toasts: ToastMessage[] = [];
+const notifiedKeys = new Set<string>();
+const avatarCache: Record<string, string> = {};
+const avatarLoading = new Set<string>();
 
 const draft = {
   userMenuOpen: false,
@@ -88,7 +93,15 @@ const draft = {
   pickerStatus: "",
   closeReason: "房主关闭房间",
   adminTarget: "",
-  adminReason: ""
+  adminReason: "",
+  teamsOpen: false
+};
+
+type ToastMessage = {
+  id: string;
+  title: string;
+  text: string;
+  tone: "info" | "success" | "warning";
 };
 
 const dataVersion = "v3";
@@ -278,6 +291,8 @@ const ensureHomeJoined = async () => {
 const receiveEnvelope = async (envelope: SignedEnvelope, renderNow = true) => {
   if (envelopes.some((item) => item.event.id === envelope.event.id)) return;
   if (!(await verifyEnvelope(envelope))) return;
+  const previousPhase = state.phase;
+  const previousSystemCount = state.system.length;
   envelopes.push(envelope);
   envelopes.sort(compareEnvelopes);
   state = applyEvent(state, envelope.event);
@@ -286,6 +301,7 @@ const receiveEnvelope = async (envelope: SignedEnvelope, renderNow = true) => {
   scheduleFinishReturn();
   maybeAutoStart();
   rememberActiveRoomIfNeeded();
+  if (renderNow) pushToastsForEvent(envelope.event, previousPhase, previousSystemCount);
   if (renderNow) notify();
 };
 
@@ -303,6 +319,64 @@ const emit = async (event: DuelEvent) => {
   } catch (error) {
     if (!sentBySocket) setStatus(friendlyError(error, "事件已保存在本地，发送失败"), "error");
   }
+};
+
+const pushToastsForEvent = (event: DuelEvent, previousPhase: DuelState["phase"], previousSystemCount: number) => {
+  if (mode !== "room" && event.roomId !== "global") return;
+  if (event.type === "game.started") {
+    notifyImportant(`${event.id}:start`, "比赛开始", matchTitle(), "success");
+  }
+  if (previousPhase !== "finished" && state.phase === "finished") {
+    notifyImportant(`${event.id}:end`, "比赛结束", state.closed?.reason ?? (state.winner === "draw" ? "双方平局" : `${teamName(state.winner)} 获胜`), "warning");
+  }
+  if (event.type === "chat.sent" && event.visibility === "team" && state.phase === "arena") {
+    const chat = state.chats.find((item) => item.id === event.id);
+    if (chat && visibleChats(state, identity.id).some((item) => item.id === chat.id)) {
+      notifyImportant(`${event.id}:team`, `队内消息 / ${chat.luoguName}`, chat.text, "info");
+    }
+  }
+  if (event.type !== "game.started" && (state.phase === "arena" || event.type.startsWith("vote.") || event.type === "judge.recordSeen" || event.type === "room.closed")) {
+    for (const message of state.system.slice(previousSystemCount)) {
+      notifyImportant(`${message.id}:system`, "系统", message.text, event.type === "judge.recordSeen" ? "success" : "info");
+    }
+  }
+};
+
+const notifyImportant = async (key: string, title: string, text: string, tone: ToastMessage["tone"] = "info") => {
+  if (notifiedKeys.has(key)) return;
+  notifiedKeys.add(key);
+  const gmNotify = (globalThis as unknown as { GM_notification?: (options: { title: string; text: string; timeout?: number }) => void }).GM_notification;
+  if (gmNotify) {
+    gmNotify({ title: `Luogu Duel · ${title}`, text, timeout: 4200 });
+    return;
+  }
+  if ("Notification" in window) {
+    let permission = Notification.permission;
+    if (permission === "default") {
+      try {
+        permission = await Notification.requestPermission();
+      } catch {
+        permission = "denied";
+      }
+    }
+    if (permission === "granted") {
+      new Notification(`Luogu Duel · ${title}`, {
+        body: text,
+        icon: "https://gengen.qzz.io/favicon.ico"
+      });
+      return;
+    }
+  }
+  pushToast(title, text, tone);
+};
+
+const pushToast = (title: string, text: string, tone: ToastMessage["tone"] = "info") => {
+  const toast: ToastMessage = { id: crypto.randomUUID(), title, text, tone };
+  toasts = [...toasts.slice(-3), toast];
+  window.setTimeout(() => {
+    toasts = toasts.filter((item) => item.id !== toast.id);
+    notify();
+  }, 4200);
 };
 
 const emitChat = async (text: string, visibility: "all" | "team") => {
@@ -438,6 +512,18 @@ const closeRoom = async () => {
   await emitDirect({ ...baseEvent("room.closed"), reason: draft.closeReason, actorName: identity.luoguName });
 };
 
+const leaveRoom = async () => {
+  if (mode !== "room" || state.phase !== "lobby") return;
+  if (state.hostId === identity.id) {
+    setStatus("房主不能退出，只能关闭房间", "error");
+    return;
+  }
+  await emit({ ...baseEvent("player.left") });
+  localStorage.removeItem(roomSeatKey());
+  localStorage.removeItem(activeRoomKey);
+  location.hash = "";
+};
+
 const setSeat = async (seat: Seat) => {
   if (blockedByBan() || state.phase !== "lobby") return;
   rememberSeat(seat);
@@ -460,6 +546,16 @@ const openVote = async (kind: VoteKind, targetPid?: string, replacement?: Proble
   const player = state.players[identity.id];
   if (!player || !isTeam(player.team) || blockedByBan()) return;
   await emit({ ...baseEvent("vote.opened"), vote: buildVote(kind, player, targetPid, replacement) });
+};
+
+const replaceProblem = async (targetPid: string) => {
+  try {
+    setStatus("正在从题库缓存选择同难度替换题");
+    const replacement = await pickLuoguReplacementProblem(state.problems, targetPid, crypto.randomUUID());
+    await openVote("replace-problem", targetPid, replacement);
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : "换题失败", "error");
+  }
 };
 
 const judgeProblem = async (pid: string) => {
@@ -493,6 +589,7 @@ const App = () => {
       <Shell title="Luogu Duel" subtitle={mode === "home" ? "control room" : `${roomId} / ${state.phase}`}>
         {mode === "home" ? <Home /> : <Room />}
       </Shell>
+      <ToastStack />
       <BanOverlay />
       <EndOverlay />
     </>
@@ -516,7 +613,7 @@ const Shell = ({ title, subtitle, children }: { title: string; subtitle: string;
           draft.userMenuOpen = !draft.userMenuOpen;
           notify();
         }}>
-          <span class="chat-avatar">{avatarText(identity?.luoguName ?? "?")}</span>
+          <UserAvatar name={identity?.luoguName ?? "?"} className="chat-avatar" />
           {identity?.luoguName ?? "..."}
         </button>
         {draft.userMenuOpen ? (
@@ -609,8 +706,15 @@ const Room = () => (
     </section>
 
     <section class="panel roster-panel">
-      <PanelTitle icon={<Users size={16} />} title="TEAMS" detail="roster / rating" />
-      <Roster />
+      <button class="roster-toggle" onClick={() => {
+        draft.teamsOpen = !draft.teamsOpen;
+        notify();
+      }}>
+        {draft.teamsOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+        <strong>TEAMS</strong>
+        <span>{teamSummary()}</span>
+      </button>
+      {draft.teamsOpen ? <Roster /> : null}
     </section>
 
     <section class="panel comms-panel">
@@ -640,6 +744,10 @@ const RoomControls = () => {
       {state.phase === "lobby" ? (
         <>
           <div class="segmented">
+            <button class="leave-seat" disabled={state.hostId === identity.id || blockedByBan()} onClick={() => void leaveRoom()}>
+              <DoorClosed size={15} />
+              退出
+            </button>
             {(["red", "blue", "spectator"] as Seat[]).map((seat) => (
               <button key={seat} class={currentSeat() === seat ? "active" : ""} disabled={blockedByBan()} onClick={() => void setSeat(seat)}>
                 {seat === "spectator" ? <Eye size={15} /> : <CircleDot size={15} />}
@@ -836,9 +944,13 @@ const Problems = () => (
     {state.problems.map((problem, index) => (
       <article class={`problem-card ${problem.solvedBy?.team ?? ""}`} key={problem.pid}>
         <div>
-          <a href={`https://www.luogu.com.cn/problem/${problem.pid}`} target="_blank" rel="noreferrer">
-            {state.phase === "lobby" ? `P${String(index + 1).padStart(4, "0")}` : problem.pid}
-          </a>
+          {state.phase === "lobby" ? (
+            <span class="problem-mask">P{String(index + 1).padStart(4, "0")}</span>
+          ) : (
+            <a href={`https://www.luogu.com.cn/problem/${problem.pid}`} target="_blank" rel="noreferrer">
+              {problem.pid}
+            </a>
+          )}
           <span>{problem.score} pts</span>
         </div>
         {problem.difficulty ? <DifficultyBadge level={problem.difficulty} /> : <em>random</em>}
@@ -846,7 +958,7 @@ const Problems = () => (
         {state.phase === "arena" && isTeam(currentSeat()) && !blockedByBan() ? (
           <div class="problem-actions">
             <button onClick={() => void judgeProblem(problem.pid)}>判题</button>
-            <button onClick={() => void openVote("replace-problem", problem.pid, createReplacementProblem(state, crypto.randomUUID(), problem.pid))}>换题</button>
+            <button onClick={() => void replaceProblem(problem.pid)}>换题</button>
             <button onClick={() => void openVote("delete-problem", problem.pid)}>删题</button>
           </div>
         ) : null}
@@ -936,6 +1048,20 @@ const ChatLine = ({ item }: { item: ChatStreamItem }) => {
       <span>{chat.visibility === "team" ? "TEAM" : "ALL"} / {chat.luoguName}</span>
       <span class="chat-text">{chat.text}</span>
     </p>
+  );
+};
+
+const ToastStack = () => {
+  if (!toasts.length) return null;
+  return (
+    <div class="toast-stack">
+      {toasts.map((toast) => (
+        <div class={`toast ${toast.tone}`} key={toast.id}>
+          <strong>{toast.title}</strong>
+          <span>{toast.text}</span>
+        </div>
+      ))}
+    </div>
   );
 };
 
@@ -1110,6 +1236,10 @@ const matchTitle = (): string => {
   const red = Object.values(state.players).filter((p) => p.team === "red").map((p) => p.luoguName).join(" / ");
   const blue = Object.values(state.players).filter((p) => p.team === "blue").map((p) => p.luoguName).join(" / ");
   return `${red || "红方"} vs ${blue || "蓝方"}`;
+};
+const teamSummary = (): string => {
+  const count = (seat: Seat) => Object.values(state.players).filter((player) => player.team === seat).length;
+  return `红 ${count("red")} / 蓝 ${count("blue")} / 观赛 ${count("spectator")}`;
 };
 
 const rememberActiveRoomIfNeeded = () => {

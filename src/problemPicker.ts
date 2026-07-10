@@ -53,6 +53,27 @@ export const pickLuoguProblems = async (
   }));
 };
 
+export const pickLuoguReplacementProblem = async (
+  currentProblems: Problem[],
+  targetPid: string,
+  seed: string
+): Promise<Problem> => {
+  const groups = await loadProblemBank();
+  const target = currentProblems.find((problem) => problem.pid === targetPid);
+  const used = new Set(currentProblems.map((problem) => problem.pid));
+  used.delete(targetPid);
+  const levels = target?.difficulty ? [target.difficulty as DifficultyLevel] : difficultyMeta.map((item) => item.value);
+  const pool = levels.flatMap((level) => groups[String(level)] ?? []).filter((item) => !used.has(item.pid));
+  if (!pool.length) throw new Error("题库缓存中没有可替换题目");
+  const [picked] = seededSample(pool, 1, `${seed}:${targetPid}:${currentProblems.length}`);
+  return {
+    pid: picked.pid,
+    title: picked.title,
+    difficulty: picked.difficulty,
+    score: target?.score ?? 100
+  };
+};
+
 export const cachedProblemCount = (): number => {
   const cached = readCache();
   if (!cached) return 0;

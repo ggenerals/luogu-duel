@@ -314,6 +314,7 @@ code {
 
 .roster-panel {
   grid-area: roster;
+  padding: 8px 12px;
 }
 
 .comms-panel {
@@ -344,6 +345,7 @@ code {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
+  overflow: hidden;
 }
 
 .problems-panel {
@@ -351,6 +353,7 @@ code {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
+  overflow: hidden;
 }
 
 .section-head,
@@ -555,6 +558,23 @@ code {
   transform: translateY(-1px);
 }
 
+.roster-toggle {
+  width: 100%;
+  justify-content: flex-start;
+  border-color: transparent;
+  padding: 4px 0;
+}
+
+.roster-toggle strong {
+  font: 900 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.roster-toggle span {
+  margin-left: auto;
+  color: var(--muted);
+  font: 800 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 .room-card {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -736,6 +756,12 @@ code {
   gap: 8px;
 }
 
+.problem-mask {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 900;
+}
+
 .problem-card.red {
   color: var(--red);
 }
@@ -780,6 +806,7 @@ code {
   margin: 0;
   border-bottom: 1px solid var(--line-soft);
   padding: 7px;
+  animation: line-in 180ms ease both;
 }
 
 .chat-log p > span:nth-child(2) {
@@ -869,7 +896,18 @@ code {
 }
 
 .feed-table {
+  display: block;
   border: 1px solid var(--line-soft);
+  align-self: stretch;
+  overflow: auto;
+}
+
+.feed-table thead,
+.feed-table tbody,
+.feed-table tr {
+  display: table;
+  width: 100%;
+  table-layout: fixed;
 }
 
 .feed-table td {
@@ -906,6 +944,61 @@ code {
   place-items: center;
   background: rgb(13 17 23 / 0.92);
   padding: 24px;
+}
+
+.toast-stack {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 70;
+  display: grid;
+  width: min(360px, calc(100vw - 32px));
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--green);
+  border-radius: 8px;
+  background: rgb(13 17 23 / 0.96);
+  box-shadow: 0 14px 34px rgb(0 0 0 / 0.36);
+  padding: 10px 12px;
+  animation: toast-in 220ms ease both;
+}
+
+.toast.warning {
+  border-left-color: var(--red);
+}
+
+.toast.success {
+  border-left-color: var(--green);
+}
+
+.toast strong,
+.toast span {
+  display: block;
+}
+
+.toast strong {
+  margin-bottom: 4px;
+  font: 900 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.toast span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.leave-room-button {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 45;
+  border-color: var(--line);
+  background: rgb(13 17 23 / 0.92);
+  box-shadow: 0 12px 28px rgb(0 0 0 / 0.34);
+  animation: float-in 220ms ease both;
 }
 
 .end-card,
@@ -960,6 +1053,42 @@ code {
 }
 
 @keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes line-in {
+  from {
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes float-in {
   from {
     opacity: 0;
     transform: translateY(8px);

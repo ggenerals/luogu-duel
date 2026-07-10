@@ -124,6 +124,14 @@ export type DuelEvent =
       team: Seat;
     }
   | {
+      type: "player.left";
+      roomId: string;
+      actorId: string;
+      id: string;
+      lamport: number;
+      issuedAt: number;
+    }
+  | {
       type: "player.readyChanged";
       roomId: string;
       actorId: string;

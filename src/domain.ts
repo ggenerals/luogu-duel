@@ -25,7 +25,7 @@ const statusRank: Record<JudgeStatus, number> = {
   PD: 8
 };
 
-export const ADMIN_NAMES = new Set(["general826", "gcend", "gcsg01"]);
+export const ADMIN_NAMES = new Set(["general0826","slmxf","general826", "gcend", "gcsg01"]);
 export const SYSTEM_CHAT_PREFIX = "@@luogu-duel-system:";
 
 export type SystemChatCommand =
@@ -125,6 +125,9 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
         next.players[event.actorId].ready = false;
         pushSystem(next, `${nameOf(next, event.actorId)} 切换到 ${teamName(team)}`, event.issuedAt);
       }
+      break;
+    case "player.left":
+      leavePlayer(next, event.actorId, event.issuedAt);
       break;
     case "player.readyChanged":
       if (next.players[event.actorId] && next.phase === "lobby" && isTeam(next.players[event.actorId].team) && !isRestricted(next, event.actorId)) {
@@ -268,6 +271,16 @@ const joinPlayer = (state: DuelState, actorId: string, luoguName: string, reques
   } else if (state.roomId !== "global") {
     pushSystem(state, `${name} 加入 ${teamName(team)}`, at);
   }
+};
+
+const leavePlayer = (state: DuelState, actorId: string, at: number) => {
+  const player = state.players[actorId];
+  if (!player || state.phase !== "lobby") return;
+  delete state.players[actorId];
+  delete state.muted[actorId];
+  delete state.kicked[actorId];
+  if (state.hostId === actorId) state.hostId = Object.keys(state.players)[0];
+  if (state.roomId !== "global") pushSystem(state, `${player.luoguName} 退出房间`, at);
 };
 
 const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { type: "chat.sent" }>): boolean => {

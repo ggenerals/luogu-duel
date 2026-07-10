@@ -8,6 +8,13 @@ type LuoguRecord = {
   user?: { name?: string; uid?: number };
 };
 
+export type LuoguUser = {
+  uid: number;
+  name: string;
+  avatar?: string;
+  color?: string;
+};
+
 const statusMap: Record<string, JudgeStatus> = {
   "12": "OK",
   "0": "PD",
@@ -54,6 +61,19 @@ export const fetchLuoguRecords = async (pid: string, users: string[], startedAt:
       };
     })
     .filter((record): record is FeedRecord => Boolean(record));
+};
+
+export const fetchLuoguUser = async (keyword: string): Promise<LuoguUser | null> => {
+  const requestUrl = new URL("/api/luogu/user/search", location.origin);
+  requestUrl.searchParams.set("keyword", keyword);
+  const response = await fetch(requestUrl, {
+    headers: { accept: "application/json" },
+    cache: "force-cache"
+  });
+  if (!response.ok) return null;
+  const data = (await response.json()) as { users?: LuoguUser[] };
+  const normalized = keyword.trim().toLowerCase();
+  return data.users?.find((user) => user.name.toLowerCase() === normalized) ?? data.users?.[0] ?? null;
 };
 
 const findRecords = (value: unknown, startedAt: number): LuoguRecord[] => {
