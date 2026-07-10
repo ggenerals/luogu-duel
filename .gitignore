@@ -2,3 +2,4 @@
 /.codex
 /node_modules
 /dist
+/.wrangler

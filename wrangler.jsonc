@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "luogu-duel",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-07-09",
+  "routes": [
+    {
+      "pattern": "duel.gengen.qzz.io",
+      "zone_name": "gengen.qzz.io"
+    },
+    {
+      "pattern": "duel.gengen.qzz.io/*",
+      "zone_name": "gengen.qzz.io"
+    }
+  ],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DUEL_ROOM",
+        "class_name": "DuelRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DuelRoom"]
+    }
+  ],
+  "vars": {
+    "CP_CLIENT_ID": "1f292b1b-e3b9-44fe-9f50-5c1f1d5042f2"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}

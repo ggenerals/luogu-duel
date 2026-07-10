@@ -52,6 +52,12 @@ export type FeedRecord = {
   recordId: string;
 };
 
+export type SystemMessage = {
+  id: string;
+  text: string;
+  at: number;
+};
+
 export type Vote = {
   id: string;
   kind: VoteKind;
@@ -68,10 +74,12 @@ export type Vote = {
 export type DuelState = {
   roomId: string;
   phase: Phase;
+  hostId?: string;
   startedAt?: number;
   closed?: {
     reason: string;
     at: number;
+    by?: string;
   };
   muted: Record<string, true>;
   kicked: Record<string, ModerationRecord>;
@@ -81,7 +89,7 @@ export type DuelState = {
   chats: ChatMessage[];
   feed: FeedRecord[];
   votes: Record<string, Vote>;
-  system: string[];
+  system: SystemMessage[];
   winner?: Team | "draw";
   lamport: number;
 };
@@ -178,6 +186,56 @@ export type DuelEvent =
       lamport: number;
       issuedAt: number;
       record: FeedRecord;
+    }
+  | {
+      type: "room.closed";
+      roomId: string;
+      actorId: string;
+      id: string;
+      lamport: number;
+      issuedAt: number;
+      reason: string;
+      actorName: string;
+    }
+  | {
+      type: "player.kicked";
+      roomId: string;
+      actorId: string;
+      id: string;
+      lamport: number;
+      issuedAt: number;
+      targetId: string;
+      targetName?: string;
+      reason: string;
+    }
+  | {
+      type: "player.unkicked";
+      roomId: string;
+      actorId: string;
+      id: string;
+      lamport: number;
+      issuedAt: number;
+      targetName: string;
+    }
+  | {
+      type: "player.muted";
+      roomId: string;
+      actorId: string;
+      id: string;
+      lamport: number;
+      issuedAt: number;
+      targetId: string;
+      targetName?: string;
+    }
+  | {
+      type: "player.unmuted";
+      roomId: string;
+      actorId: string;
+      id: string;
+      lamport: number;
+      issuedAt: number;
+      targetId: string;
+      targetName?: string;
     };
 
 export type SignedEnvelope = {

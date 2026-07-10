@@ -22,13 +22,10 @@ const statusMap: Record<string, JudgeStatus> = {
   Accepted: "OK"
 };
 
-const recordsProxy = "https://oauth.gengen.qzz.io/luogu/records";
+const recordsProxy = "/api/luogu/records";
 
 export const fetchLuoguRecords = async (pid: string, users: string[], startedAt: number): Promise<FeedRecord[]> => {
-  const url = new URL("https://www.luogu.com.cn/record/list");
-  url.searchParams.set("pid", pid);
-  url.searchParams.set("_contentOnly", "1");
-  const requestUrl = new URL(recordsProxy);
+  const requestUrl = new URL(recordsProxy, location.origin);
   requestUrl.searchParams.set("pid", pid);
 
   const response = await fetch(requestUrl, {

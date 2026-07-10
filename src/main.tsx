@@ -1,58 +1,82 @@
 import "./style.css";
+import type { ComponentChildren, JSX } from "preact";
 import { render } from "preact";
+import {
+  Ban,
+  Bot,
+  Check,
+  CircleDot,
+  Crown,
+  DoorClosed,
+  Eye,
+  Flame,
+  Flag,
+  Gauge,
+  Handshake,
+  LogOut,
+  MessageSquare,
+  Play,
+  Radio,
+  RefreshCw,
+  Send,
+  Shield,
+  Swords,
+  Terminal,
+  Trash2,
+  Users,
+  Volume2,
+  VolumeX,
+  X
+} from "lucide-preact";
 import {
   applyEvent,
   applyEvents,
   buildVote,
+  canCloseRoom,
   canStart,
   createInitialState,
   createReplacementProblem,
-  encodeSystemChatCommand,
+  isAdminName,
+  isTeam,
   makeProblemSet,
+  normalizeName,
   scoreOf,
+  sortProblemsByDifficulty,
+  teamName,
   visibleChats,
-  winThreshold,
-  type SystemChatCommand
+  winThreshold
 } from "./domain";
-import {
-  deleteCloudSnapshot,
-  loadCloudSnapshot,
-  loadRoomDirectory,
-  saveCloudSnapshot,
-  saveRoomDirectory,
-  type RoomListing
-} from "./cloudStore";
 import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope, type LocalIdentity } from "./identity";
 import { fetchLuoguRecords } from "./luogu";
 import { cachedProblemCount, difficultyMeta, pickLuoguProblems, type DifficultyLevel } from "./problemPicker";
-import { completeCpOAuthLogin, loadCpSession, logoutCpSession, startCpOAuthLogin, type CpSession } from "./oauth";
-import type { ChatMessage, DuelEvent, DuelState, Player, Problem, Seat, SignedEnvelope, Team, VoteKind } from "./types";
+import { completeCpOAuthLogin, consumeCpOAuthError, loadCpSession, logoutCpSession, startCpOAuthLogin, type CpSession } from "./oauth";
+import { fetchRooms, fetchSnapshot, publishEnvelope, roomWebSocketUrl, type RoomListing, type ServerMessage } from "./realtimeStore";
+import type { ChatMessage, DuelEvent, DuelState, Player, Problem, Seat, SignedEnvelope, VoteKind } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("Missing #app");
 
 type BootPhase = "loading" | "auth-error" | "ready";
+type ViewMode = "home" | "room";
 
 let bootPhase: BootPhase = "loading";
+let mode: ViewMode = "home";
 let identity: LocalIdentity;
+let cpSession: CpSession | null = null;
 let roomId = "global";
 let roomSecret = "public-lobby";
 let envelopes: SignedEnvelope[] = [];
 let state: DuelState = createInitialState(roomId);
 let globalModeration: DuelState = createInitialState("global");
-let apiPollTimer: number | undefined;
-let apiSaveTimer: number | undefined;
-let apiBusy = false;
-let apiFailureCount = 0;
-let apiSaveFailureCount = 0;
-let dirtyEventIds = new Set<string>();
-let statusText = "正在初始化";
-let cpSession: CpSession | null = null;
-let authErrorText = "";
-let cleanupTimer: number | undefined;
-let cleanupKey = "";
+let rooms: RoomListing[] = [];
+let socket: WebSocket | null = null;
+let reconnectTimer: number | undefined;
 let finishReturnTimer: number | undefined;
-let waitingRooms: RoomListing[] = [];
+let clockTimer: number | undefined;
+let syncTimer: number | undefined;
+let statusText = "booting...";
+let statusTone: "info" | "error" = "info";
+let authErrorText = "";
 
 const draft = {
   userMenuOpen: false,
@@ -62,151 +86,293 @@ const draft = {
   difficultyLow: 1 as DifficultyLevel,
   difficultyHigh: 3 as DifficultyLevel,
   pickerStatus: "",
-  adminReasons: {} as Record<string, string>
+  closeReason: "房主关闭房间",
+  adminTarget: "",
+  adminReason: ""
 };
 
-const dataVersion = "v2";
-const storageKey = () => `luogu-duel.${dataVersion}.log.${roomId}`;
+const dataVersion = "v3";
 const roomSeatKey = () => `luogu-duel.${dataVersion}.seat.${roomId}`;
 const activeRoomKey = `luogu-duel.active-room.${dataVersion}`;
 const historyKey = `luogu-duel.history.${dataVersion}`;
-const adminNames = new Set(["General826", "Gcend", "GCSG01"]);
 
 const notify = () => render(<App />, app);
-const setStatus = (text: string) => {
+const setStatus = (text: string, tone: "info" | "error" = "info") => {
   statusText = text;
+  statusTone = tone;
   notify();
 };
 
 const boot = async () => {
   identity = await loadIdentity();
+  clockTimer ??= window.setInterval(() => notify(), 1000);
+  syncTimer ??= window.setInterval(() => void periodicSync(), 20_000);
   window.addEventListener("hashchange", () => void enterFromHash());
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) void pullApiSnapshot("页面恢复");
-  });
+  window.addEventListener("online", () => void connectRoom());
 
-  let oauthLuoguName: string | null = null;
-  let oauthFailed = false;
   try {
-    oauthLuoguName = await completeCpOAuthLogin();
-    if (oauthLuoguName) {
-      identity = await renameIdentity(identity, oauthLuoguName);
-      statusText = `已通过 CP OAuth 绑定 ${oauthLuoguName}`;
-    }
+    await completeCpOAuthLogin();
   } catch (error) {
     authErrorText = error instanceof Error ? error.message : "CP OAuth 登录失败";
-    statusText = authErrorText;
-    oauthFailed = true;
     logoutCpSession();
   }
 
   cpSession = loadCpSession();
-  if (oauthFailed) {
-    bootPhase = "auth-error";
-    notify();
-    return;
-  }
-  if (!cpSession && location.pathname !== "/callback") {
-    await startCpOAuthLogin();
-    return;
-  }
   if (!cpSession) {
-    authErrorText = "CP OAuth 未能完成登录";
+    const oauthError = consumeCpOAuthError();
+    if (oauthError) {
+      authErrorText = oauthError;
+      bootPhase = "auth-error";
+      notify();
+      return;
+    }
+    const callbackReturnedAt = Number(sessionStorage.getItem("luogu-duel.oauth.callback-returned") || "0");
+    if (Date.now() - callbackReturnedAt < 5 * 60_000) {
+      sessionStorage.removeItem("luogu-duel.oauth.callback-returned");
+      authErrorText = "CP OAuth 回调已返回，但未能建立登录会话。请重新登录；如果仍失败，请看 /api/auth/exchange 的响应。";
+      bootPhase = "auth-error";
+      notify();
+      return;
+    }
+    authErrorText = "请先通过 CP OAuth 登录。";
     bootPhase = "auth-error";
     notify();
     return;
   }
 
   identity = await renameIdentity(identity, cpSession.luoguName);
-  bootPhase = "ready";
+  bootPhase = authErrorText ? "auth-error" : "ready";
+  await refreshGlobalModeration();
   await enterFromHash();
-  if (oauthLuoguName && !state.players[identity.id] && !isBannedName(identity.luoguName)) {
-    const seat = preferredSeat();
-    await emitCommand({ kind: "player.joined", luoguName: oauthLuoguName, team: seat });
-    rememberSeat(seat);
-  }
-  notify();
 };
 
 const enterFromHash = async () => {
   const params = new URLSearchParams(location.hash.slice(1));
   roomId = params.get("room") || "global";
   roomSecret = params.get("secret") || (roomId === "global" ? "public-lobby" : "public-room");
-
-  stopApiSync();
-  if (cleanupTimer) window.clearTimeout(cleanupTimer);
-  if (finishReturnTimer) window.clearTimeout(finishReturnTimer);
-  cleanupTimer = undefined;
-  finishReturnTimer = undefined;
-  cleanupKey = "";
-  apiFailureCount = 0;
-  apiSaveFailureCount = 0;
+  mode = roomId === "global" ? "home" : "room";
+  closeSocket();
+  clearFinishTimer();
   draft.chat = "";
+  draft.closeReason = isAdmin() ? "管理员强制关闭房间" : "房主关闭房间";
 
-  envelopes = loadLog();
-  state = applyEvents(roomId, envelopes.map((item) => item.event));
-  if (roomId === "global") globalModeration = state;
-  dirtyEventIds = new Set();
-  scheduleCleanupIfFinished();
+  if (mode === "home") {
+    state = createInitialState("global");
+    envelopes = [];
+    await loadDirectory();
+    notify();
+    return;
+  }
+
+  state = createInitialState(roomId);
+  envelopes = [];
   notify();
-
-  await pullApiSnapshot("进入房间");
-  if (await closeStaleSoloRoom()) return;
+  await loadSnapshot();
   await ensureJoined();
+  connectRoom();
   rememberActiveRoomIfNeeded();
-  startApiSync();
-  statusText = roomId === "global" ? "公共大厅已连接，云端同步运行中" : "房间已连接，云端同步运行中";
   notify();
+};
+
+const loadDirectory = async () => {
+  try {
+    await refreshGlobalModeration();
+    if (mode === "home") state = globalModeration;
+    await ensureHomeJoined();
+    rooms = await fetchRooms();
+    statusTone = "info";
+    statusText = `大厅在线，${rooms.length} 个房间可见`;
+  } catch (error) {
+    rooms = [];
+    statusTone = "error";
+    statusText = friendlyError(error, "房间目录暂时不可用");
+  }
+};
+
+const loadSnapshot = async () => {
+  try {
+    await refreshGlobalModeration();
+    const remote = await fetchSnapshot(roomId, roomSecret);
+    await mergeEnvelopes(remote);
+    statusTone = "info";
+    statusText = "快照已同步";
+  } catch (error) {
+    statusTone = "error";
+    statusText = friendlyError(error, "房间快照同步失败");
+  }
+};
+
+const periodicSync = async () => {
+  if (bootPhase !== "ready") return;
+  if (mode === "home") {
+    await loadDirectory();
+  } else {
+    await loadSnapshot();
+  }
+  notify();
+};
+
+const connectRoom = () => {
+  if (mode !== "room") return;
+  closeSocket(false);
+  socket = new WebSocket(roomWebSocketUrl(roomId, roomSecret));
+  socket.addEventListener("open", () => {
+    statusTone = "info";
+    statusText = "WebSocket 已连接";
+    notify();
+  });
+  socket.addEventListener("message", (event) => void handleServerMessage(event.data));
+  socket.addEventListener("close", () => {
+    socket = null;
+    if (mode === "room") {
+      statusTone = "error";
+      statusText = "连接休眠或断开，正在重连";
+      reconnectTimer = window.setTimeout(connectRoom, 1200);
+      notify();
+    }
+  });
+  socket.addEventListener("error", () => {
+    statusTone = "error";
+    statusText = "WebSocket 错误，HTTP 兜底仍可用";
+    notify();
+  });
+};
+
+const closeSocket = (clearTimer = true) => {
+  if (clearTimer && reconnectTimer) window.clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
+  if (socket) socket.close();
+  socket = null;
+};
+
+const handleServerMessage = async (raw: string) => {
+  const message = JSON.parse(raw) as ServerMessage;
+  if (message.type === "hello" || message.type === "sync") {
+    await mergeEnvelopes(message.envelopes);
+    await ensureJoined();
+  }
+  if (message.type === "event") await receiveEnvelope(message.envelope);
+  if (message.type === "error") {
+    statusTone = "error";
+    statusText = message.message;
+  }
+  notify();
+};
+
+const mergeEnvelopes = async (incoming: SignedEnvelope[]) => {
+  for (const envelope of incoming) await receiveEnvelope(envelope, false);
 };
 
 const ensureJoined = async () => {
-  if (state.players[identity.id]) {
-    rememberSeat(state.players[identity.id].team);
-    return;
-  }
-  if (isBannedName(identity.luoguName)) {
-    statusText = "当前账号已被该房间封禁，不能重新加入";
-    return;
-  }
-  const alreadyJoined = envelopes.some(
-    (item) =>
-      item.event.actorId === identity.id &&
-      (item.event.type === "player.joined" ||
-        (item.event.type === "chat.sent" && item.event.text.includes('"kind":"player.joined"')))
-  );
-  if (alreadyJoined) return;
+  if (mode !== "room" || state.players[identity.id] || bannedRecord()) return;
   const seat = preferredSeat();
-  await emitCommand({ kind: "player.joined", luoguName: identity.luoguName, team: seat });
+  await emit({ ...baseEvent("player.joined"), luoguName: identity.luoguName, team: seat });
   rememberSeat(seat);
 };
 
+const ensureHomeJoined = async () => {
+  if (mode !== "home" || state.players[identity.id] || bannedRecord()) return;
+  await emit({ ...baseEvent("player.joined"), luoguName: identity.luoguName, team: "spectator" });
+};
+
+const receiveEnvelope = async (envelope: SignedEnvelope, renderNow = true) => {
+  if (envelopes.some((item) => item.event.id === envelope.event.id)) return;
+  if (!(await verifyEnvelope(envelope))) return;
+  envelopes.push(envelope);
+  envelopes.sort(compareEnvelopes);
+  state = applyEvent(state, envelope.event);
+  if (roomId === "global") globalModeration = state;
+  saveHistory();
+  scheduleFinishReturn();
+  maybeAutoStart();
+  rememberActiveRoomIfNeeded();
+  if (renderNow) notify();
+};
+
 const emit = async (event: DuelEvent) => {
+  if (blockedByBan()) return;
   const envelope = await signEvent(identity, event);
   await receiveEnvelope(envelope);
-  dirtyEventIds.add(event.id);
-  scheduleApiSave(350);
+  let sentBySocket = false;
+  if (socket?.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "event", envelope }));
+    sentBySocket = true;
+  }
+  try {
+    await publishEnvelope(roomId, roomSecret, envelope);
+  } catch (error) {
+    if (!sentBySocket) setStatus(friendlyError(error, "事件已保存在本地，发送失败"), "error");
+  }
 };
 
 const emitChat = async (text: string, visibility: "all" | "team") => {
   await emit({ ...baseEvent("chat.sent"), text, visibility });
 };
 
-const emitCommand = async (command: SystemChatCommand) => {
-  await emitChat(encodeSystemChatCommand(command), "all");
+const emitDirect = async (event: Extract<DuelEvent, { type: "room.closed" | "player.kicked" | "player.unkicked" | "player.muted" | "player.unmuted" }>) => {
+  await emit(event);
 };
 
-const receiveEnvelope = async (envelope: SignedEnvelope) => {
-  if (envelopes.some((item) => item.event.id === envelope.event.id)) return;
-  if (!(await verifyEnvelope(envelope))) return;
-  envelopes.push(envelope);
-  saveLog();
-  state = applyEvents(roomId, envelopes.map((item) => item.event));
-  if (roomId === "global") globalModeration = state;
-  saveHistory();
-  scheduleCleanupIfFinished();
-  notify();
-  maybeAutoStart();
+const refreshGlobalModeration = async () => {
+  try {
+    const remote = await fetchSnapshot("global", "public-lobby");
+    globalModeration = applyEvents("global", remote.map((item) => item.event));
+  } catch {
+    globalModeration = createInitialState("global");
+  }
 };
+
+const ensureGlobalAdminJoined = async () => {
+  if (globalModeration.players[identity.id]) return;
+  const joinEvent: DuelEvent = {
+    type: "player.joined",
+    roomId: "global",
+    actorId: identity.id,
+    id: crypto.randomUUID(),
+    lamport: globalModeration.lamport + 1,
+    issuedAt: Date.now(),
+    luoguName: identity.luoguName,
+    team: "spectator"
+  };
+  const envelope = await signEvent(identity, joinEvent);
+  await publishEnvelope("global", "public-lobby", envelope);
+  globalModeration = applyEvent(globalModeration, envelope.event);
+};
+
+const moderateGlobal = async (action: "ban" | "unban" | "mute" | "unmute") => {
+  const targetName = draft.adminTarget.trim();
+  if (!isAdmin() || !targetName) return;
+  if (isAdminName(targetName)) {
+    setStatus("不能操作管理员账号", "error");
+    return;
+  }
+
+  await ensureGlobalAdminJoined();
+  const targetId = `name:${normalizeName(targetName)}`;
+  const base = {
+    roomId: "global",
+    actorId: identity.id,
+    id: crypto.randomUUID(),
+    lamport: globalModeration.lamport + 1,
+    issuedAt: Date.now()
+  };
+  const event: DuelEvent =
+    action === "ban"
+      ? { ...base, type: "player.kicked", targetId, targetName, reason: draft.adminReason.trim() || "管理员封禁" }
+      : action === "unban"
+        ? { ...base, type: "player.unkicked", targetName }
+        : action === "mute"
+          ? { ...base, type: "player.muted", targetId, targetName }
+          : { ...base, type: "player.unmuted", targetId, targetName };
+  const envelope = await signEvent(identity, event);
+  await publishEnvelope("global", "public-lobby", envelope);
+  globalModeration = applyEvent(globalModeration, envelope.event);
+  if (mode === "home") state = globalModeration;
+  setStatus(`已${actionLabel(action)} ${targetName}`);
+};
+
+const actionLabel = (action: "ban" | "unban" | "mute" | "unmute"): string =>
+  action === "ban" ? "封禁" : action === "unban" ? "解封" : action === "mute" ? "禁言" : "解禁言";
 
 const baseEvent = <T extends DuelEvent["type"]>(type: T) => ({
   type,
@@ -217,215 +383,10 @@ const baseEvent = <T extends DuelEvent["type"]>(type: T) => ({
   issuedAt: Date.now()
 });
 
-const maybeAutoStart = async () => {
-  if (!canStart(state)) return;
-  if (
-    envelopes.some(
-      (item) => item.event.type === "game.started" || (item.event.type === "chat.sent" && item.event.text.includes('"kind":"game.started"'))
-    )
-  ) {
-    return;
-  }
-  await emitCommand({ kind: "game.started" });
-  await publishActiveRoom();
-};
-
-const startApiSync = () => {
-  const loop = async () => {
-    await pullApiSnapshot("轮询同步");
-    apiPollTimer = window.setTimeout(loop, currentPollInterval());
-  };
-  apiPollTimer = window.setTimeout(loop, currentPollInterval());
-};
-
-const stopApiSync = () => {
-  if (apiPollTimer) window.clearTimeout(apiPollTimer);
-  if (apiSaveTimer) window.clearTimeout(apiSaveTimer);
-  apiPollTimer = undefined;
-  apiSaveTimer = undefined;
-  apiBusy = false;
-};
-
-const pullApiSnapshot = async (reason: string) => {
-  if (apiBusy) return;
-  apiBusy = true;
-  try {
-    if (roomId === "global") {
-      try {
-        waitingRooms = await loadRoomDirectory();
-      } catch {
-        waitingRooms = [];
-      }
-    }
-    const remote = await loadCloudSnapshot(cloudKey());
-    const remoteIds = new Set(remote.map((item) => item.event.id));
-    const added = await mergeRemoteEnvelopes(remote);
-    if (roomId === "global") {
-      globalModeration = state;
-    } else {
-      await refreshGlobalModeration();
-    }
-    dirtyEventIds = new Set([
-      ...[...dirtyEventIds].filter((id) => !remoteIds.has(id)),
-      ...envelopes.filter((item) => item.event.roomId === roomId && !remoteIds.has(item.event.id)).map((item) => item.event.id)
-    ]);
-    if (dirtyEventIds.size > 0) scheduleApiSave(900);
-    apiFailureCount = 0;
-    statusText = added > 0 ? `${reason}：合并 ${added} 条事件` : `${reason}：已是最新`;
-  } catch (error) {
-    apiFailureCount += 1;
-    statusText = friendlyCloudError(error);
-  } finally {
-    apiBusy = false;
-    notify();
-  }
-};
-
-const publishWaitingRoom = async (listing: RoomListing) => {
-  try {
-    const rooms = await loadRoomDirectory();
-    waitingRooms = rooms.filter((room) => room.roomId !== listing.roomId).concat(listing);
-    await saveRoomDirectory(waitingRooms);
-  } catch (error) {
-    statusText = friendlyCloudError(error, "房间列表写入失败");
-  }
-};
-
-const publishActiveRoom = async () => {
-  if (roomId === "global") return;
-  try {
-    const rooms = await loadRoomDirectory();
-    const current = rooms.find((room) => room.roomId === roomId);
-    const listing: RoomListing = {
-      roomId,
-      secret: roomSecret,
-      host: current?.host ?? Object.values(state.players)[0]?.luoguName ?? identity.luoguName,
-      createdAt: current?.createdAt ?? Date.now(),
-      problemCount: state.problems.length,
-      status: "arena",
-      startedAt: state.startedAt ?? Date.now()
-    };
-    waitingRooms = rooms.filter((room) => room.roomId !== roomId).concat(listing);
-    await saveRoomDirectory(waitingRooms);
-  } catch {
-    statusText = "对局仍在本地进行，房间目录稍后自动重试";
-  }
-};
-
-const unpublishWaitingRoom = async (targetRoomId: string) => {
-  try {
-    const rooms = await loadRoomDirectory();
-    const next = rooms.filter((room) => room.roomId !== targetRoomId);
-    if (next.length === rooms.length) return;
-    await saveRoomDirectory(next);
-    if (roomId === "global") waitingRooms = next;
-  } catch {
-    statusText = "房间目录暂时不可用，不影响当前对局";
-  }
-};
-
-const closeStaleSoloRoom = async (): Promise<boolean> => {
-  if (roomId === "global" || state.phase !== "lobby") return false;
-  const firstEventAt = envelopes.filter((item) => item.event.roomId === roomId).sort((a, b) => a.event.issuedAt - b.event.issuedAt)[0]?.event.issuedAt;
-  if (!firstEventAt || Date.now() - firstEventAt < 300_000) return false;
-  if (Object.keys(state.players).length > 1) return false;
-  await deleteCloudSnapshot(cloudKey());
-  await unpublishWaitingRoom(roomId);
-  localStorage.removeItem(storageKey());
-  statusText = "房间 300 秒内无人加入，已自动关闭";
-  location.hash = "";
-  return true;
-};
-
-const mergeRemoteEnvelopes = async (remote: SignedEnvelope[]): Promise<number> => {
-  const known = new Set(envelopes.map((item) => item.event.id));
-  const accepted: SignedEnvelope[] = [];
-
-  for (const envelope of remote) {
-    if (known.has(envelope.event.id) || envelope.event.roomId !== roomId) continue;
-    if (!(await verifyEnvelope(envelope))) continue;
-    known.add(envelope.event.id);
-    accepted.push(envelope);
-  }
-
-  if (accepted.length === 0) return 0;
-  accepted.sort(compareEnvelopes);
-  envelopes.push(...accepted);
-  envelopes.sort(compareEnvelopes);
-  saveLog();
-  state = accepted.reduce((next, envelope) => applyEvent(next, envelope.event), state);
-  if (roomId === "global") globalModeration = state;
-  saveHistory();
-  scheduleCleanupIfFinished();
-  void maybeAutoStart();
-  return accepted.length;
-};
-
-const refreshGlobalModeration = async () => {
-  try {
-    const globalRemote = await loadCloudSnapshot("global");
-    globalModeration = applyEvents("global", globalRemote.map((item) => item.event));
-  } catch {
-    // Room sync should keep working even when the global moderation snapshot is temporarily unavailable.
-  }
-};
-
-const scheduleApiSave = (delay: number) => {
-  if (apiSaveTimer) window.clearTimeout(apiSaveTimer);
-  apiSaveTimer = window.setTimeout(() => void flushApiSave(), delay);
-};
-
-const flushApiSave = async () => {
-  if (apiBusy || dirtyEventIds.size === 0) {
-    if (dirtyEventIds.size > 0) scheduleApiSave(1200);
-    return;
-  }
-  try {
-    await saveCloudSnapshot(cloudKey(), envelopes);
-    statusText = `云端已写入 ${dirtyEventIds.size} 条待确认事件`;
-    dirtyEventIds.clear();
-    apiSaveFailureCount = 0;
-  } catch (error) {
-    apiSaveFailureCount += 1;
-    statusText = friendlyCloudError(error, "云端写入失败，已保留本地事件");
-    scheduleApiSave(Math.min(30_000, 2500 * 2 ** Math.min(apiSaveFailureCount, 4)));
-  }
-  notify();
-};
-
-const scheduleCleanupIfFinished = () => {
-  if (roomId === "global" || state.phase !== "finished") return;
-  localStorage.removeItem(activeRoomKey);
-  void unpublishWaitingRoom(roomId);
-  const key = cloudKey();
-  if (cleanupTimer && cleanupKey === key) return;
-  if (cleanupTimer) window.clearTimeout(cleanupTimer);
-  if (finishReturnTimer) window.clearTimeout(finishReturnTimer);
-  cleanupKey = key;
-  finishReturnTimer = window.setTimeout(() => {
-    location.hash = "";
-  }, 10_000);
-  cleanupTimer = window.setTimeout(async () => {
-    try {
-      await deleteCloudSnapshot(key);
-      statusText = "对局已结束，云端房间快照已删除";
-    } catch (error) {
-      statusText = friendlyCloudError(error, "云端房间删除失败");
-    }
-    notify();
-  }, 10_000);
-};
-
-const currentPollInterval = (): number => {
-  const base = 20_000;
-  if (document.hidden) return 45_000;
-  return Math.min(60_000, base + apiFailureCount * 5_000);
-};
-
 const submitCreateRoom = async (event: Event) => {
   event.preventDefault();
   if (hasBlockingActiveRoom()) {
-    setStatus("你已经在一场比赛中，不能创建新房间");
+    setStatus("你已经在一场比赛中，先结束或观赛再创建新房间", "error");
     return;
   }
 
@@ -439,916 +400,725 @@ const submitCreateRoom = async (event: Event) => {
     if (manual) {
       problems = makeProblemSet(count, nextRoom, manual);
     } else {
-      draft.pickerStatus = "正在下载/读取洛谷题库缓存";
+      draft.pickerStatus = "读取洛谷题库缓存";
       notify();
       problems = await pickLuoguProblems(count, nextRoom, draft.difficultyLow, draft.difficultyHigh);
-      draft.pickerStatus = `已从 ${difficultyName(draft.difficultyLow)} → ${difficultyName(draft.difficultyHigh)} 抽取 ${problems.length} 题`;
+      draft.pickerStatus = `已抽取 ${problems.length} 题`;
     }
+    problems = sortProblemsByDifficulty(problems);
   } catch (error) {
     draft.pickerStatus = "";
-    setStatus(error instanceof Error ? error.message : "题库抽取失败");
+    setStatus(error instanceof Error ? error.message : "题库抽取失败", "error");
     return;
   }
 
   history.pushState(null, "", `#room=${nextRoom}&secret=${nextSecret}`);
   await enterFromHash();
-  await emitCommand({ kind: "room.configured", problems });
-  await publishWaitingRoom({
-    roomId: nextRoom,
-    secret: nextSecret,
-    host: identity.luoguName,
-    createdAt: Date.now(),
-    problemCount: problems.length,
-    status: "lobby"
-  });
-  notify();
+  await emit({ ...baseEvent("room.configured"), problems });
 };
 
 const submitChat = async (event: Event) => {
   event.preventDefault();
   const raw = draft.chat.trim();
-  if (!raw) return;
-  if (isMuted(identity.id)) {
-    setStatus("你已被禁言，暂时不能发送消息");
+  if (!raw || blockedByBan()) return;
+  if (isMutedCurrent()) {
+    setStatus("你已被禁言", "error");
     return;
   }
-  if (isRestricted(identity.id)) {
-    setStatus("你已被移出或封禁，不能发送消息");
-    return;
-  }
-  if (await handleAdminChatCommand(raw)) {
-    draft.chat = "";
-    notify();
-    return;
-  }
-  const teamMessage = roomId !== "global" && raw.startsWith("/");
-  await emitChat(teamMessage ? raw.slice(1).trim() : raw, teamMessage ? "team" : "all");
+  const teamMessage = raw.startsWith("/") && mode === "room";
+  const text = teamMessage ? raw.slice(1).trim() : raw;
+  if (!text) return;
+  await emitChat(text, teamMessage ? "team" : "all");
   draft.chat = "";
   notify();
 };
 
-const handleAdminChatCommand = async (raw: string): Promise<boolean> => {
-  const muteMatch = raw.match(/^\/(ban|unban)\s+(\S+)$/i);
-  const kickMatch = raw.match(/^\/kick\s+(\S+)(?:\s+(.+))?$/i);
-  const unkickMatch = raw.match(/^\/unkick\s+(\S+)$/i);
-  if (!muteMatch && !kickMatch && !unkickMatch) return false;
-  if (roomId !== "global") {
-    statusText = "管理命令请回到主页执行；房间内 / 开头仍作为队内消息";
-    return true;
-  }
-  if (!isAdmin(identity.luoguName)) {
-    statusText = "只有管理员可以使用管理命令";
-    return true;
-  }
-
-  if (unkickMatch) {
-    await emitCommand({ kind: "player.unkicked", targetName: unkickMatch[1] });
-    return true;
-  }
-
-  const targetName = (muteMatch?.[2] || kickMatch?.[1] || "").trim();
-  const target = findPlayerByName(targetName);
-  if (!target) {
-    statusText = `没有找到用户 ${targetName}`;
-    return true;
-  }
-  if (isAdmin(target.luoguName)) {
-    statusText = "管理员不能被禁言、踢出或封禁";
-    return true;
-  }
-
-  if (muteMatch) {
-    await emitCommand({ kind: muteMatch[1].toLowerCase() === "ban" ? "player.muted" : "player.unmuted", targetId: target.id });
-    return true;
-  }
-
-  await emitCommand({ kind: "player.kicked", targetId: target.id, reason: kickMatch?.[2]?.trim() || "管理员移出房间" });
-  return true;
+const closeRoom = async () => {
+  if (!canCloseRoom(state, identity.id, identity.luoguName)) return;
+  await emitDirect({ ...baseEvent("room.closed"), reason: draft.closeReason, actorName: identity.luoguName });
 };
 
-const setTeam = async (seat: Seat) => {
-  if (isRestricted(identity.id)) {
-    setStatus("你已被移出或封禁，不能切换队伍");
-    return;
-  }
+const setSeat = async (seat: Seat) => {
+  if (blockedByBan() || state.phase !== "lobby") return;
   rememberSeat(seat);
-  await emitCommand({ kind: "player.teamChanged", team: seat });
-  rememberActiveRoomIfNeeded();
+  await emit({ ...baseEvent("player.teamChanged"), team: seat });
 };
 
 const toggleReady = async () => {
   const player = state.players[identity.id];
-  if (!isParticipant(player?.team) || isRestricted(identity.id)) return;
-  await emitCommand({ kind: "player.readyChanged", ready: !(player?.ready ?? false) });
+  if (!player || !isTeam(player.team) || blockedByBan()) return;
+  await emit({ ...baseEvent("player.readyChanged"), ready: !player.ready });
+};
+
+const maybeAutoStart = () => {
+  if (!canStart(state)) return;
+  if (envelopes.some((item) => item.event.type === "game.started")) return;
+  void emit({ ...baseEvent("game.started") });
 };
 
 const openVote = async (kind: VoteKind, targetPid?: string, replacement?: Problem) => {
   const player = state.players[identity.id];
-  if (!player || !isParticipant(player.team) || isRestricted(identity.id)) return;
-  await emitCommand({ kind: "vote.opened", vote: buildVote(kind, player, targetPid, replacement) });
+  if (!player || !isTeam(player.team) || blockedByBan()) return;
+  await emit({ ...baseEvent("vote.opened"), vote: buildVote(kind, player, targetPid, replacement) });
 };
 
 const judgeProblem = async (pid: string) => {
   const users = Object.values(state.players)
-    .filter((player) => isParticipant(player.team) && !isRestricted(player.id))
+    .filter((player) => isTeam(player.team) && !moderationRecordForPlayer(player))
     .map((p) => p.luoguName);
   if (!state.startedAt) {
-    setStatus("对局尚未正式开赛，不能判题");
+    setStatus("对局尚未开始", "error");
     return;
   }
   try {
-    statusText = `正在抓取 ${pid} 的洛谷提交`;
+    statusTone = "info";
+    statusText = `抓取 ${pid} 提交记录`;
     notify();
     const records = await fetchLuoguRecords(pid, users, state.startedAt);
-    for (const record of records) {
-      await emitCommand({ kind: "judge.recordSeen", record });
-    }
-    statusText = records.length ? `已同步 ${pid} 的 ${records.length} 条提交` : `${pid} 暂无开赛后的有效提交`;
+    for (const record of records) await emit({ ...baseEvent("judge.recordSeen"), record });
+    statusTone = "info";
+    statusText = records.length ? `已同步 ${records.length} 条提交` : `${pid} 暂无开赛后的有效提交`;
   } catch (error) {
-    statusText = error instanceof Error ? error.message : "提交抓取失败";
-  }
-  notify();
-};
-
-const adminMute = async (player: Player, muted: boolean) => {
-  if (!isAdmin(identity.luoguName) || isAdmin(player.luoguName)) return;
-  const sameNamePlayers = playersByNormalizedName(player.luoguName);
-  for (const target of sameNamePlayers) {
-    await emitCommand({ kind: muted ? "player.unmuted" : "player.muted", targetId: target.id });
-  }
-};
-
-const adminKick = async (player: Player) => {
-  if (!isAdmin(identity.luoguName) || isAdmin(player.luoguName)) return;
-  await emitCommand({ kind: "player.kicked", targetId: player.id, reason: draft.adminReasons[player.id]?.trim() || "管理员移出房间" });
-};
-
-const adminUnkick = async (player: Player) => {
-  if (!isAdmin(identity.luoguName)) return;
-  await emitCommand({ kind: "player.unkicked", targetName: player.luoguName });
-};
-
-const closeCurrentRoom = async (force: boolean) => {
-  if (roomId === "global") return;
-  if (!force && state.phase !== "lobby") {
-    setStatus("比赛已经正式开始，普通关闭不可用");
-    return;
-  }
-  if (force && !isAdmin(identity.luoguName)) return;
-  await emitCommand({ kind: "room.closed", reason: force ? "管理员强制关闭房间" : "玩家关闭未开赛房间" });
-  await unpublishWaitingRoom(roomId);
-};
-
-const forceCloseListing = async (listing: RoomListing) => {
-  if (!isAdmin(identity.luoguName)) return;
-  try {
-    const targetKey = `${listing.roomId}:${listing.secret}`;
-    const remote = await loadCloudSnapshot(targetKey);
-    const lamport = Math.max(0, ...remote.map((item) => item.event.lamport)) + 1;
-    const event: DuelEvent = {
-      type: "chat.sent",
-      roomId: listing.roomId,
-      actorId: identity.id,
-      id: crypto.randomUUID(),
-      lamport,
-      issuedAt: Date.now(),
-      text: encodeSystemChatCommand({ kind: "room.closed", reason: "管理员强制关闭房间", actorName: identity.luoguName }),
-      visibility: "all"
-    };
-    const envelope = await signEvent(identity, event);
-    await saveCloudSnapshot(targetKey, remote.concat(envelope).slice(-1000));
-    await unpublishWaitingRoom(listing.roomId);
-    statusText = `已向房间 ${listing.roomId} 发送强制关闭`;
-  } catch (error) {
-    statusText = friendlyCloudError(error, "强制关闭房间失败");
+    statusTone = "error";
+    statusText = friendlyError(error, "提交抓取失败");
   }
   notify();
 };
 
 const App = () => {
-  if (bootPhase === "loading") {
-    return (
-      <main class="auth-gate">
-        <section class="panel auth-card lift-in">
-          <p class="eyebrow">LUOGU DUEL</p>
-          <h1>正在进入对局</h1>
-          <p class="lead">{statusText}</p>
-        </section>
-      </main>
-    );
-  }
-
-  if (bootPhase === "auth-error") return <AuthGate />;
-
+  if (bootPhase === "loading") return <Shell title="Luogu Duel" subtitle="initializing"><Loading /></Shell>;
+  if (bootPhase === "auth-error") return <AuthError />;
   return (
     <>
-      <Topbar />
-      {roomId === "global" ? <Home /> : state.phase === "arena" || state.phase === "finished" ? <Arena /> : <Lobby />}
+      <Shell title="Luogu Duel" subtitle={mode === "home" ? "control room" : `${roomId} / ${state.phase}`}>
+        {mode === "home" ? <Home /> : <Room />}
+      </Shell>
+      <BanOverlay />
       <EndOverlay />
     </>
   );
 };
 
-const AuthGate = () => (
-  <main class="auth-gate">
-    <section class="panel auth-card lift-in">
-      <p class="eyebrow">CP OAUTH</p>
-      <h1>登录没有完成</h1>
-      <p class="lead">{authErrorText || "需要通过 CP OAuth 绑定洛谷用户名后继续。"}</p>
-      <div class="actions">
-        <button class="primary" onClick={() => void startCpOAuthLogin()}>
-          重新登录
-        </button>
-      </div>
-    </section>
-  </main>
-);
-
-const Topbar = () => (
-  <header class="topbar">
-    <div class="brand-row">
+const Shell = ({ title, subtitle, children }: { title: string; subtitle: string; children: ComponentChildren }) => (
+  <div class="app-shell">
+    <header class="topbar">
       <button class="brand" onClick={() => (location.hash = "")}>
-        Luogu Duel
+        <Swords size={20} />
+        <span>{title}</span>
+        <em>{subtitle}</em>
       </button>
-      <span class={`status-pill ${apiFailureCount ? "warning" : ""}`}>{statusText}</span>
-      <span class="muted">待确认 {dirtyEventIds.size}</span>
-    </div>
-    <div class="user-area">
-      <button class="user-button" onClick={() => ((draft.userMenuOpen = !draft.userMenuOpen), notify())}>
-        {cpSession?.luoguName ?? identity.luoguName}
-      </button>
-      {draft.userMenuOpen ? (
-        <div class="user-menu lift-in">
-          <button onClick={() => void pullApiSnapshot("手动同步")}>立即同步</button>
-          <button
-            onClick={async () => {
-              identity = await createIdentity(identity.luoguName);
-              location.reload();
-            }}
-          >
-            重置本机密钥
-          </button>
-          <button
-            onClick={async () => {
-              logoutCpSession();
-              draft.userMenuOpen = false;
-              await startCpOAuthLogin();
-            }}
-          >
-            登出
-          </button>
-        </div>
-      ) : null}
-    </div>
-  </header>
+      <div class={`status-pill ${statusTone}`}>
+        <Radio size={15} />
+        <span>{statusText}</span>
+      </div>
+      <div class="session">
+        <button class="session-user" onClick={() => {
+          draft.userMenuOpen = !draft.userMenuOpen;
+          notify();
+        }}>
+          <span class="chat-avatar">{avatarText(identity?.luoguName ?? "?")}</span>
+          {identity?.luoguName ?? "..."}
+        </button>
+        {draft.userMenuOpen ? (
+          <div class="session-menu">
+            <button onClick={logout}>
+              <LogOut size={15} />
+              退出登录
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </header>
+    {children}
+  </div>
 );
 
 const Home = () => (
   <main class="home-grid">
-    <section class="panel chat-panel lift-in">
-      <PanelTitle title="公共聊天室" subtitle="公共大厅消息" />
-      <Chat />
-      <AdminTools />
-    </section>
-    <section class="stack">
-      <section class="panel hero-panel lift-in">
+    <section class="command-panel">
+      <div class="section-head">
+        <Terminal size={18} />
         <div>
-          <p class="eyebrow">LOCKOUT MATCH</p>
-          <h1>创建一场洛谷抢分对决</h1>
-          <p class="lead">欢迎加入洛谷抢分对决！自定义难度，智能抽题封存。赛后提交计分，公平竞技，速来挑战你的算法极限！。</p>
+          <h1>创建 Luogu Duel</h1>
+          <p>极简房间、实时状态、房间级 Durable Object。</p>
         </div>
-        <form class="create-form" autocomplete="off" onSubmit={(event) => void submitCreateRoom(event)}>
-          <label>
-            题目数量
-            <input
-              type="number"
-              min="1"
-              max="21"
-              value={draft.roomCount}
-              autoComplete="off"
-              onInput={(event) => {
-                draft.roomCount = clamp(Number(event.currentTarget.value || 9), 1, 21);
-                notify();
-              }}
-            />
-          </label>
-          <DifficultyRangeSlider />
-          <label>
-            手动题号
-            <textarea
-              value={draft.manualProblems}
-              placeholder="留空则从题库抽取，例如 P1000 P1001"
-              autoComplete="off"
-              onInput={(event) => {
-                draft.manualProblems = event.currentTarget.value;
-                const manualCount = parseManualProblemCount(draft.manualProblems);
-                if (manualCount > 0) draft.roomCount = clamp(manualCount, 1, 21);
-                notify();
-              }}
-            />
-          </label>
-          <div class="picker-note">
-            <span>本地缓存 {cachedProblemCount()} 题</span>
-            <span>{draft.pickerStatus || "首次抽题会下载并缓存洛谷公开题库"}</span>
-          </div>
-          <button class="primary">创建房间</button>
-        </form>
-      </section>
-      <section class="home-bottom">
-        <section class="panel lift-in">
-          <PanelTitle title="实时对局" subtitle="等待或进行中" />
-          <WaitingRooms />
-        </section>
-        <section class="panel lift-in">
-          <PanelTitle title="历史对局" subtitle="本地记录" />
-          <History />
-        </section>
-      </section>
+      </div>
+      <form class="create-form" onSubmit={(event) => void submitCreateRoom(event)}>
+        <label>
+          <span>题目数量</span>
+          <input type="number" min={1} max={21} value={draft.roomCount} onInput={(event) => (draft.roomCount = Number(event.currentTarget.value))} />
+        </label>
+        <label class="wide">
+          <span>手动题号</span>
+          <input value={draft.manualProblems} placeholder="P1001 P1002，留空则自动抽题" onInput={(event) => (draft.manualProblems = event.currentTarget.value)} />
+        </label>
+        <DifficultyControl label="最低难度" value={draft.difficultyLow} set={(value) => (draft.difficultyLow = value)} />
+        <DifficultyControl label="最高难度" value={draft.difficultyHigh} set={(value) => (draft.difficultyHigh = value)} />
+        <button class="primary wide">
+          <Play size={17} />
+          生成房间
+        </button>
+      </form>
+      <p class="muted">题库缓存：{cachedProblemCount()} 条 {draft.pickerStatus ? ` / ${draft.pickerStatus}` : ""}</p>
+      <AdminPanel />
     </section>
-  </main>
-);
 
-const Lobby = () => (
-  <main class="lobby">
-    <section class="panel lift-in">
-      <PanelTitle
-        title="准备室"
-        subtitle="红蓝双方都准备后自动开赛"
-        action={
-          <div class="title-actions">
-            <button onClick={() => void navigator.clipboard.writeText(location.href)}>复制邀请链接</button>
-            <button class="danger" onClick={() => void closeCurrentRoom(false)}>
-              关闭房间
-            </button>
-          </div>
-        }
-      />
-      <RestrictionBanner />
-      <Roster />
-      <div class="actions">
-        <button disabled={isRestricted(identity.id)} onClick={() => void setTeam("red")}>
-          加入红方
+    <section class="panel">
+      <div class="section-head">
+        <Users size={18} />
+        <div>
+          <h2>公开房间</h2>
+          <p>进行中的房间默认观赛加入。</p>
+        </div>
+        <button class="ghost icon-only" onClick={() => void loadDirectory()}>
+          <RefreshCw size={16} />
         </button>
-        <button disabled={isRestricted(identity.id)} onClick={() => void setTeam("blue")}>
-          加入蓝方
-        </button>
-        <button disabled={isRestricted(identity.id)} onClick={() => void setTeam("spectator")}>
-          观赛席
-        </button>
-        {isParticipant(currentSeat()) ? (
-          <button class="primary" disabled={isRestricted(identity.id)} onClick={() => void toggleReady()}>
-            {state.players[identity.id]?.ready ? "取消准备" : "准备就绪"}
-          </button>
-        ) : null}
       </div>
-      <p class="muted">观赛席不参与准备、投票和计分。未正式开始前，普通玩家也可以关闭房间。</p>
+      <RoomList />
     </section>
-    <section class="panel lift-in">
-      <PanelTitle title="题目池" subtitle="开赛后公开" />
-      <div class="table-scroll masked-problems">
-        <Problems withActions={false} />
-      </div>
-    </section>
-  </main>
-);
 
-const Arena = () => (
-  <main class="arena">
-    <section class="panel lift-in">
-      <SeatBadge />
-      <div class="scoreboard">
-        <strong class="red">红 {scoreOf(state, "red")}</strong>
-        <span>胜利线 {winThreshold(state)}</span>
-        <strong class="blue">蓝 {scoreOf(state, "blue")}</strong>
-      </div>
-      {state.winner ? <div class="result">{state.winner === "draw" ? "平局" : `${teamName(state.winner)} 获胜`}</div> : null}
-      <div class="table-scroll problem-scroll">
-        <Problems withActions={true} />
-      </div>
-      <div class="actions">
-        {isParticipant(currentSeat()) && !isRestricted(identity.id) ? (
-          <>
-            <button onClick={() => void openVote("surrender")}>投降</button>
-            <button onClick={() => void openVote("draw")}>平局</button>
-          </>
-        ) : null}
-      </div>
-      <Votes />
-    </section>
-    <section class="panel chat-panel lift-in">
-      <PanelTitle title="房间通讯" subtitle="/ 开头为队内消息" />
-      <Roster compact />
+    <section class="panel home-chat-panel">
       <Chat />
-      <SystemFlow />
     </section>
-    <section class="panel lift-in">
-      <PanelTitle title="实时提交实况" subtitle={`${state.feed.length} 条`} />
-      <div class="table-scroll feed-scroll">
-        <Feed />
+
+    <section class="panel">
+      <div class="section-head">
+        <Gauge size={18} />
+        <div>
+          <h2>历史</h2>
+          <p>本机最近对局。</p>
+        </div>
       </div>
+      <History />
     </section>
   </main>
 );
 
-const PanelTitle = ({ title, subtitle, action }: { title: string; subtitle?: string; action?: preact.ComponentChildren }) => (
-  <div class="panel-title">
-    <div>
-      <span>{title}</span>
-      {subtitle ? <small>{subtitle}</small> : null}
+const Room = () => (
+  <main class="room-grid">
+    <section class="arena-head">
+      <div class="match-meta">
+        <p class="eyebrow">{state.phase === "arena" ? "LIVE MATCH" : "READY ROOM"}</p>
+        <h1>{matchTitle()}</h1>
+        <p>{state.problems.length} 题 / 胜利线 {winThreshold(state)} / 你是 {teamName(currentSeat())}</p>
+      </div>
+      <div class="timer-block">
+        <strong>{formatMatchClock()}</strong>
+        <ScoreBar />
+      </div>
+    </section>
+
+    <section class="panel roster-panel">
+      <PanelTitle icon={<Users size={16} />} title="TEAMS" detail="roster / rating" />
+      <Roster />
+    </section>
+
+    <section class="panel comms-panel">
+      <Chat />
+      <Votes />
+      <RoomControls />
+    </section>
+
+    <section class="panel submissions-panel">
+      <PanelTitle icon={<Flame size={16} />} title="SUBMISSIONS" detail="history" />
+      <FeedTable />
+    </section>
+
+    <section class="panel problems-panel">
+      <PanelTitle icon={<Terminal size={16} />} title="PROBLEMS" detail="easy -> hard" />
+      <Problems />
+    </section>
+  </main>
+);
+
+const RoomControls = () => {
+  const player = state.players[identity.id];
+  const canClose = canCloseRoom(state, identity.id, identity.luoguName);
+  const canPlayAction = state.phase === "arena" && isTeam(player?.team) && !blockedByBan();
+  return (
+    <div class="room-controls">
+      {state.phase === "lobby" ? (
+        <>
+          <div class="segmented">
+            {(["red", "blue", "spectator"] as Seat[]).map((seat) => (
+              <button key={seat} class={currentSeat() === seat ? "active" : ""} disabled={blockedByBan()} onClick={() => void setSeat(seat)}>
+                {seat === "spectator" ? <Eye size={15} /> : <CircleDot size={15} />}
+                {teamName(seat)}
+              </button>
+            ))}
+          </div>
+          <button class={player?.ready ? "success" : "primary"} disabled={!isTeam(player?.team) || blockedByBan()} onClick={() => void toggleReady()}>
+            <Check size={16} />
+            {player?.ready ? "已准备" : "准备"}
+          </button>
+        </>
+      ) : null}
+      {canPlayAction ? (
+        <div class="match-actions">
+          <button class="ghost" onClick={() => void openVote("draw")}>
+            <Handshake size={16} />
+            求和
+          </button>
+          <button class="danger" onClick={() => void openVote("surrender")}>
+            <Flag size={16} />
+            投降
+          </button>
+        </div>
+      ) : null}
+      {canClose ? (
+        <div class="close-box">
+          <input value={draft.closeReason} onInput={(event) => (draft.closeReason = event.currentTarget.value)} />
+          <button class="danger" onClick={() => void closeRoom()}>
+            <DoorClosed size={16} />
+            {isAdmin() ? "强制关房" : "关闭房间"}
+          </button>
+        </div>
+      ) : null}
     </div>
-    {action}
+  );
+};
+
+const PanelTitle = ({ icon, title, detail }: { icon: ComponentChildren; title: string; detail: string }) => (
+  <div class="panel-title">
+    <span>{icon}</span>
+    <strong>{title}</strong>
+    <em>{detail}</em>
   </div>
 );
 
-const DifficultyRangeSlider = () => {
-  const low = Math.min(draft.difficultyLow, draft.difficultyHigh) as DifficultyLevel;
-  const high = Math.max(draft.difficultyLow, draft.difficultyHigh) as DifficultyLevel;
-  const setLow = (value: DifficultyLevel) => {
-    draft.difficultyLow = value;
-    if (draft.difficultyLow > draft.difficultyHigh) draft.difficultyHigh = draft.difficultyLow;
-    notify();
-  };
-  const setHigh = (value: DifficultyLevel) => {
-    draft.difficultyHigh = value;
-    if (draft.difficultyHigh < draft.difficultyLow) draft.difficultyLow = draft.difficultyHigh;
-    notify();
-  };
+const ScoreBar = () => {
+  const red = scoreOf(state, "red");
+  const blue = scoreOf(state, "blue");
+  const total = Math.max(1, red + blue);
+  const redPct = red + blue === 0 ? 50 : (red / total) * 100;
+  const bluePct = 100 - redPct;
   return (
-    <div class="difficulty-range">
-      <div class="difficulty-range-head">
-        <span>
-          低难度 <strong>{difficultyName(low)}</strong>
-        </span>
-        <span>
-          高难度 <strong>{difficultyName(high)}</strong>
-        </span>
+    <div class="duel-progress" aria-label="score progress">
+      <div class="red-fill" style={{ width: `${redPct}%` }}>
+        <span>{red}</span>
       </div>
-      <div class="difficulty-track-wrap">
-        <div class="difficulty-track" />
-        <input
-          class="difficulty-range-input low"
-          type="range"
-          min="1"
-          max="8"
-          step="1"
-          value={draft.difficultyLow}
-          aria-label="低难度端点"
-          onInput={(event) => setLow(Number(event.currentTarget.value) as DifficultyLevel)}
-        />
-        <input
-          class="difficulty-range-input high"
-          type="range"
-          min="1"
-          max="8"
-          step="1"
-          value={draft.difficultyHigh}
-          aria-label="高难度端点"
-          onInput={(event) => setHigh(Number(event.currentTarget.value) as DifficultyLevel)}
-        />
-      </div>
-      <div class="difficulty-scale">
-        {difficultyMeta.map((item) => (
-          <span key={item.value}>{item.short}</span>
-        ))}
+      <div class="blue-fill" style={{ width: `${bluePct}%` }}>
+        <span>{blue}</span>
       </div>
     </div>
   );
 };
 
-const WaitingRooms = () => {
-  const freshRooms = waitingRooms
-    .filter((room) => Date.now() - room.createdAt < (room.status === "arena" ? 6 : 2) * 60 * 60 * 1000)
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .slice(0, 12);
-  if (freshRooms.length === 0) return <p class="muted">暂无等待中的公开房间。</p>;
+const RoomList = () => {
+  const fresh = rooms.filter((room) => Date.now() - room.createdAt < 6 * 60 * 60 * 1000);
+  if (!fresh.length) return <p class="muted">暂无公开房间。</p>;
   return (
     <div class="room-list">
-      {freshRooms.map((room) => (
-        <div class="room-card" key={room.roomId}>
+      {fresh.map((room) => (
+        <article class="room-card" key={room.roomId}>
           <div>
-            <strong>
-              {room.host} <em class={room.status === "arena" ? "live" : ""}>{room.status === "arena" ? "进行中" : "准备中"}</em>
-            </strong>
-            <span>
-              {room.problemCount} 题 · {room.status === "arena" && room.startedAt ? `开赛 ${timeAgo(room.startedAt)}` : timeAgo(room.createdAt)}
-            </span>
+            <strong>{room.host}</strong>
+            <span>{room.problemCount} 题 / {room.status === "arena" ? `开赛 ${timeAgo(room.startedAt ?? room.createdAt)}` : "准备中"}</span>
           </div>
-          <div class="room-actions">
-            <button
-              onClick={() => {
-                if (hasBlockingActiveRoom(room.roomId)) {
-                  setStatus("你已经在一场比赛中，不能加入其他房间");
-                  return;
-                }
-                location.hash = `room=${room.roomId}&secret=${room.secret}`;
-              }}
-            >
-              {room.status === "arena" ? "观赛" : "加入"}
-            </button>
-            {isAdmin(identity.luoguName) ? (
-              <button class="danger" onClick={() => void forceCloseListing(room)}>
-                强制关房
-              </button>
-            ) : null}
-          </div>
-        </div>
+          <em class={room.status === "arena" ? "live" : ""}>{room.status === "arena" ? "LIVE" : "LOBBY"}</em>
+          <button onClick={() => joinRoom(room)}>{room.status === "arena" ? "观赛" : "加入"}</button>
+        </article>
       ))}
     </div>
   );
 };
 
-const History = () => {
-  const history = readHistory();
-  if (history.length === 0) return <p class="muted">暂无历史对局。</p>;
+const AdminPanel = () => {
+  if (!isAdmin()) return null;
   return (
-    <>
-      {history
-        .slice(-8)
-        .reverse()
-        .map((item) => (
-          <div class="history" key={`${item.roomId}:${item.at}`}>
-            <span>{item.roomId}</span>
-            <span>{item.result}</span>
-          </div>
-        ))}
-    </>
-  );
-};
-
-const Roster = ({ compact = false }: { compact?: boolean }) => (
-  <div class={compact ? "teams compact" : "teams"}>
-    <TeamCard team="red" />
-    <TeamCard team="blue" />
-    <TeamCard team="spectator" />
-  </div>
-);
-
-const TeamCard = ({ team }: { team: Seat }) => {
-  const players = Object.values(state.players).filter((player) => player.team === team);
-  return (
-    <div class={`team ${team}`}>
-      <h3>{teamName(team)}</h3>
-      {players.length ? (
-        players.map((player) => <PlayerRow player={player} team={team} key={player.id} />)
-      ) : (
-        <p class="muted">{team === "spectator" ? "暂无观赛者" : "等待玩家"}</p>
-      )}
-    </div>
-  );
-};
-
-const PlayerRow = ({ player, team }: { player: Player; team: Seat }) => {
-  const muted = isMuted(player.id);
-  const kicked = moderationRecordForPlayer(player);
-  return (
-    <div class={`player ${kicked ? "restricted" : ""}`}>
-      <span class="player-name">{player.luoguName}</span>
-      <span class="badge-row">
-        {isAdmin(player.luoguName) ? <em class="role admin">管理员</em> : null}
-        {muted ? <em class="role muted">禁言</em> : null}
-        {kicked ? <em class="role kicked">封禁</em> : null}
-        <em class="role">{team === "spectator" ? "观赛" : player.ready ? "已准备" : "未准备"}</em>
-      </span>
-      {kicked ? <small class="moderation-reason">{kicked.reason}</small> : null}
-    </div>
-  );
-};
-
-const RestrictionBanner = () => {
-  const record = moderationRecordForPlayer(state.players[identity.id]) || moderationRecordForName(identity.luoguName);
-  if (!record && !isMuted(identity.id)) return null;
-  return (
-    <div class="restriction-banner">
-      {record ? (
-        <>
-          <strong>你已被移出并封禁</strong>
-          <span>
-            {record.reason} · {record.by}
-          </span>
-        </>
-      ) : (
-        <>
-          <strong>你已被禁言</strong>
-          <span>仍可观赛，但暂时不能发送聊天消息。</span>
-        </>
-      )}
-    </div>
-  );
-};
-
-const AdminTools = ({ compact = false }: { compact?: boolean }) => {
-  if (!isAdmin(identity.luoguName) || roomId !== "global") return null;
-  const players = uniquePlayersByName();
-  return (
-    <div class={`admin-tools ${compact ? "compact" : ""}`}>
-      <div class="admin-head">
-        <span>全局管理员面板</span>
-        <small>禁言影响全部房间发言，踢出会按用户名封禁。</small>
-      </div>
-      <div class="admin-list">
-        {players.map((player) => {
-          const sameNamePlayers = playersByNormalizedName(player.luoguName);
-          const muted = sameNamePlayers.some((target) => isMuted(target.id));
-          const kicked = Boolean(moderationRecordForPlayer(player));
-          const protectedUser = isAdmin(player.luoguName);
-          return (
-            <div class="admin-row" key={normalizeName(player.luoguName)}>
-              <div>
-                <strong>{player.luoguName}</strong>
-                <span>
-                  {teamName(player.team)}
-                  {muted ? " · 已禁言" : ""}
-                  {kicked ? " · 已封禁" : ""}
-                </span>
-              </div>
-              <input
-                value={draft.adminReasons[player.id] || ""}
-                placeholder="踢出理由"
-                autoComplete="off"
-                disabled={protectedUser || kicked}
-                onInput={(event) => {
-                  draft.adminReasons[player.id] = event.currentTarget.value;
-                  notify();
-                }}
-              />
-              <div class="admin-actions">
-                <button disabled={protectedUser || kicked} onClick={() => void adminMute(player, muted)}>
-                  {muted ? "解除禁言" : "禁言"}
-                </button>
-                {kicked ? (
-                  <button onClick={() => void adminUnkick(player)}>取消封禁</button>
-                ) : (
-                  <button class="danger" disabled={protectedUser} onClick={() => void adminKick(player)}>
-                    踢出并封禁
-                  </button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-};
-
-const SeatBadge = () => (
-  <div class={`seat-badge ${currentSeat()}`}>
-    <span>我的身份</span>
-    <strong>{teamName(currentSeat())}</strong>
-  </div>
-);
-
-const Problems = ({ withActions }: { withActions: boolean }) => (
-  <table>
-    <thead>
-      <tr>
-        <th>题目</th>
-        <th>难度</th>
-        <th>分数</th>
-        <th>解题选手</th>
-        {withActions ? <th>操作</th> : null}
-      </tr>
-    </thead>
-    <tbody>
-      {state.problems.map((problem, index) =>
-        withActions ? (
-          <tr class={problem.solvedBy?.team ?? ""} key={problem.pid}>
-            <td>
-              <a href={`https://www.luogu.com.cn/problem/${problem.pid}`} target="_blank" rel="noreferrer">
-                {problem.pid}
-              </a>
-              {problem.title ? <small class="problem-title">{problem.title}</small> : null}
-            </td>
-            <td>{problem.difficulty ? <DifficultyBadge level={problem.difficulty} /> : <span class="muted">随机</span>}</td>
-            <td>{problem.score}</td>
-            <td>{problem.solvedBy ? problem.solvedBy.luoguName : "未抢占"}</td>
-            <td class="row-actions">
-              {isParticipant(currentSeat()) && !isRestricted(identity.id) ? (
-                <>
-                  <button onClick={() => void judgeProblem(problem.pid)}>判题</button>
-                  <button onClick={() => void openVote("replace-problem", problem.pid, createReplacementProblem(state, crypto.randomUUID(), problem.pid))}>
-                    换题
-                  </button>
-                  <button onClick={() => void openVote("delete-problem", problem.pid)}>删除</button>
-                </>
-              ) : (
-                <span class="muted">观赛中</span>
-              )}
-            </td>
-          </tr>
-        ) : (
-          <tr key={`${problem.pid}:${index}`}>
-            <td>
-              <span class="blur-token">P{String(index + 1).padStart(4, "0")}</span>
-            </td>
-            <td>
-              <span class="blur-token">{problem.difficulty ? difficultyName(problem.difficulty) : "未知"}</span>
-            </td>
-            <td>
-              <span class="blur-token">{problem.score}</span>
-            </td>
-            <td>
-              <span class="muted">开赛后公开</span>
-            </td>
-          </tr>
-        )
-      )}
-    </tbody>
-  </table>
-);
-
-const DifficultyBadge = ({ level }: { level: number }) => {
-  const meta = difficultyMeta.find((item) => item.value === level);
-  return (
-    <span class="difficulty-badge" style={{ "--difficulty-color": meta?.color ?? "#6b7280" } as preact.JSX.CSSProperties}>
-      {meta?.short ?? level}
-    </span>
-  );
-};
-
-const Chat = () => {
-  const chats = roomId === "global" ? state.chats.filter((chat) => chat.visibility === "all") : visibleChats(state, identity.id);
-  return (
-    <>
-      <div class="chat-log">
-        {chats.slice(-80).reverse().map((chat) => (
-          <ChatLine chat={chat} key={chat.id} />
-        ))}
-      </div>
-      <form class="chat-form" autocomplete="off" onSubmit={(event) => void submitChat(event)}>
+    <div class="admin-panel">
+      <PanelTitle icon={<Shield size={16} />} title="ADMIN" detail="global moderation" />
+      <p>当前管理员：{identity.luoguName}</p>
+      <div class="admin-moderation">
         <input
-          name="duel-message"
-          value={draft.chat}
-          placeholder={roomId === "global" ? "输入公共消息" : "输入消息，/ 开头为队内私聊"}
-          autoComplete="new-password"
-          spellcheck={false}
-          disabled={Boolean(isMuted(identity.id) || isRestricted(identity.id))}
-          onInput={(event) => {
-            draft.chat = event.currentTarget.value;
-            notify();
-          }}
+          value={draft.adminTarget}
+          placeholder="Luogu 用户名"
+          onInput={(event) => (draft.adminTarget = event.currentTarget.value)}
         />
-        <button disabled={Boolean(isMuted(identity.id) || isRestricted(identity.id))}>发送</button>
-      </form>
-    </>
-  );
-};
-
-const ChatLine = ({ chat }: { chat: ChatMessage }) => (
-  <p class={chat.visibility === "team" ? "private" : ""}>
-    <span>
-      {chat.visibility === "team" ? "队内" : "公屏"} · {chat.luoguName}
-    </span>
-    {chat.text}
-  </p>
-);
-
-const Votes = () => {
-  const openVotes = Object.values(state.votes).filter((vote) => vote.status === "open");
-  if (openVotes.length === 0) return null;
-  const canVote = isParticipant(currentSeat()) && !isRestricted(identity.id);
-  return (
-    <div class="votes">
-      {openVotes.map((vote) => (
-        <div class="vote" key={vote.id}>
-          <span>
-            {voteLabel(vote.kind)} {vote.targetPid ?? ""}
-          </span>
-          <span>
-            {Object.keys(vote.approvals).length}/{participantCount()}
-          </span>
-          {canVote ? (
-            <>
-              <button onClick={() => void emitCommand({ kind: "vote.cast", voteId: vote.id, approve: true })}>同意</button>
-              <button onClick={() => void emitCommand({ kind: "vote.cast", voteId: vote.id, approve: false })}>拒绝</button>
-            </>
-          ) : null}
-          {canVote && vote.proposerId === identity.id ? (
-            <button onClick={() => void emitCommand({ kind: "vote.cancelled", voteId: vote.id })}>取消</button>
-          ) : null}
-        </div>
-      ))}
+        <input
+          value={draft.adminReason}
+          placeholder="原因（封禁时使用）"
+          onInput={(event) => (draft.adminReason = event.currentTarget.value)}
+        />
+        <button class="danger" onClick={() => void moderateGlobal("ban")}>
+          <Ban size={14} />
+          封禁
+        </button>
+        <button class="ghost" onClick={() => void moderateGlobal("unban")}>
+          <X size={14} />
+          解封
+        </button>
+        <button class="ghost" onClick={() => void moderateGlobal("mute")}>
+          <VolumeX size={14} />
+          禁言
+        </button>
+        <button class="ghost" onClick={() => void moderateGlobal("unmute")}>
+          <Volume2 size={14} />
+          解禁言
+        </button>
+      </div>
+      <div class="admin-room-list">
+        {rooms.length ? (
+          rooms.map((room) => (
+            <div class="admin-room" key={room.roomId}>
+              <code>{room.roomId}</code>
+              <span>{room.host} / {room.status}</span>
+              <button class="danger" onClick={() => void forceCloseRoom(room)}>
+                <Trash2 size={14} />
+                删除房间
+              </button>
+            </div>
+          ))
+        ) : (
+          <p class="muted">暂无可管理的公开房间。</p>
+        )}
+      </div>
     </div>
   );
 };
 
-const Feed = () => (
-  <table>
-    <thead>
-      <tr>
-        <th>用户</th>
-        <th>题目</th>
-        <th>时间</th>
-        <th>状态</th>
-      </tr>
-    </thead>
-    <tbody>
-      {state.feed.map((item) => (
-        <tr key={`${item.recordId}:${item.pid}`}>
-          <td>{item.luoguName}</td>
-          <td>{item.pid}</td>
-          <td>{formatTime(item.at)}</td>
-          <td>
-            <strong>{item.status}</strong>
-          </td>
-        </tr>
-      ))}
-    </tbody>
-  </table>
-);
+const forceCloseRoom = async (room: RoomListing) => {
+  const event: DuelEvent = {
+    type: "room.closed",
+    roomId: room.roomId,
+    actorId: identity.id,
+    id: crypto.randomUUID(),
+    lamport: 1,
+    issuedAt: Date.now(),
+    reason: "管理员删除房间",
+    actorName: identity.luoguName
+  };
+  const envelope = await signEvent(identity, event);
+  await publishEnvelope(room.roomId, room.secret, envelope);
+  rooms = rooms.filter((item) => item.roomId !== room.roomId);
+  setStatus(`已删除房间 ${room.roomId}`);
+};
 
-const SystemFlow = () => (
-  <div class="system-flow">
-    {state.system.slice(-10).map((line, index) => (
-      <p key={`${line}:${index}`}>{line}</p>
+const Roster = () => (
+  <div class="teams">
+    {(["red", "blue", "spectator"] as Seat[]).map((seat) => (
+      <div class={`team-card ${seat}`} key={seat}>
+        <h3>{teamName(seat)}</h3>
+        {Object.values(state.players).filter((player) => player.team === seat).length ? (
+          Object.values(state.players)
+            .filter((player) => player.team === seat)
+            .map((player) => <PlayerRow player={player} key={player.id} />)
+        ) : (
+          <p class="muted">等待玩家</p>
+        )}
+      </div>
     ))}
   </div>
 );
 
+const PlayerRow = ({ player }: { player: Player }) => {
+  const banned = moderationRecordForPlayer(player);
+  const muted = isMutedPlayer(player);
+  return (
+    <div class={`player-row ${banned ? "banned" : ""}`}>
+      <div class="avatar">{avatarText(player.luoguName)}</div>
+      <div class="player-main">
+        <span>{player.luoguName}</span>
+        <small>{ratingFor(player.luoguName)}</small>
+      </div>
+      <div class="player-tags">
+        {state.hostId === player.id ? <em><Crown size={12} />HOST</em> : null}
+        {isAdminName(player.luoguName) ? <em><Shield size={12} />ADMIN</em> : null}
+        {muted ? <em><Ban size={12} />MUTED</em> : null}
+        {banned ? <em><Ban size={12} />BANNED</em> : <em>{player.ready ? "READY" : teamName(player.team).toUpperCase()}</em>}
+      </div>
+    </div>
+  );
+};
+
+const Problems = () => (
+  <div class="problem-grid">
+    {state.problems.map((problem, index) => (
+      <article class={`problem-card ${problem.solvedBy?.team ?? ""}`} key={problem.pid}>
+        <div>
+          <a href={`https://www.luogu.com.cn/problem/${problem.pid}`} target="_blank" rel="noreferrer">
+            {state.phase === "lobby" ? `P${String(index + 1).padStart(4, "0")}` : problem.pid}
+          </a>
+          <span>{problem.score} pts</span>
+        </div>
+        {problem.difficulty ? <DifficultyBadge level={problem.difficulty} /> : <em>random</em>}
+        <strong>{problem.solvedBy?.luoguName ?? (state.phase === "lobby" ? "hidden" : "unclaimed")}</strong>
+        {state.phase === "arena" && isTeam(currentSeat()) && !blockedByBan() ? (
+          <div class="problem-actions">
+            <button onClick={() => void judgeProblem(problem.pid)}>判题</button>
+            <button onClick={() => void openVote("replace-problem", problem.pid, createReplacementProblem(state, crypto.randomUUID(), problem.pid))}>换题</button>
+            <button onClick={() => void openVote("delete-problem", problem.pid)}>删题</button>
+          </div>
+        ) : null}
+      </article>
+    ))}
+  </div>
+);
+
+const Chat = () => {
+  const items = chatStreamItems();
+  const muted = isMutedCurrent();
+  return (
+    <div class="chat">
+      <PanelTitle icon={<MessageSquare size={16} />} title="CHAT" detail={mode === "room" ? "/ prefix = team" : "global"} />
+      <div class="chat-log">
+        {items.map((item) => <ChatLine item={item} key={item.id} />)}
+      </div>
+      <form class="chat-form" onSubmit={(event) => void submitChat(event)}>
+        <textarea
+          value={draft.chat}
+          rows={1}
+          disabled={blockedByBan() || muted}
+          placeholder={muted ? "你已被禁言" : mode === "room" ? "消息，/开头发队内" : "大厅自由聊天"}
+          onInput={(event) => (draft.chat = event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
+        />
+        <button disabled={blockedByBan() || muted}>
+          <Send size={15} />
+          {muted ? "禁言" : "发送"}
+        </button>
+      </form>
+    </div>
+  );
+};
+
+type ChatStreamItem =
+  | { type: "chat"; id: string; at: number; chat: ChatMessage }
+  | { type: "system"; id: string; at: number; text: string }
+  | { type: "judge"; id: string; at: number; record: DuelState["feed"][number] };
+
+const chatStreamItems = (): ChatStreamItem[] => {
+  const chats = visibleChats(state, identity.id).slice(-80).map((chat) => ({ type: "chat" as const, id: chat.id, at: chat.at, chat }));
+  const judges = state.feed.slice(0, 40).map((record) => ({
+    type: "judge" as const,
+    id: `judge:${record.recordId}:${record.pid}`,
+    at: record.at,
+    record
+  }));
+  const systems = state.system.slice(-40).map((message) => ({
+    type: "system" as const,
+    id: `system:${message.id}`,
+    at: message.at,
+    text: message.text
+  }));
+  return [...chats, ...judges, ...systems].sort((a, b) => b.at - a.at).slice(0, 120);
+};
+
+const ChatLine = ({ item }: { item: ChatStreamItem }) => {
+  if (item.type === "system") {
+    return (
+      <p class="system">
+        <span class="chat-avatar">#</span>
+        <span>SYS</span>
+        <span class="chat-text">{item.text}</span>
+      </p>
+    );
+  }
+  if (item.type === "judge") {
+    const record = item.record;
+    return (
+      <p class={record.status === "OK" ? "judge ok" : "judge fail"}>
+        <span class="chat-avatar">{record.status === "OK" ? "✓" : "!"}</span>
+        <span>{formatClock(record.at)} / {record.pid}</span>
+        <span class="chat-text">{record.luoguName} {record.status}</span>
+      </p>
+    );
+  }
+  const chat = item.chat;
+  return (
+    <p class={chat.visibility === "team" ? "private" : ""}>
+      <span class="chat-avatar">{avatarText(chat.luoguName)}</span>
+      <span>{chat.visibility === "team" ? "TEAM" : "ALL"} / {chat.luoguName}</span>
+      <span class="chat-text">{chat.text}</span>
+    </p>
+  );
+};
+
+const FeedTable = () => (
+  <table class="feed-table">
+    <thead>
+      <tr>
+        <th>TIME</th>
+        <th>PROB</th>
+        <th>USER</th>
+        <th>VERDICT</th>
+      </tr>
+    </thead>
+    <tbody>
+      {state.feed.slice(0, 16).map((item) => (
+        <tr class={item.status === "OK" ? "ok" : "fail"} key={`${item.recordId}:${item.pid}`}>
+          <td>{formatClock(item.at)}</td>
+          <td><code>{problemCode(item.pid)}</code></td>
+          <td>{item.luoguName}</td>
+          <td>{item.status}</td>
+        </tr>
+      ))}
+      {state.feed.length === 0 ? (
+        <tr>
+          <td colSpan={4}>No submissions.</td>
+        </tr>
+      ) : null}
+    </tbody>
+  </table>
+);
+
+const Votes = () => {
+  const openVotes = Object.values(state.votes).filter((vote) => vote.status === "open");
+  if (!openVotes.length) return null;
+  const canVote = isTeam(currentSeat()) && !blockedByBan();
+  return (
+    <div class="votes">
+      {openVotes.map((vote) => (
+        <div class="vote" key={vote.id}>
+          <span>{voteLabel(vote.kind)} {vote.targetPid ?? ""}</span>
+          <strong>{Object.keys(vote.approvals).length}/{participantCount()}</strong>
+          {canVote ? (
+            <>
+              <button onClick={() => void emit({ ...baseEvent("vote.cast"), voteId: vote.id, approve: true })}>同意</button>
+              <button onClick={() => void emit({ ...baseEvent("vote.cast"), voteId: vote.id, approve: false })}>拒绝</button>
+            </>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+const BanOverlay = () => {
+  const record = bannedRecord();
+  if (!record) return null;
+  return (
+    <div class="ban-overlay">
+      <div>
+        <Ban size={46} />
+        <h1>你已被封禁</h1>
+        <p>{record.reason}</p>
+        <small>操作人：{record.by}</small>
+      </div>
+    </div>
+  );
+};
+
 const EndOverlay = () => {
   if (state.phase !== "finished") return null;
   const mine = currentSeat();
-  const title = state.closed
-    ? "房间已关闭"
-    : state.winner === "draw"
-      ? "平局"
-      : state.winner === mine
-        ? "胜利"
-        : isParticipant(mine)
-          ? "失败"
-          : `${teamName(state.winner ?? "spectator")} 获胜`;
-  const detail = state.closed?.reason ?? "10 秒后返回主页";
+  const title = state.closed ? "房间已关闭" : state.winner === "draw" ? "平局" : state.winner === mine ? "胜利" : isTeam(mine) ? "失败" : `${teamName(state.winner)} 获胜`;
   return (
     <div class="end-overlay">
       <div class={`end-card ${state.winner ?? "closed"}`}>
         <p class="eyebrow">MATCH END</p>
         <h1>{title}</h1>
-        <p class="lead">{detail}</p>
-        <button class="primary" onClick={() => (location.hash = "")}>
-          返回主页
-        </button>
+        <p>{state.closed?.reason ?? "10 秒后返回主页"}</p>
+        <button class="primary" onClick={() => (location.hash = "")}>返回大厅</button>
       </div>
     </div>
   );
 };
 
-const loadLog = (): SignedEnvelope[] => JSON.parse(localStorage.getItem(storageKey()) || "[]") as SignedEnvelope[];
-const saveLog = () => localStorage.setItem(storageKey(), JSON.stringify(envelopes.slice(-1000)));
-const cloudKey = (): string => (roomId === "global" ? "global" : `${roomId}:${roomSecret}`);
-const compareEnvelopes = (a: SignedEnvelope, b: SignedEnvelope): number =>
-  a.event.lamport - b.event.lamport || a.event.issuedAt - b.event.issuedAt || a.event.id.localeCompare(b.event.id);
+const AuthError = () => (
+  <Shell title="Luogu Duel" subtitle="auth error">
+    <main class="center-screen">
+      <Bot size={42} />
+      <h1>登录失败</h1>
+      <p>{authErrorText}</p>
+      <button class="primary" onClick={() => void startCpOAuthLogin(true)}>重新登录</button>
+    </main>
+  </Shell>
+);
 
+const Loading = () => (
+  <main class="center-screen">
+    <Bot size={42} />
+    <h1>Connecting</h1>
+    <p>正在装载身份与房间网络。</p>
+  </main>
+);
+
+const DifficultyControl = ({ label, value, set }: { label: string; value: DifficultyLevel; set: (value: DifficultyLevel) => void }) => (
+  <label>
+    <span>{label}</span>
+    <select value={value} onChange={(event) => set(Number(event.currentTarget.value) as DifficultyLevel)}>
+      {difficultyMeta.map((item) => (
+        <option value={item.value} key={item.value}>{item.label}</option>
+      ))}
+    </select>
+  </label>
+);
+
+const DifficultyBadge = ({ level }: { level: number }) => {
+  const meta = difficultyMeta.find((item) => item.value === level);
+  return <span class="difficulty-badge" style={{ "--difficulty-color": meta?.color ?? "#6b7280" } as JSX.CSSProperties}>{meta?.short ?? level}</span>;
+};
+
+const History = () => {
+  const history = readHistory();
+  if (!history.length) return <p class="muted">暂无历史对局。</p>;
+  return (
+    <div class="history-list">
+      {history.slice(-8).reverse().map((item) => (
+        <p key={`${item.roomId}:${item.at}`}><span>{item.roomId}</span><strong>{item.result}</strong></p>
+      ))}
+    </div>
+  );
+};
+
+const joinRoom = (room: RoomListing) => {
+  if (hasBlockingActiveRoom(room.roomId)) {
+    setStatus("你已经在一场比赛中，不能加入其他房间", "error");
+    return;
+  }
+  location.hash = `room=${room.roomId}&secret=${room.secret}`;
+};
+
+const logout = () => {
+  logoutCpSession();
+  location.hash = "";
+  location.reload();
+};
+
+const blockedByBan = (): boolean => Boolean(bannedRecord());
+const bannedRecord = () =>
+  moderationRecordForPlayer(state.players[identity?.id]) ||
+  moderationRecordForName(identity?.luoguName ?? "");
+const moderationRecordForName = (name: string) =>
+  state.banned[normalizeName(name)] || globalModeration.banned[normalizeName(name)];
+const moderationRecordForPlayer = (player: Player | undefined) => (player ? state.kicked[player.id] || moderationRecordForName(player.luoguName) : undefined);
+const isMutedCurrent = (): boolean => isMutedByIdentity(identity?.id ?? "", identity?.luoguName ?? "");
+const isMutedPlayer = (player: Player): boolean => isMutedByIdentity(player.id, player.luoguName);
+const isMutedByIdentity = (id: string, name: string): boolean => {
+  const nameKey = `name:${normalizeName(name)}`;
+  return Boolean(state.muted[id] || state.muted[nameKey] || globalModeration.muted[id] || globalModeration.muted[nameKey]);
+};
+const currentSeat = (): Seat => state.players[identity.id]?.team ?? preferredSeat();
 const preferredSeat = (): Seat => {
   if (state.phase !== "lobby") return "spectator";
   const remembered = localStorage.getItem(roomSeatKey()) as Seat | null;
   if (remembered === "red" || remembered === "blue" || remembered === "spectator") return remembered;
-  return pickTeam();
-};
-
-const pickTeam = (): Team => {
   const red = Object.values(state.players).filter((p) => p.team === "red").length;
   const blue = Object.values(state.players).filter((p) => p.team === "blue").length;
   return red <= blue ? "red" : "blue";
 };
-
 const rememberSeat = (seat: Seat) => localStorage.setItem(roomSeatKey(), seat);
-const currentSeat = (): Seat => state.players[identity.id]?.team ?? preferredSeat();
-const isParticipant = (seat: Seat | undefined): seat is Team => seat === "red" || seat === "blue";
-const participantCount = (): number => Object.values(state.players).filter((player) => isParticipant(player.team) && !isRestricted(player.id)).length;
-const teamName = (seat: Seat): string => (seat === "red" ? "红方" : seat === "blue" ? "蓝方" : "观赛席");
-const isAdmin = (name: string): boolean => adminNames.has(name);
-const normalizeName = (name: string): string => name.trim().toLowerCase();
-const moderationRecordForName = (name: string) => state.banned[normalizeName(name)] || globalModeration.banned[normalizeName(name)];
-const moderationRecordForPlayer = (player: Player | undefined) =>
-  player ? state.kicked[player.id] || globalModeration.kicked[player.id] || moderationRecordForName(player.luoguName) : undefined;
-const isBannedName = (name: string): boolean => Boolean(moderationRecordForName(name));
-const isMuted = (id: string): boolean => Boolean(state.muted[id] || globalModeration.muted[id]);
-const isRestricted = (id: string): boolean => {
-  const player = state.players[id];
-  return Boolean(moderationRecordForPlayer(player));
-};
-const findPlayerByName = (name: string): Player | undefined =>
-  Object.values(state.players).find((player) => normalizeName(player.luoguName) === normalizeName(name));
-const playersByNormalizedName = (name: string): Player[] =>
-  Object.values(state.players).filter((player) => normalizeName(player.luoguName) === normalizeName(name));
-const uniquePlayersByName = (): Player[] => {
-  const byName = new Map<string, Player>();
-  for (const player of Object.values(state.players)) {
-    const key = normalizeName(player.luoguName);
-    const current = byName.get(key);
-    if (!current || isAdmin(player.luoguName) || player.luoguName.localeCompare(current.luoguName) < 0) {
-      byName.set(key, player);
-    }
-  }
-  return [...byName.values()].sort((a, b) => a.luoguName.localeCompare(b.luoguName));
+const isAdmin = () => isAdminName(identity?.luoguName ?? "");
+const participantCount = (): number => Object.values(state.players).filter((player) => isTeam(player.team) && !moderationRecordForPlayer(player)).length;
+const matchTitle = (): string => {
+  const red = Object.values(state.players).filter((p) => p.team === "red").map((p) => p.luoguName).join(" / ");
+  const blue = Object.values(state.players).filter((p) => p.team === "blue").map((p) => p.luoguName).join(" / ");
+  return `${red || "红方"} vs ${blue || "蓝方"}`;
 };
 
 const rememberActiveRoomIfNeeded = () => {
   const seat = state.players[identity.id]?.team;
-  if (roomId !== "global" && isParticipant(seat) && !isRestricted(identity.id) && state.phase !== "finished") {
+  if (mode === "room" && isTeam(seat) && !blockedByBan() && state.phase !== "finished") {
     localStorage.setItem(activeRoomKey, JSON.stringify({ roomId, secret: roomSecret }));
+    return;
   }
-  if (state.phase === "finished" || isRestricted(identity.id)) localStorage.removeItem(activeRoomKey);
+  if (mode === "room" || state.phase === "finished" || blockedByBan()) localStorage.removeItem(activeRoomKey);
 };
 
 const hasBlockingActiveRoom = (allowedRoomId?: string): boolean => {
@@ -1356,6 +1126,10 @@ const hasBlockingActiveRoom = (allowedRoomId?: string): boolean => {
   if (!raw) return false;
   try {
     const active = JSON.parse(raw) as { roomId?: string };
+    if (active.roomId && !rooms.some((room) => room.roomId === active.roomId)) {
+      localStorage.removeItem(activeRoomKey);
+      return false;
+    }
     return Boolean(active.roomId && active.roomId !== allowedRoomId);
   } catch {
     localStorage.removeItem(activeRoomKey);
@@ -1363,11 +1137,19 @@ const hasBlockingActiveRoom = (allowedRoomId?: string): boolean => {
   }
 };
 
-const parseManualProblemCount = (value: string): number =>
-  value
-    .split(/[\s,，]+/)
-    .map((pid) => pid.trim().toUpperCase())
-    .filter((pid) => /^P\d{1,5}$/.test(pid)).length;
+const scheduleFinishReturn = () => {
+  if (state.phase !== "finished") return;
+  clearFinishTimer();
+  localStorage.removeItem(activeRoomKey);
+  finishReturnTimer = window.setTimeout(() => {
+    location.hash = "";
+  }, 10_000);
+};
+
+const clearFinishTimer = () => {
+  if (finishReturnTimer) window.clearTimeout(finishReturnTimer);
+  finishReturnTimer = undefined;
+};
 
 const readHistory = (): Array<{ roomId: string; result: string; at: number }> => {
   try {
@@ -1378,31 +1160,41 @@ const readHistory = (): Array<{ roomId: string; result: string; at: number }> =>
 };
 
 const saveHistory = () => {
-  if (roomId === "global" || !state.winner) return;
-  const history = readHistory();
-  const result = state.winner === "draw" ? "平局" : `${teamName(state.winner)}胜`;
-  const next = history.filter((item) => item.roomId !== roomId).concat({ roomId, result, at: Date.now() });
+  if (mode !== "room" || state.phase !== "finished" || (!state.winner && !state.closed)) return;
+  const result = state.closed ? "关闭" : state.winner === "draw" ? "平局" : `${teamName(state.winner)}胜`;
+  const next = readHistory().filter((item) => item.roomId !== roomId).concat({ roomId, result, at: Date.now() });
   localStorage.setItem(historyKey, JSON.stringify(next.slice(-30)));
 };
 
-const friendlyCloudError = (error: unknown, prefix = "云同步暂时不可用"): string => {
-  const message = error instanceof Error ? error.message : String(error);
-  if (message.includes("Failed to fetch") || message.includes("NetworkError") || message.includes("Load failed")) {
-    return `${prefix}，已切换本地缓存并自动退避重试`;
-  }
-  return `${prefix}：${message}`;
-};
+const compareEnvelopes = (a: SignedEnvelope, b: SignedEnvelope): number =>
+  a.event.lamport - b.event.lamport || a.event.issuedAt - b.event.issuedAt || a.event.id.localeCompare(b.event.id);
 
-const difficultyName = (level: number): string => difficultyMeta.find((item) => item.value === level)?.label ?? `难度 ${level}`;
 const voteLabel = (kind: VoteKind): string => {
   if (kind === "replace-problem") return "换题";
   if (kind === "delete-problem") return "删题";
   if (kind === "draw") return "平局";
   return "投降";
 };
+
+const formatMatchClock = (): string => {
+  const base = state.startedAt ?? Date.now();
+  const seconds = state.phase === "arena" && state.startedAt ? Math.max(0, Math.floor((Date.now() - base) / 1000)) : 0;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return [h, m, s].map((n) => String(n).padStart(2, "0")).join(":");
+};
+
+const formatClock = (time: number): string =>
+  new Date(time).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+const avatarText = (name: string): string => (name.trim()[0] || "?").toUpperCase();
+const ratingFor = (name: string): number => 1200 + [...name].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 1900;
+const problemCode = (pid: string): string => pid.replace(/^P/i, "") || pid;
+
+const friendlyError = (error: unknown, prefix: string): string => `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
 const compactId = () => crypto.randomUUID().replaceAll("-", "").slice(0, 10);
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, Number.isFinite(n) ? n : min));
-const formatTime = (time: number) => new Date(time).toLocaleString("zh-CN", { hour12: false });
 const timeAgo = (time: number): string => {
   const minutes = Math.max(0, Math.floor((Date.now() - time) / 60_000));
   if (minutes < 1) return "刚刚";

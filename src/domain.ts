@@ -24,8 +24,8 @@ const statusRank: Record<JudgeStatus, number> = {
   UKE: 7,
   PD: 8
 };
-const adminNames = new Set(["General826", "Gcend", "GCSG01"]);
 
+export const ADMIN_NAMES = new Set(["general826", "gcend", "gcsg01"]);
 export const SYSTEM_CHAT_PREFIX = "@@luogu-duel-system:";
 
 export type SystemChatCommand =
@@ -37,12 +37,7 @@ export type SystemChatCommand =
   | { kind: "vote.opened"; vote: Omit<Vote, "approvals" | "rejections" | "status" | "createdAt"> }
   | { kind: "vote.cast"; voteId: string; approve: boolean }
   | { kind: "vote.cancelled"; voteId: string }
-  | { kind: "judge.recordSeen"; record: FeedRecord }
-  | { kind: "player.muted"; targetId: string }
-  | { kind: "player.unmuted"; targetId: string }
-  | { kind: "player.kicked"; targetId: string; reason: string }
-  | { kind: "player.unkicked"; targetName: string }
-  | { kind: "room.closed"; reason: string; actorName?: string };
+  | { kind: "judge.recordSeen"; record: FeedRecord };
 
 export const encodeSystemChatCommand = (command: SystemChatCommand): string =>
   `${SYSTEM_CHAT_PREFIX}${encodeURIComponent(JSON.stringify(command))}`;
@@ -67,6 +62,12 @@ export const normalizePid = (pid: string): string => {
   return /^P\d{1,5}$/.test(trimmed) ? trimmed : "";
 };
 
+export const normalizeName = (name: string): string => name.trim().toLowerCase();
+export const isAdminName = (name: string): boolean => ADMIN_NAMES.has(normalizeName(name));
+export const isTeam = (team: Seat | undefined): team is Team => team === "red" || team === "blue";
+export const teamName = (team: Seat | undefined): string =>
+  team === "red" ? "红方" : team === "blue" ? "蓝方" : "观赛";
+
 export const makeProblemSet = (count: number, seed: string, manualInput: string): Problem[] => {
   const manual = manualInput
     .split(/[\s,，]+/)
@@ -79,10 +80,9 @@ export const makeProblemSet = (count: number, seed: string, manualInput: string)
 
   const used = new Set<string>();
   const problems: Problem[] = [];
-  let rng = seeded(seed);
+  const rng = seeded(seed);
   while (problems.length < count) {
-    const n = 1000 + Math.floor(rng() * 16001);
-    const pid = `P${n}`;
+    const pid = `P${1000 + Math.floor(rng() * 16001)}`;
     if (!used.has(pid)) {
       used.add(pid);
       problems.push({ pid, score: scoreForIndex(problems.length) });
@@ -90,6 +90,16 @@ export const makeProblemSet = (count: number, seed: string, manualInput: string)
   }
   return problems;
 };
+
+export const sortProblemsByDifficulty = (problems: Problem[]): Problem[] =>
+  [...problems]
+    .sort(
+      (a, b) =>
+        (a.difficulty ?? 99) - (b.difficulty ?? 99) ||
+        numericPid(a.pid) - numericPid(b.pid) ||
+        a.pid.localeCompare(b.pid)
+    )
+    .map((problem, index) => ({ ...problem, score: scoreForIndex(index) }));
 
 export const applyEvents = (roomId: string, events: DuelEvent[]): DuelState =>
   events
@@ -103,74 +113,61 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
 
   switch (event.type) {
     case "room.configured":
-      if (next.problems.length === 0 && event.problems.length > 0) {
-        next.problems = event.problems.map((p) => ({ ...p }));
-        next.system.push(`[系统] 房间题目已生成，共 ${event.problems.length} 题。`);
-      }
+      configureRoom(next, event.actorId, event.problems, event.issuedAt);
       break;
-
     case "player.joined":
-      {
-        const banned = next.banned[normalizeName(event.luoguName)];
-        const team = banned || next.phase !== "lobby" ? "spectator" : event.team;
-        next.players[event.actorId] = {
-          id: event.actorId,
-          luoguName: event.luoguName.trim() || shortId(event.actorId),
-          team,
-          ready: team === "spectator" ? false : (next.players[event.actorId]?.ready ?? false),
-          online: !banned
-        };
-        if (banned) {
-          next.kicked[event.actorId] = banned;
-          next.system.push(`[系统] 已阻止被封禁用户 ${event.luoguName} 加入：${banned.reason}`);
-        } else {
-          next.system.push(`[系统] ${event.luoguName} 加入 ${teamName(team)}。`);
-        }
-      }
+      joinPlayer(next, event.actorId, event.luoguName, event.team, event.issuedAt);
       break;
-
     case "player.teamChanged":
       if (next.players[event.actorId] && next.phase === "lobby" && !isRestricted(next, event.actorId)) {
-        next.players[event.actorId].team = event.team;
+        const team = next.phase === "lobby" ? event.team : "spectator";
+        next.players[event.actorId].team = team;
         next.players[event.actorId].ready = false;
-        next.system.push(`[系统] ${nameOf(next, event.actorId)} 切换到 ${teamName(event.team)}。`);
+        pushSystem(next, `${nameOf(next, event.actorId)} 切换到 ${teamName(team)}`, event.issuedAt);
       }
       break;
-
     case "player.readyChanged":
       if (next.players[event.actorId] && next.phase === "lobby" && isTeam(next.players[event.actorId].team) && !isRestricted(next, event.actorId)) {
         next.players[event.actorId].ready = event.ready;
       }
       break;
-
     case "game.started":
       if (canStart(next)) {
         next.phase = "arena";
         next.startedAt = event.issuedAt;
-        next.system.push(`[系统] ${matchTitle(next)} 对决开始。`);
+        pushSystem(next, `${matchTitle(next)} 开始`, event.issuedAt);
       }
       break;
-
     case "chat.sent":
-      if (applySystemChatCommand(next, event)) break;
-      pushChat(next, event);
+      if (!applySystemChatCommand(next, event)) pushChat(next, event);
       break;
-
     case "vote.opened":
       openVote(next, event.vote, event.issuedAt, event.actorId);
       break;
-
     case "vote.cast":
-      castVote(next, event.voteId, event.actorId, event.approve);
+      castVote(next, event.voteId, event.actorId, event.approve, event.issuedAt);
       break;
-
     case "vote.cancelled":
-      cancelVote(next, event.voteId, event.actorId);
+      cancelVote(next, event.voteId, event.actorId, event.issuedAt);
       break;
-
     case "judge.recordSeen":
       pushFeed(next, event.record);
       claimIfAccepted(next, event.record, event.id);
+      break;
+    case "room.closed":
+      closeRoom(next, event.actorId, event.actorName, event.reason, event.issuedAt);
+      break;
+    case "player.kicked":
+      kickPlayer(next, event.actorId, event.targetId, event.targetName, event.reason, event.issuedAt);
+      break;
+    case "player.unkicked":
+      unkickPlayer(next, event.actorId, event.targetName, event.issuedAt);
+      break;
+    case "player.muted":
+      mutePlayer(next, event.actorId, event.targetId, event.targetName, event.issuedAt);
+      break;
+    case "player.unmuted":
+      unmutePlayer(next, event.actorId, event.targetId, event.targetName, event.issuedAt);
       break;
   }
 
@@ -178,11 +175,13 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
   return next;
 };
 
-export const scoreOf = (state: DuelState, team: Team): number =>
-  state.problems.reduce((sum, problem) => sum + (problem.solvedBy?.team === team ? problem.score : 0), 0);
+export const participants = (state: DuelState): Player[] =>
+  Object.values(state.players).filter((player) => isTeam(player.team) && !isRestricted(state, player.id));
 
-export const winThreshold = (state: DuelState): number =>
-  Math.ceil(state.problems.reduce((sum, problem) => sum + problem.score, 0) / 2);
+export const participantIds = (state: DuelState): string[] =>
+  participants(state)
+    .map((player) => player.id)
+    .sort();
 
 export const canStart = (state: DuelState): boolean => {
   const players = participants(state);
@@ -196,18 +195,19 @@ export const canStart = (state: DuelState): boolean => {
   );
 };
 
+export const canCloseRoom = (state: DuelState, actorId: string, actorName: string): boolean =>
+  isAdminName(actorName) || (state.phase === "lobby" && state.hostId === actorId);
+
 export const visibleChats = (state: DuelState, viewerId: string): ChatMessage[] => {
   const viewer = state.players[viewerId];
   return state.chats.filter((chat) => chat.visibility === "all" || (isTeam(viewer?.team) && chat.team === viewer.team));
 };
 
-export const participants = (state: DuelState): Player[] =>
-  Object.values(state.players).filter((player) => isTeam(player.team) && !isRestricted(state, player.id));
+export const scoreOf = (state: DuelState, team: Team): number =>
+  state.problems.reduce((sum, problem) => sum + (problem.solvedBy?.team === team ? problem.score : 0), 0);
 
-export const participantIds = (state: DuelState): string[] =>
-  participants(state)
-    .map((player) => player.id)
-    .sort();
+export const winThreshold = (state: DuelState): number =>
+  Math.ceil(state.problems.reduce((sum, problem) => sum + problem.score, 0) / 2);
 
 export const requiredVoters = (state: DuelState, vote: Vote): string[] => {
   if (vote.kind === "surrender" && vote.team) {
@@ -218,7 +218,7 @@ export const requiredVoters = (state: DuelState, vote: Vote): string[] => {
 
 export const createReplacementProblem = (state: DuelState, seed: string, targetPid: string): Problem => {
   const used = new Set(state.problems.map((p) => p.pid));
-  let rng = seeded(`${seed}:${targetPid}:${state.problems.length}`);
+  const rng = seeded(`${seed}:${targetPid}:${state.problems.length}`);
   for (let attempt = 0; attempt < 5000; attempt += 1) {
     const pid = `P${1000 + Math.floor(rng() * 16001)}`;
     if (!used.has(pid)) {
@@ -243,86 +243,47 @@ export const buildVote = (
   replacement
 });
 
-const compareEvents = (a: DuelEvent, b: DuelEvent): number =>
-  a.lamport - b.lamport || a.issuedAt - b.issuedAt || a.id.localeCompare(b.id);
+const configureRoom = (state: DuelState, actorId: string, problems: Problem[], at: number) => {
+  if (state.problems.length > 0 || problems.length === 0) return;
+  state.hostId = state.hostId ?? actorId;
+  state.problems = sortProblemsByDifficulty(problems);
+  pushSystem(state, `房间题目已生成，共 ${problems.length} 题`, at);
+};
 
-const cloneState = (state: DuelState): DuelState => ({
-  ...state,
-  players: Object.fromEntries(Object.entries(state.players).map(([id, p]) => [id, { ...p }])),
-  problems: state.problems.map((problem) => ({
-    ...problem,
-    solvedBy: problem.solvedBy ? { ...problem.solvedBy } : undefined
-  })),
-  chats: [...state.chats],
-  feed: [...state.feed],
-  votes: Object.fromEntries(
-    Object.entries(state.votes).map(([id, vote]) => [
-      id,
-      {
-        ...vote,
-        replacement: vote.replacement ? { ...vote.replacement } : undefined,
-        approvals: { ...vote.approvals },
-        rejections: { ...vote.rejections }
-      }
-    ])
-  ),
-  system: [...state.system],
-  muted: { ...state.muted },
-  kicked: cloneModerationMap(state.kicked),
-  banned: cloneModerationMap(state.banned),
-  closed: state.closed ? { ...state.closed } : undefined
-});
-
-const pushChat = (state: DuelState, event: Extract<DuelEvent, { type: "chat.sent" }>) => {
-  const player = state.players[event.actorId];
-  if (state.muted[event.actorId] || isRestricted(state, event.actorId)) return;
-  if (!player || event.text.trim().length === 0) return;
-  state.chats.push({
-    id: event.id,
-    actorId: event.actorId,
-    luoguName: player.luoguName,
-    team: player.team,
-    visibility: event.visibility,
-    text: event.text.trim().slice(0, 500),
-    at: event.issuedAt
-  });
+const joinPlayer = (state: DuelState, actorId: string, luoguName: string, requestedSeat: Seat, at: number) => {
+  const name = luoguName.trim() || shortId(actorId);
+  const banned = state.banned[normalizeName(name)];
+  const team = banned || state.phase !== "lobby" ? "spectator" : requestedSeat;
+  state.hostId = state.hostId ?? actorId;
+  state.players[actorId] = {
+    id: actorId,
+    luoguName: name,
+    team,
+    ready: team === "spectator" ? false : (state.players[actorId]?.ready ?? false),
+    online: !banned
+  };
+  if (banned) {
+    state.kicked[actorId] = banned;
+    pushSystem(state, `已阻止被封禁用户 ${name} 加入：${banned.reason}`, at);
+  } else if (state.roomId !== "global") {
+    pushSystem(state, `${name} 加入 ${teamName(team)}`, at);
+  }
 };
 
 const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { type: "chat.sent" }>): boolean => {
   const command = decodeSystemChatCommand(event.text);
   if (!command) return false;
-
   switch (command.kind) {
     case "room.configured":
-      if (state.problems.length === 0 && command.problems.length > 0) {
-        state.problems = command.problems.map((p) => ({ ...p }));
-        state.system.push(`[系统] 房间题目已生成，共 ${command.problems.length} 题。`);
-      }
+      configureRoom(state, event.actorId, command.problems, event.issuedAt);
       return true;
     case "player.joined":
-      {
-        const banned = state.banned[normalizeName(command.luoguName)];
-        const team = banned || state.phase !== "lobby" ? "spectator" : command.team;
-        state.players[event.actorId] = {
-          id: event.actorId,
-          luoguName: command.luoguName.trim() || shortId(event.actorId),
-          team,
-          ready: team === "spectator" ? false : (state.players[event.actorId]?.ready ?? false),
-          online: !banned
-        };
-        if (banned) {
-          state.kicked[event.actorId] = banned;
-          state.system.push(`[系统] 已阻止被封禁用户 ${command.luoguName} 加入：${banned.reason}`);
-        } else {
-          state.system.push(`[系统] ${command.luoguName} 加入 ${teamName(team)}。`);
-        }
-      }
+      joinPlayer(state, event.actorId, command.luoguName, command.team, event.issuedAt);
       return true;
     case "player.teamChanged":
       if (state.players[event.actorId] && state.phase === "lobby" && !isRestricted(state, event.actorId)) {
         state.players[event.actorId].team = command.team;
         state.players[event.actorId].ready = false;
-        state.system.push(`[系统] ${nameOf(state, event.actorId)} 切换到 ${teamName(command.team)}。`);
       }
       return true;
     case "player.readyChanged":
@@ -334,72 +295,21 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
       if (canStart(state)) {
         state.phase = "arena";
         state.startedAt = event.issuedAt;
-        state.system.push(`[系统] ${matchTitle(state)} 对决开始。`);
+        pushSystem(state, `${matchTitle(state)} 开始`, event.issuedAt);
       }
       return true;
     case "vote.opened":
       openVote(state, command.vote, event.issuedAt, event.actorId);
       return true;
     case "vote.cast":
-      castVote(state, command.voteId, event.actorId, command.approve);
+      castVote(state, command.voteId, event.actorId, command.approve, event.issuedAt);
       return true;
     case "vote.cancelled":
-      cancelVote(state, command.voteId, event.actorId);
+      cancelVote(state, command.voteId, event.actorId, event.issuedAt);
       return true;
     case "judge.recordSeen":
       pushFeed(state, command.record);
       claimIfAccepted(state, command.record, event.id);
-      return true;
-    case "player.muted":
-      if (isAdminName(nameOf(state, event.actorId)) && state.players[command.targetId] && !isAdminName(nameOf(state, command.targetId))) {
-        state.muted[command.targetId] = true;
-        state.system.push(`[系统] 管理员已禁言 ${nameOf(state, command.targetId)}。`);
-      }
-      return true;
-    case "player.unmuted":
-      if (isAdminName(nameOf(state, event.actorId)) && state.players[command.targetId]) {
-        delete state.muted[command.targetId];
-        state.system.push(`[系统] 管理员已解除 ${nameOf(state, command.targetId)} 的禁言。`);
-      }
-      return true;
-    case "player.kicked":
-      if (isAdminName(nameOf(state, event.actorId))) {
-        const target = state.players[command.targetId];
-        if (target && !isAdminName(target.luoguName)) {
-          const record: ModerationRecord = {
-            reason: command.reason.trim() || "管理员移出房间",
-            by: nameOf(state, event.actorId),
-            at: event.issuedAt
-          };
-          state.kicked[target.id] = record;
-          state.banned[normalizeName(target.luoguName)] = record;
-          target.team = "spectator";
-          target.ready = false;
-          target.online = false;
-          delete state.muted[target.id];
-          state.system.push(`[系统] 管理员已踢出并封禁 ${target.luoguName}：${record.reason}`);
-        }
-      }
-      return true;
-    case "player.unkicked":
-      if (isAdminName(nameOf(state, event.actorId))) {
-        const normalizedTarget = normalizeName(command.targetName);
-        delete state.banned[normalizedTarget];
-        for (const player of Object.values(state.players)) {
-          if (normalizeName(player.luoguName) === normalizedTarget) {
-            delete state.kicked[player.id];
-            player.online = true;
-          }
-        }
-        state.system.push(`[系统] 管理员已取消封禁 ${command.targetName}。`);
-      }
-      return true;
-    case "room.closed":
-      if (isAdminName(command.actorName ?? nameOf(state, event.actorId)) || state.phase === "lobby") {
-        state.phase = "finished";
-        state.closed = { reason: command.reason || "管理员关闭房间", at: event.issuedAt };
-        state.system.push(`[系统] 房间已关闭：${state.closed.reason}`);
-      }
       return true;
   }
 };
@@ -411,6 +321,83 @@ const decodeSystemChatCommand = (text: string): SystemChatCommand | null => {
   } catch {
     return null;
   }
+};
+
+const pushChat = (state: DuelState, event: Extract<DuelEvent, { type: "chat.sent" }>) => {
+  const player = state.players[event.actorId];
+  if (!player || isMutedPlayer(state, player) || isRestricted(state, event.actorId) || event.text.trim().length === 0) return;
+  state.chats.push({
+    id: event.id,
+    actorId: event.actorId,
+    luoguName: player.luoguName,
+    team: player.team,
+    visibility: event.visibility,
+    text: event.text.trim().slice(0, 500),
+    at: event.issuedAt
+  });
+};
+
+const closeRoom = (state: DuelState, actorId: string, actorName: string, reason: string, at: number) => {
+  if (!canCloseRoom(state, actorId, actorName) || state.phase === "finished") return;
+  state.phase = "finished";
+  state.closed = { reason: reason.trim() || "房间已关闭", by: actorName, at };
+  pushSystem(state, `房间已关闭：${state.closed.reason}`, at);
+};
+
+const kickPlayer = (state: DuelState, actorId: string, targetId: string, targetName: string | undefined, reason: string, at: number) => {
+  const actor = state.players[actorId];
+  const target = state.players[targetId];
+  const finalTargetName = target?.luoguName || targetName || targetId;
+  if (!actor || !isAdminName(actor.luoguName) || isAdminName(finalTargetName)) return;
+  const record: ModerationRecord = {
+    reason: reason.trim() || "管理员封禁",
+    by: actor.luoguName,
+    at
+  };
+  state.kicked[targetId] = record;
+  state.banned[normalizeName(finalTargetName)] = record;
+  if (target) {
+    target.team = "spectator";
+    target.ready = false;
+    target.online = false;
+    delete state.muted[target.id];
+  }
+  delete state.muted[`name:${normalizeName(finalTargetName)}`];
+  pushSystem(state, `${finalTargetName} 已被 ${actor.luoguName} 封禁：${record.reason}`, at);
+};
+
+const unkickPlayer = (state: DuelState, actorId: string, targetName: string, at: number) => {
+  const actor = state.players[actorId];
+  if (!actor || !isAdminName(actor.luoguName)) return;
+  const normalizedTarget = normalizeName(targetName);
+  delete state.banned[normalizedTarget];
+  for (const player of Object.values(state.players)) {
+    if (normalizeName(player.luoguName) === normalizedTarget) {
+      delete state.kicked[player.id];
+      player.online = true;
+    }
+  }
+  pushSystem(state, `${actor.luoguName} 已解除 ${targetName} 的封禁`, at);
+};
+
+const mutePlayer = (state: DuelState, actorId: string, targetId: string, targetName: string | undefined, at: number) => {
+  const actor = state.players[actorId];
+  const target = state.players[targetId];
+  const finalTargetName = target?.luoguName || targetName || targetId;
+  if (!actor || !isAdminName(actor.luoguName) || isAdminName(finalTargetName)) return;
+  state.muted[targetId] = true;
+  state.muted[`name:${normalizeName(finalTargetName)}`] = true;
+  pushSystem(state, `${finalTargetName} 已被 ${actor.luoguName} 禁言`, at);
+};
+
+const unmutePlayer = (state: DuelState, actorId: string, targetId: string, targetName: string | undefined, at: number) => {
+  const actor = state.players[actorId];
+  const target = state.players[targetId];
+  const finalTargetName = target?.luoguName || targetName || targetId;
+  if (!actor || !isAdminName(actor.luoguName)) return;
+  delete state.muted[targetId];
+  delete state.muted[`name:${normalizeName(finalTargetName)}`];
+  pushSystem(state, `${actor.luoguName} 已解除 ${finalTargetName} 的禁言`, at);
 };
 
 const openVote = (
@@ -428,11 +415,11 @@ const openVote = (
     createdAt
   };
   state.votes[vote.id] = vote;
-  state.system.push(`[系统] ${nameOf(state, actorId)} 发起${voteLabel(vote)}。`);
-  settleVote(state, vote);
+  pushSystem(state, `${nameOf(state, actorId)} 发起${voteLabel(vote)}`, createdAt);
+  settleVote(state, vote, createdAt);
 };
 
-const castVote = (state: DuelState, voteId: string, actorId: string, approve: boolean) => {
+const castVote = (state: DuelState, voteId: string, actorId: string, approve: boolean, at: number) => {
   const vote = state.votes[voteId];
   if (!vote || vote.status !== "open" || !requiredVoters(state, vote).includes(actorId)) return;
   if (approve) {
@@ -441,42 +428,41 @@ const castVote = (state: DuelState, voteId: string, actorId: string, approve: bo
   } else {
     vote.rejections[actorId] = true;
     vote.status = "rejected";
-    state.system.push(`[系统] ${nameOf(state, actorId)} 拒绝${voteLabel(vote)}。`);
+    pushSystem(state, `${nameOf(state, actorId)} 拒绝${voteLabel(vote)}`, at);
   }
-  settleVote(state, vote);
+  settleVote(state, vote, at);
 };
 
-const cancelVote = (state: DuelState, voteId: string, actorId: string) => {
+const cancelVote = (state: DuelState, voteId: string, actorId: string, at: number) => {
   const vote = state.votes[voteId];
   if (!vote || vote.status !== "open" || vote.proposerId !== actorId) return;
   vote.status = "cancelled";
-  state.system.push(`[系统] ${nameOf(state, actorId)} 取消${voteLabel(vote)}。`);
+  pushSystem(state, `${nameOf(state, actorId)} 取消${voteLabel(vote)}`, at);
 };
 
-const settleVote = (state: DuelState, vote: Vote) => {
+const settleVote = (state: DuelState, vote: Vote, at: number) => {
   if (vote.status !== "open") return;
   const voters = requiredVoters(state, vote);
   if (voters.length === 0 || !voters.every((id) => vote.approvals[id])) return;
-
   vote.status = "passed";
   if (vote.kind === "replace-problem" && vote.targetPid && vote.replacement) {
-    const replacement: Problem = { ...vote.replacement };
-    state.problems = state.problems.map((p) => (p.pid === vote.targetPid ? replacement : p));
-    state.system.push(`[系统] ${vote.targetPid} 已更换为 ${replacement.pid}。`);
+    const replacement = vote.replacement;
+    state.problems = sortProblemsByDifficulty(state.problems.map((p) => (p.pid === vote.targetPid ? { ...replacement } : p)));
+    pushSystem(state, `${vote.targetPid} 已更换为 ${replacement.pid}`, at);
   }
   if (vote.kind === "delete-problem" && vote.targetPid) {
-    state.problems = state.problems.filter((p) => p.pid !== vote.targetPid);
-    state.system.push(`[系统] ${vote.targetPid} 已删除。`);
+    state.problems = sortProblemsByDifficulty(state.problems.filter((p) => p.pid !== vote.targetPid));
+    pushSystem(state, `${vote.targetPid} 已删除`, at);
   }
   if (vote.kind === "draw") {
     state.phase = "finished";
     state.winner = "draw";
-    state.system.push("[系统] 双方同意平局。");
+    pushSystem(state, "双方同意平局", at);
   }
   if (vote.kind === "surrender" && vote.team) {
     state.phase = "finished";
     state.winner = vote.team === "red" ? "blue" : "red";
-    state.system.push(`[系统] ${teamName(vote.team)} 投降。`);
+    pushSystem(state, `${teamName(vote.team)} 投降`, at);
   }
 };
 
@@ -498,7 +484,6 @@ const claimIfAccepted = (state: DuelState, record: FeedRecord, eventId: string) 
   const player = Object.values(state.players).find((p) => p.luoguName === record.luoguName);
   const problem = state.problems.find((p) => p.pid === record.pid);
   if (!player || !problem || !isTeam(player.team)) return;
-
   const candidate = {
     team: player.team,
     playerId: player.id,
@@ -506,11 +491,10 @@ const claimIfAccepted = (state: DuelState, record: FeedRecord, eventId: string) 
     recordId: record.recordId || eventId,
     at: record.at
   };
-
   const current = problem.solvedBy;
   if (!current || candidate.at < current.at || (candidate.at === current.at && candidate.recordId < current.recordId)) {
     problem.solvedBy = candidate;
-    state.system.push(`[系统] ${teamName(player.team)} ${player.luoguName} 抢占 ${record.pid}。`);
+    pushSystem(state, `${teamName(player.team)} ${player.luoguName} 抢占 ${record.pid}`, record.at);
   }
 };
 
@@ -527,7 +511,61 @@ const updateWinner = (state: DuelState) => {
   }
 };
 
+const compareEvents = (a: DuelEvent, b: DuelEvent): number =>
+  a.lamport - b.lamport || a.issuedAt - b.issuedAt || a.id.localeCompare(b.id);
+
+const cloneState = (state: DuelState): DuelState => ({
+  ...state,
+  closed: state.closed ? { ...state.closed } : undefined,
+  players: Object.fromEntries(Object.entries(state.players).map(([id, p]) => [id, { ...p }])),
+  problems: state.problems.map((problem) => ({
+    ...problem,
+    solvedBy: problem.solvedBy ? { ...problem.solvedBy } : undefined
+  })),
+  chats: [...state.chats],
+  feed: [...state.feed],
+  votes: Object.fromEntries(
+    Object.entries(state.votes).map(([id, vote]) => [
+      id,
+      {
+        ...vote,
+        replacement: vote.replacement ? { ...vote.replacement } : undefined,
+        approvals: { ...vote.approvals },
+        rejections: { ...vote.rejections }
+      }
+    ])
+  ),
+  system: state.system.map((message) => ({ ...message })),
+  muted: { ...state.muted },
+  kicked: cloneModerationMap(state.kicked),
+  banned: cloneModerationMap(state.banned)
+});
+
+const cloneModerationMap = (map: Record<string, ModerationRecord>): Record<string, ModerationRecord> =>
+  Object.fromEntries(Object.entries(map).map(([key, value]) => [key, { ...value }]));
+
+const pushSystem = (state: DuelState, text: string, at: number) => {
+  state.system.push({
+    id: `${at}:${state.system.length}:${text}`,
+    text,
+    at
+  });
+};
+
+const isRestricted = (state: DuelState, id: string): boolean => {
+  const player = state.players[id];
+  return Boolean(state.kicked[id] || (player && state.banned[normalizeName(player.luoguName)]));
+};
+
+const isMutedPlayer = (state: DuelState, player: Player): boolean =>
+  Boolean(state.muted[player.id] || state.muted[`name:${normalizeName(player.luoguName)}`]);
+
 const scoreForIndex = (index: number): number => 100 + Math.floor(index / 3) * 50;
+
+const numericPid = (pid: string): number => {
+  const match = pid.match(/\d+/);
+  return match ? Number(match[0]) : Number.MAX_SAFE_INTEGER;
+};
 
 const seeded = (seed: string): (() => number) => {
   let h = 2166136261;
@@ -557,21 +595,11 @@ const matchTitle = (state: DuelState): string => {
 };
 
 const voteLabel = (vote: Pick<Vote, "kind" | "targetPid">): string => {
-  if (vote.kind === "replace-problem") return `更换 ${vote.targetPid}`;
-  if (vote.kind === "delete-problem") return `删除 ${vote.targetPid}`;
+  if (vote.kind === "replace-problem") return `换题 ${vote.targetPid}`;
+  if (vote.kind === "delete-problem") return `删题 ${vote.targetPid}`;
   if (vote.kind === "draw") return "平局";
   return "投降";
 };
 
-const isTeam = (team: Seat | undefined): team is Team => team === "red" || team === "blue";
-const isAdminName = (name: string): boolean => adminNames.has(name);
-const teamName = (team: Seat): string => (team === "red" ? "红方" : team === "blue" ? "蓝方" : "观赛席");
 const nameOf = (state: DuelState, id: string): string => state.players[id]?.luoguName ?? shortId(id);
-const normalizeName = (name: string): string => name.trim().toLowerCase();
-const isRestricted = (state: DuelState, id: string): boolean => {
-  const player = state.players[id];
-  return Boolean(state.kicked[id] || (player && state.banned[normalizeName(player.luoguName)]));
-};
-const cloneModerationMap = (map: Record<string, ModerationRecord>): Record<string, ModerationRecord> =>
-  Object.fromEntries(Object.entries(map).map(([key, value]) => [key, { ...value }]));
 const shortId = (id: string): string => id.slice(0, 6);
