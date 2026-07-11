@@ -256,13 +256,27 @@ const configureRoom = (state: DuelState, actorId: string, problems: Problem[], a
 const joinPlayer = (state: DuelState, actorId: string, luoguName: string, requestedSeat: Seat, at: number) => {
   const name = luoguName.trim() || shortId(actorId);
   const banned = state.banned[normalizeName(name)];
-  const team = banned || state.phase !== "lobby" ? "spectator" : requestedSeat;
+  const duplicateId = Object.values(state.players).find((player) => player.id !== actorId && normalizeName(player.luoguName) === normalizeName(name))?.id;
+  const duplicate = duplicateId ? state.players[duplicateId] : undefined;
+  if (duplicateId) {
+    delete state.players[duplicateId];
+    if (state.hostId === duplicateId) state.hostId = actorId;
+    if (state.kicked[duplicateId]) {
+      state.kicked[actorId] = state.kicked[duplicateId];
+      delete state.kicked[duplicateId];
+    }
+    if (state.muted[duplicateId]) {
+      state.muted[actorId] = true;
+      delete state.muted[duplicateId];
+    }
+  }
+  const team = banned || state.phase !== "lobby" ? "spectator" : duplicate?.team ?? requestedSeat;
   state.hostId = state.hostId ?? actorId;
   state.players[actorId] = {
     id: actorId,
     luoguName: name,
     team,
-    ready: team === "spectator" ? false : (state.players[actorId]?.ready ?? false),
+    ready: team === "spectator" ? false : (state.players[actorId]?.ready ?? duplicate?.ready ?? false),
     online: !banned
   };
   if (banned) {

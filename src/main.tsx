@@ -1,4 +1,4 @@
-import "./style.css";
+﻿import "./style.css";
 import type { ComponentChildren, JSX } from "preact";
 import { render } from "preact";
 import {
@@ -16,19 +16,24 @@ import {
   Gauge,
   Handshake,
   LogOut,
+  Medal,
   MessageSquare,
   Play,
   Radio,
   RefreshCw,
   Send,
   Shield,
+  Sprout,
+  Star,
   Swords,
   Terminal,
   Trash2,
+  Trophy,
   Users,
   Volume2,
   VolumeX,
-  X
+  X,
+  Zap
 } from "lucide-preact";
 import {
   applyEvent,
@@ -51,14 +56,14 @@ import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope
 import { fetchLuoguRecords, fetchLuoguUser } from "./luogu";
 import { cachedProblemCount, difficultyMeta, pickLuoguProblems, pickLuoguReplacementProblem, type DifficultyLevel } from "./problemPicker";
 import { completeCpOAuthLogin, consumeCpOAuthError, loadCpSession, logoutCpSession, startCpOAuthLogin, type CpSession } from "./oauth";
-import { fetchRooms, fetchSnapshot, publishEnvelope, roomWebSocketUrl, type RoomListing, type ServerMessage } from "./realtimeStore";
+import { fetchRooms, fetchSnapshot, fetchUserRecord, fetchUsers, publishEnvelope, roomWebSocketUrl, saveUserRecord, type RoomListing, type ServerMessage, type UserRecord } from "./realtimeStore";
 import type { ChatMessage, DuelEvent, DuelState, Player, Problem, Seat, SignedEnvelope, VoteKind } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("Missing #app");
 
 type BootPhase = "loading" | "auth-error" | "ready";
-type ViewMode = "home" | "room";
+type ViewMode = "home" | "room" | "profile";
 
 let bootPhase: BootPhase = "loading";
 let mode: ViewMode = "home";
@@ -70,6 +75,8 @@ let envelopes: SignedEnvelope[] = [];
 let state: DuelState = createInitialState(roomId);
 let globalModeration: DuelState = createInitialState("global");
 let rooms: RoomListing[] = [];
+let users: UserRecord[] = [];
+let profileUserName = "";
 let socket: WebSocket | null = null;
 let reconnectTimer: number | undefined;
 let finishReturnTimer: number | undefined;
@@ -80,11 +87,17 @@ let statusTone: "info" | "error" = "info";
 let authErrorText = "";
 let toasts: ToastMessage[] = [];
 const notifiedKeys = new Set<string>();
-const avatarCache: Record<string, string> = {};
+const avatarCacheKey = "luogu-duel.avatar-cache.v1";
+const userCacheKey = "luogu-duel.user-cache.v1";
+const userCacheTtl = 24 * 60 * 60 * 1000;
+const avatarCache: Record<string, string> = readAvatarCache();
+const userCache: Record<string, { user: UserRecord; cachedAt: number }> = readUserCache();
 const avatarLoading = new Set<string>();
+const avatarMissing = new Set<string>();
 
 const draft = {
   userMenuOpen: false,
+  roomTab: "duel" as "duel" | "ranking",
   chat: "",
   roomCount: 9,
   manualProblems: "",
@@ -109,7 +122,11 @@ const roomSeatKey = () => `luogu-duel.${dataVersion}.seat.${roomId}`;
 const activeRoomKey = `luogu-duel.active-room.${dataVersion}`;
 const historyKey = `luogu-duel.history.${dataVersion}`;
 
-const notify = () => render(<App />, app);
+const notify = (forceStickChat = false) => {
+  const stickChat = forceStickChat || shouldStickChats();
+  render(<App />, app);
+  if (stickChat) queueMicrotask(scrollChatsToBottom);
+};
 const setStatus = (text: string, tone: "info" | "error" = "info") => {
   statusText = text;
   statusTone = tone;
@@ -155,11 +172,24 @@ const boot = async () => {
 
   identity = await renameIdentity(identity, cpSession.luoguName);
   bootPhase = authErrorText ? "auth-error" : "ready";
+  await registerCurrentUser();
   await refreshGlobalModeration();
   await enterFromHash();
 };
 
 const enterFromHash = async () => {
+  const profileName = profileNameFromPath();
+  if (profileName) {
+    mode = "profile";
+    roomId = "global";
+    roomSecret = "public-lobby";
+    profileUserName = profileName;
+    closeSocket();
+    await Promise.all([loadDirectory(), loadUsers()]);
+    await ensureUserLoaded(profileName);
+    notify();
+    return;
+  }
   const params = new URLSearchParams(location.hash.slice(1));
   roomId = params.get("room") || "global";
   roomSecret = params.get("secret") || (roomId === "global" ? "public-lobby" : "public-room");
@@ -172,7 +202,7 @@ const enterFromHash = async () => {
   if (mode === "home") {
     state = createInitialState("global");
     envelopes = [];
-    await loadDirectory();
+    await Promise.all([loadDirectory(), loadUsers()]);
     notify();
     return;
   }
@@ -202,6 +232,17 @@ const loadDirectory = async () => {
   }
 };
 
+const loadUsers = async () => {
+  try {
+    users = await fetchUsers();
+    for (const user of users) writeCachedUser(user);
+  } catch {
+    users = Object.values(userCache)
+      .filter((entry) => Date.now() - entry.cachedAt < userCacheTtl)
+      .map((entry) => entry.user);
+  }
+};
+
 const loadSnapshot = async () => {
   try {
     await refreshGlobalModeration();
@@ -217,8 +258,8 @@ const loadSnapshot = async () => {
 
 const periodicSync = async () => {
   if (bootPhase !== "ready") return;
-  if (mode === "home") {
-    await loadDirectory();
+  if (mode === "home" || mode === "profile") {
+    await Promise.all([loadDirectory(), loadUsers()]);
   } else {
     await loadSnapshot();
   }
@@ -504,7 +545,7 @@ const submitChat = async (event: Event) => {
   if (!text) return;
   await emitChat(text, teamMessage ? "team" : "all");
   draft.chat = "";
-  notify();
+  notify(true);
 };
 
 const closeRoom = async () => {
@@ -586,8 +627,8 @@ const App = () => {
   if (bootPhase === "auth-error") return <AuthError />;
   return (
     <>
-      <Shell title="Luogu Duel" subtitle={mode === "home" ? "control room" : `${roomId} / ${state.phase}`}>
-        {mode === "home" ? <Home /> : <Room />}
+      <Shell title="Luogu Duel" subtitle={mode === "profile" ? "user" : mode === "home" ? "control room" : `${roomId} / ${state.phase}`}>
+        {mode === "profile" ? <ProfilePage /> : mode === "home" ? <Home /> : <Room />}
       </Shell>
       <ToastStack />
       <BanOverlay />
@@ -599,7 +640,10 @@ const App = () => {
 const Shell = ({ title, subtitle, children }: { title: string; subtitle: string; children: ComponentChildren }) => (
   <div class="app-shell">
     <header class="topbar">
-      <button class="brand" onClick={() => (location.hash = "")}>
+      <button class="brand" onClick={() => {
+        if (mode === "profile") location.href = "/";
+        else location.hash = "";
+      }}>
         <Swords size={20} />
         <span>{title}</span>
         <em>{subtitle}</em>
@@ -610,20 +654,12 @@ const Shell = ({ title, subtitle, children }: { title: string; subtitle: string;
       </div>
       <div class="session">
         <button class="session-user" onClick={() => {
-          draft.userMenuOpen = !draft.userMenuOpen;
-          notify();
+          openProfile(identity?.luoguName ?? "");
         }}>
           <UserAvatar name={identity?.luoguName ?? "?"} className="chat-avatar" />
           {identity?.luoguName ?? "..."}
         </button>
-        {draft.userMenuOpen ? (
-          <div class="session-menu">
-            <button onClick={logout}>
-              <LogOut size={15} />
-              退出登录
-            </button>
-          </div>
-        ) : null}
+        <button class="ghost icon-only" onClick={logout}><LogOut size={15} /></button>
       </div>
     </header>
     {children}
@@ -660,33 +696,32 @@ const Home = () => (
       <AdminPanel />
     </section>
 
-    <section class="panel">
+    <section class="panel home-room-panel">
       <div class="section-head">
         <Users size={18} />
         <div>
           <h2>公开房间</h2>
-          <p>进行中的房间默认观赛加入。</p>
+          <p>最新 20 场对决，准备中优先。</p>
         </div>
         <button class="ghost icon-only" onClick={() => void loadDirectory()}>
           <RefreshCw size={16} />
         </button>
       </div>
-      <RoomList />
+      <div class="home-tabs">
+        <button class={draft.roomTab === "duel" ? "active" : ""} onClick={() => {
+          draft.roomTab = "duel";
+          notify();
+        }}>Duel</button>
+        <button class={draft.roomTab === "ranking" ? "active" : ""} onClick={() => {
+          draft.roomTab = "ranking";
+          notify();
+        }}>Ranking</button>
+      </div>
+      {draft.roomTab === "duel" ? <RoomList /> : <Ranking />}
     </section>
 
     <section class="panel home-chat-panel">
       <Chat />
-    </section>
-
-    <section class="panel">
-      <div class="section-head">
-        <Gauge size={18} />
-        <div>
-          <h2>历史</h2>
-          <p>本机最近对局。</p>
-        </div>
-      </div>
-      <History />
     </section>
   </main>
 );
@@ -696,7 +731,7 @@ const Room = () => (
     <section class="arena-head">
       <div class="match-meta">
         <p class="eyebrow">{state.phase === "arena" ? "LIVE MATCH" : "READY ROOM"}</p>
-        <h1>{matchTitle()}</h1>
+        <h1><MatchTitle /></h1>
         <p>{state.problems.length} 题 / 胜利线 {winThreshold(state)} / 你是 {teamName(currentSeat())}</p>
       </div>
       <div class="timer-block">
@@ -734,6 +769,25 @@ const Room = () => (
     </section>
   </main>
 );
+
+const MatchTitle = () => {
+  const red = Object.values(state.players).filter((p) => p.team === "red");
+  const blue = Object.values(state.players).filter((p) => p.team === "blue");
+  const names = (players: Player[], fallback: string) =>
+    players.length ? players.map((player, index) => (
+      <span key={player.id}>
+        {index > 0 ? " / " : ""}
+        <button class="title-name" style={{ color: nameColor(player.luoguName) }} onClick={() => openProfile(player.luoguName)}>{player.luoguName}</button>
+      </span>
+    )) : fallback;
+  return (
+    <>
+      <span class="red-title">{names(red, "红方")}</span>
+      <span> vs </span>
+      <span class="blue-title">{names(blue, "蓝方")}</span>
+    </>
+  );
+};
 
 const RoomControls = () => {
   const player = state.players[identity.id];
@@ -813,22 +867,101 @@ const ScoreBar = () => {
 };
 
 const RoomList = () => {
-  const fresh = rooms.filter((room) => Date.now() - room.createdAt < 6 * 60 * 60 * 1000);
+  const fresh = sortedRooms().slice(0, 20);
   if (!fresh.length) return <p class="muted">暂无公开房间。</p>;
   return (
-    <div class="room-list">
+    <div class="duel-table">
+      <div class="duel-row duel-head">
+        <span>ID</span>
+        <span>选手</span>
+        <span>状态</span>
+      </div>
       {fresh.map((room) => (
-        <article class="room-card" key={room.roomId}>
-          <div>
-            <strong>{room.host}</strong>
-            <span>{room.problemCount} 题 / {room.status === "arena" ? `开赛 ${timeAgo(room.startedAt ?? room.createdAt)}` : "准备中"}</span>
-          </div>
-          <em class={room.status === "arena" ? "live" : ""}>{room.status === "arena" ? "LIVE" : "LOBBY"}</em>
-          <button onClick={() => joinRoom(room)}>{room.status === "arena" ? "观赛" : "加入"}</button>
-        </article>
+        <button class="duel-row" key={room.roomId} onClick={() => joinRoom(room)}>
+          <code>{shortRoomId(room.roomId)}</code>
+          <span>{roomLine(room)}</span>
+          <em class={room.status}>{roomStatusLabel(room)}</em>
+        </button>
       ))}
     </div>
   );
+};
+
+const sortedRooms = (): RoomListing[] => {
+  const rank = { lobby: 0, arena: 1, finished: 2 };
+  return [...rooms].sort(
+    (a, b) =>
+      rank[a.status] - rank[b.status] ||
+      (b.endedAt ?? b.startedAt ?? b.createdAt) - (a.endedAt ?? a.startedAt ?? a.createdAt)
+  );
+};
+
+const roomLine = (room: RoomListing): string => {
+  const red = (room.redPlayers?.length ? room.redPlayers : [room.host]).join(" & ");
+  const blue = (room.bluePlayers ?? []).join(" & ");
+  if (room.status === "finished" && room.winner && room.winner !== "draw") {
+    const winner = room.winner === "red" ? red : blue || "蓝方";
+    const loser = room.winner === "red" ? blue || "蓝方" : red;
+    return `${winner} 胜 ${loser}`;
+  }
+  if (room.status === "finished" && room.winner === "draw") return `${red} 平 ${blue || "蓝方"}`;
+  return `${red} vs ${blue || "等待蓝方"}`;
+};
+
+const roomStatusLabel = (room: RoomListing): string =>
+  room.status === "lobby" ? "准备" : room.status === "arena" ? "进行中" : "已结束";
+
+const shortRoomId = (id: string): string => id.replace(/\D/g, "").slice(-5) || id.slice(0, 5);
+
+type RatingRow = {
+  name: string;
+  rating: number;
+  wins: number;
+  losses: number;
+  games: number;
+};
+
+const Ranking = () => {
+  const rows = ratingRows();
+  if (!rows.length) return <p class="muted">暂无注册用户。</p>;
+  return (
+    <div class="ranking-list">
+      {rows.map((row, index) => (
+        <button class="ranking-row" key={row.name} onClick={() => openProfile(row.name)}>
+          <span>#{index + 1}</span>
+          <UserAvatar name={row.name} className="chat-avatar" />
+          <strong style={{ color: nameColor(row.name, row.rating) }}>{row.name}</strong>
+          <code>{Math.round(row.rating)}</code>
+          <em>{row.wins}-{row.losses}</em>
+        </button>
+      ))}
+    </div>
+  );
+};
+
+const ratingRows = (): RatingRow[] => {
+  const map = new Map<string, RatingRow>();
+  const ensure = (name: string): RatingRow => {
+    const key = normalizeName(name);
+    const existing = map.get(key);
+    if (existing) return existing;
+    const stored = userRecordFor(name);
+    const row = {
+      name: stored?.name ?? name,
+      rating: stored?.rating ?? 1300,
+      wins: stored?.wins ?? 0,
+      losses: stored?.losses ?? 0,
+      games: stored?.games ?? 0
+    };
+    map.set(key, row);
+    return row;
+  };
+  for (const user of users) ensure(user.name);
+  if (identity?.luoguName) ensure(identity.luoguName);
+  for (const room of sortedRooms()) {
+    for (const name of [room.host, ...(room.redPlayers ?? []), ...(room.bluePlayers ?? [])]) ensure(name);
+  }
+  return [...map.values()].sort((a, b) => b.rating - a.rating || b.wins - a.wins || a.name.localeCompare(b.name));
 };
 
 const AdminPanel = () => {
@@ -922,12 +1055,13 @@ const Roster = () => (
 const PlayerRow = ({ player }: { player: Player }) => {
   const banned = moderationRecordForPlayer(player);
   const muted = isMutedPlayer(player);
+  const row = ratingRowFor(player.luoguName);
   return (
     <div class={`player-row ${banned ? "banned" : ""}`}>
       <UserAvatar name={player.luoguName} className="avatar" />
       <div class="player-main">
-        <span>{player.luoguName}</span>
-        <small>{ratingFor(player.luoguName)}</small>
+        <button class="name-button" style={{ color: nameColor(player.luoguName) }} onClick={() => openProfile(player.luoguName)}>{player.luoguName}</button>
+        <small>{Math.round(row.rating)}</small>
       </div>
       <div class="player-tags">
         {state.hostId === player.id ? <em><Crown size={12} />HOST</em> : null}
@@ -1005,26 +1139,26 @@ type ChatStreamItem =
   | { type: "judge"; id: string; at: number; record: DuelState["feed"][number] };
 
 const chatStreamItems = (): ChatStreamItem[] => {
-  const chats = visibleChats(state, identity.id).slice(-80).map((chat) => ({ type: "chat" as const, id: chat.id, at: chat.at, chat }));
-  const judges = state.feed.slice(0, 40).map((record) => ({
+  const chats = visibleChats(state, identity.id).slice(-20).map((chat) => ({ type: "chat" as const, id: chat.id, at: chat.at, chat }));
+  const judges = mode === "room" ? state.feed.slice(0, 20).map((record) => ({
     type: "judge" as const,
     id: `judge:${record.recordId}:${record.pid}`,
     at: record.at,
     record
-  }));
-  const systems = state.system.slice(-40).map((message) => ({
+  })) : [];
+  const systems = mode === "room" ? state.system.slice(-20).map((message) => ({
     type: "system" as const,
     id: `system:${message.id}`,
     at: message.at,
     text: message.text
-  }));
-  return [...chats, ...judges, ...systems].sort((a, b) => b.at - a.at).slice(0, 120);
+  })) : [];
+  return [...chats, ...judges, ...systems].sort((a, b) => a.at - b.at).slice(-20);
 };
 
 const ChatLine = ({ item }: { item: ChatStreamItem }) => {
   if (item.type === "system") {
     return (
-      <p class="system">
+      <p class="chat-line system">
         <span class="chat-avatar">#</span>
         <span>SYS</span>
         <span class="chat-text">{item.text}</span>
@@ -1034,7 +1168,7 @@ const ChatLine = ({ item }: { item: ChatStreamItem }) => {
   if (item.type === "judge") {
     const record = item.record;
     return (
-      <p class={record.status === "OK" ? "judge ok" : "judge fail"}>
+      <p class={record.status === "OK" ? "chat-line judge ok" : "chat-line judge fail"}>
         <span class="chat-avatar">{record.status === "OK" ? "✓" : "!"}</span>
         <span>{formatClock(record.at)} / {record.pid}</span>
         <span class="chat-text">{record.luoguName} {record.status}</span>
@@ -1042,10 +1176,11 @@ const ChatLine = ({ item }: { item: ChatStreamItem }) => {
     );
   }
   const chat = item.chat;
+  const mine = chat.actorId === identity.id || isOwnName(chat.luoguName);
   return (
-    <p class={chat.visibility === "team" ? "private" : ""}>
+    <p class={`chat-line bubble ${mine ? "mine" : "theirs"} ${chat.visibility === "team" ? "private" : ""}`}>
       <UserAvatar name={chat.luoguName} className="chat-avatar" />
-      <span>{chat.visibility === "team" ? "TEAM" : "ALL"} / {chat.luoguName}</span>
+      <button class="chat-name" style={{ color: nameColor(chat.luoguName) }} onClick={() => openProfile(chat.luoguName)}>{chat.visibility === "team" ? "TEAM" : "ALL"} / {chat.luoguName}</button>
       <span class="chat-text">{chat.text}</span>
     </p>
   );
@@ -1067,6 +1202,51 @@ const ToastStack = () => {
         </div>
       ))}
     </div>
+  );
+};
+
+const ProfilePage = () => {
+  const name = profileUserName || identity.luoguName;
+  const user = userRecordFor(name);
+  const row = ratingRowFor(name);
+  const mine = normalizeName(name) === normalizeName(identity.luoguName);
+  return (
+    <main class="profile-page">
+      <div class="profile-card">
+        <div class="profile-head">
+          <div>
+            <UserAvatar name={name} className="profile-avatar" />
+            <h1 style={{ color: nameColor(name) }}>{name}</h1>
+          </div>
+          <div class="profile-html" dangerouslySetInnerHTML={{ __html: sanitizeProfileHtml(user?.profileHtml || "<p>这个用户还没有写主页。</p>") }} />
+        </div>
+        {mine ? (
+          <textarea
+            class="profile-editor"
+            value={user?.profileHtml ?? ""}
+            placeholder="用纯文本内嵌 HTML 自定义主页"
+            onInput={(event) => updateLocalUser(name, { profileHtml: event.currentTarget.value })}
+            onBlur={(event) => void persistUserProfile(name, event.currentTarget.value)}
+          />
+        ) : null}
+        <div class="profile-stats">
+          <strong>Rating {Math.round(row.rating)}</strong>
+          <span>{row.games} 场 / {row.wins} 胜 / {row.losses} 负</span>
+        </div>
+        <div class="profile-section">
+          <h2>最近 20 场</h2>
+          {playerRooms(name).slice(0, 20).map((room) => <p key={room.roomId}><code>{shortRoomId(room.roomId)}</code><span>{roomLine(room)}</span><em>{roomStatusLabel(room)}</em></p>)}
+        </div>
+        <div class="achievement-grid">
+          {achievementsFor(name, row).map((achievement) => (
+            <article class="achievement" key={achievement.title}>
+              <achievement.Icon size={26} />
+              <div><h3>{achievement.title}</h3><p>{achievement.text}</p><span>进度 {achievement.progress}%</span></div>
+            </article>
+          ))}
+        </div>
+      </div>
+    </main>
   );
 };
 
@@ -1225,13 +1405,22 @@ const isMutedByIdentity = (id: string, name: string): boolean => {
   const nameKey = `name:${normalizeName(name)}`;
   return Boolean(state.muted[id] || state.muted[nameKey] || globalModeration.muted[id] || globalModeration.muted[nameKey]);
 };
+const isOwnName = (name: string): boolean => normalizeName(name) === normalizeName(identity?.luoguName ?? "");
 const avatarUrlFor = (name: string): string => {
   const key = normalizeName(name);
-  if (!key || avatarCache[key]) return avatarCache[key] || "";
-  if (!avatarLoading.has(key)) {
+  if (!key) return "";
+  const cached = avatarCache[key];
+  if (cached) return cached;
+  if (!avatarMissing.has(key) && !avatarLoading.has(key)) {
     avatarLoading.add(key);
     void fetchLuoguUser(name).then((user) => {
-      if (user?.avatar) avatarCache[key] = user.avatar;
+      if (user?.avatar) {
+        avatarCache[key] = user.avatar;
+        writeAvatarCache();
+        void saveUserRecord({ name: user.name || name, avatar: user.avatar, color: user.color });
+      } else {
+        avatarMissing.add(key);
+      }
       avatarLoading.delete(key);
       notify();
     }).catch(() => {
@@ -1240,6 +1429,162 @@ const avatarUrlFor = (name: string): string => {
   }
   return "";
 };
+function readAvatarCache(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(avatarCacheKey);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, string | { url?: string }>;
+    return Object.fromEntries(Object.entries(parsed).flatMap(([key, value]) => {
+      if (typeof value === "string" && value) return [[key, value]];
+      if (typeof value === "object" && typeof value?.url === "string" && value.url) return [[key, value.url]];
+      return [];
+    }));
+  } catch {
+    return {};
+  }
+}
+const writeAvatarCache = () => {
+  try {
+    const entries = Object.entries(avatarCache)
+      .filter(([, url]) => Boolean(url))
+      .slice(-1000);
+    localStorage.setItem(avatarCacheKey, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // Avatar search is cosmetic; ignore quota/private-mode failures.
+  }
+};
+function readUserCache(): Record<string, { user: UserRecord; cachedAt: number }> {
+  try {
+    const raw = localStorage.getItem(userCacheKey);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, { user?: UserRecord; cachedAt?: number }>;
+    return Object.fromEntries(Object.entries(parsed).flatMap(([key, value]) =>
+      value.user && typeof value.cachedAt === "number" ? [[key, value as { user: UserRecord; cachedAt: number }]] : []
+    ));
+  } catch {
+    return {};
+  }
+}
+const writeUserCache = () => {
+  try {
+    localStorage.setItem(userCacheKey, JSON.stringify(userCache));
+  } catch {
+    // User cache is an optimization only.
+  }
+};
+const writeCachedUser = (user: UserRecord) => {
+  userCache[normalizeName(user.name)] = { user, cachedAt: Date.now() };
+  writeUserCache();
+};
+const userRecordFor = (name: string): UserRecord | null => {
+  const key = normalizeName(name);
+  const cached = userCache[key];
+  return users.find((user) => normalizeName(user.name) === key) ?? (cached && Date.now() - cached.cachedAt < userCacheTtl ? cached.user : null);
+};
+const ensureUserLoaded = async (name: string): Promise<UserRecord | null> => {
+  const key = normalizeName(name);
+  const cached = userCache[key];
+  if (cached && Date.now() - cached.cachedAt < userCacheTtl) return cached.user;
+  try {
+    const user = await fetchUserRecord(name);
+    if (user) {
+      updateLocalUser(user.name, user, false);
+      writeCachedUser(user);
+    }
+    return user;
+  } catch {
+    return cached?.user ?? null;
+  }
+};
+const updateLocalUser = (name: string, patch: Partial<UserRecord>, renderNow = true) => {
+  const key = normalizeName(name);
+  const existing = userRecordFor(name);
+  const next: UserRecord = {
+    name: existing?.name ?? name,
+    rating: existing?.rating ?? 1300,
+    wins: existing?.wins ?? 0,
+    losses: existing?.losses ?? 0,
+    games: existing?.games ?? 0,
+    updatedAt: Date.now(),
+    ...patch
+  };
+  users = users.filter((user) => normalizeName(user.name) !== key).concat(next);
+  writeCachedUser(next);
+  if (renderNow) notify();
+};
+const registerCurrentUser = async () => {
+  if (!identity?.luoguName) return;
+  try {
+    const user = await saveUserRecord({ name: identity.luoguName });
+    updateLocalUser(user.name, user, false);
+  } catch {
+    updateLocalUser(identity.luoguName, {}, false);
+  }
+};
+const profileNameFromPath = (): string => {
+  const match = decodeURIComponent(location.pathname).match(/^\/user\/([^/]+)\/?$/);
+  return match?.[1]?.trim() ?? "";
+};
+const persistUserProfile = async (name: string, profileHtml: string) => {
+  updateLocalUser(name, { profileHtml });
+  try {
+    const user = await saveUserRecord({ name, profileHtml });
+    updateLocalUser(user.name, user);
+  } catch (error) {
+    setStatus(friendlyError(error, "主页保存失败"), "error");
+  }
+};
+const openProfile = (name: string) => {
+  if (!name.trim()) return;
+  window.open(`/user/${encodeURIComponent(name.trim())}`, "_blank", "noopener,noreferrer");
+};
+const ratingRowFor = (name: string): RatingRow => {
+  const key = normalizeName(name);
+  const user = userRecordFor(name);
+  return ratingRows().find((item) => normalizeName(item.name) === key) ?? {
+    name: user?.name ?? name,
+    rating: user?.rating ?? 1300,
+    wins: user?.wins ?? 0,
+    losses: user?.losses ?? 0,
+    games: user?.games ?? 0
+  };
+};
+const nameColor = (name: string, rating = ratingRowFor(name).rating): string => {
+  if (isAdminName(name)) return "rgb(157, 61, 207)";
+  if (rating < 1400) return "rgb(52, 152, 219)";
+  if (rating < 1600) return "rgb(82, 196, 26)";
+  if (rating < 1900) return "rgb(243, 156, 17)";
+  return "rgb(254, 76, 97)";
+};
+const playerRooms = (name: string): RoomListing[] =>
+  sortedRooms().filter((room) => [...(room.redPlayers ?? []), ...(room.bluePlayers ?? [])].some((player) => normalizeName(player) === normalizeName(name)));
+const achievementsFor = (name: string, row: RatingRow) => {
+  const rank = ratingRows().findIndex((item) => normalizeName(item.name) === normalizeName(name)) + 1;
+  const roomsForPlayer = playerRooms(name);
+  const firstDone = row.games > 0;
+  const fastWin = roomsForPlayer.some((room) => room.startedAt && room.endedAt && room.endedAt - room.startedAt <= 180000);
+  return [
+    { Icon: Star, title: "一等星", text: "进入排行榜前 20。", progress: rank > 0 && rank <= 20 ? 100 : 0 },
+    { Icon: Swords, title: "决斗家", text: "获得 10 场胜利。", progress: Math.min(100, row.wins * 10) },
+    { Icon: Sprout, title: "初出茅庐", text: "完成第一场决斗。", progress: firstDone ? 100 : 0 },
+    { Icon: Zap, title: "闪电战", text: "在 3 分钟内结束一场对局。", progress: fastWin ? 100 : 0 },
+    { Icon: Trophy, title: "冠军", text: "登上排行榜第一名。", progress: rank === 1 ? 100 : 0 },
+    { Icon: Medal, title: "常胜", text: "胜率达到 70%，且至少完成 5 场。", progress: row.games >= 5 ? Math.min(100, Math.round((row.wins / row.games / 0.7) * 100)) : Math.min(80, row.games * 16) }
+  ];
+};
+const sanitizeProfileHtml = (html: string): string =>
+  html
+    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "")
+    .replace(/\son\w+="[^"]*"/gi, "")
+    .replace(/\son\w+='[^']*'/gi, "")
+    .replace(/javascript:/gi, "");
+const scrollChatsToBottom = () => {
+  document.querySelectorAll<HTMLElement>(".chat-log").forEach((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+};
+const shouldStickChats = (): boolean =>
+  [...document.querySelectorAll<HTMLElement>(".chat-log")].some((element) => element.scrollHeight - element.scrollTop - element.clientHeight < 80);
 const currentSeat = (): Seat => state.players[identity.id]?.team ?? preferredSeat();
 const preferredSeat = (): Seat => {
   if (state.phase !== "lobby") return "spectator";

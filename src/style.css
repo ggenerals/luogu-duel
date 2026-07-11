@@ -74,7 +74,7 @@ button {
   gap: 6px;
   min-height: 32px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius:  4px;
   background: transparent;
   color: var(--text);
   padding: 6px 10px;
@@ -124,6 +124,7 @@ button.ghost {
 .icon-only {
   width: 32px;
   padding: 0;
+  margin: 3px 10px 3px 10px;
 }
 
 input,
@@ -132,7 +133,7 @@ textarea {
   width: 100%;
   min-height: 32px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius:  4px;
   background: #0b1016;
   color: var(--text);
   padding: 6px 8px;
@@ -258,7 +259,7 @@ code {
 }
 
 .home-grid {
-  grid-template-columns: minmax(320px, 0.9fr) minmax(360px, 1fr) minmax(360px, 1fr) minmax(260px, 0.7fr);
+  grid-template-columns: minmax(280px, 1fr) minmax(420px, 2fr) minmax(280px, 1fr);
   min-height: calc(100vh - 52px);
   height: calc(100vh - 52px);
 }
@@ -279,7 +280,7 @@ code {
 .arena-head {
   min-width: 0;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius:  4px;
   background: var(--panel);
   box-shadow: 0 8px 20px rgb(0 0 0 / 0.22);
   animation: card-in 180ms ease both;
@@ -327,6 +328,11 @@ code {
 .home-chat-panel {
   display: grid;
   min-height: 0;
+}
+
+.home-room-panel {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
 }
 
 .home-chat-panel .chat {
@@ -517,6 +523,84 @@ code {
   white-space: nowrap;
 }
 
+.home-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.home-tabs button.active {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.duel-table,
+.ranking-list {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--line-soft);
+  border-radius:  4px;
+}
+
+.duel-row,
+.ranking-row {
+  display: grid;
+  width: 100%;
+  min-height: 34px;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.duel-row {
+  grid-template-columns: 74px minmax(0, 1fr) 76px;
+}
+
+.duel-head {
+  color: var(--muted);
+  font-weight: 900;
+  pointer-events: none;
+}
+
+.duel-row span,
+.duel-row code,
+.duel-row em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.duel-row em {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.duel-row em.lobby {
+  color: var(--green);
+}
+
+.duel-row em.arena {
+  color: var(--blue);
+}
+
+.duel-row em.finished {
+  color: var(--red);
+}
+
+.ranking-row {
+  grid-template-columns: 42px 26px minmax(0, 1fr) 72px 56px;
+  align-items: center;
+}
+
+.ranking-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .room-list,
 .history-list,
 .teams,
@@ -539,7 +623,7 @@ code {
 .vote,
 .player-row {
   border: 1px solid var(--line-soft);
-  border-radius: 7px;
+  border-radius:  4px;
   background: var(--panel);
   transition:
     border-color 140ms ease,
@@ -805,24 +889,92 @@ img.chat-avatar {
   min-height: 210px;
   overflow: auto;
   border: 1px solid var(--line-soft);
-  border-radius: 7px;
+  border-radius:  4px;
   background: #0b1016;
 }
 
-.chat-log p {
+.chat-line {
   display: grid;
   grid-template-columns: 26px minmax(92px, 0.4fr) minmax(0, 1fr);
   gap: 6px;
   margin: 0;
-  border-bottom: 1px solid var(--line-soft);
   padding: 7px;
   animation: line-in 180ms ease both;
 }
 
-.chat-log p > span:nth-child(2) {
-  display: block;
+.chat-line > span:nth-child(2),
+.chat-name {
+  display: contents;
   color: var(--muted);
   font: 800 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.chat-line.bubble {
+  width: fit-content;
+  max-width: min(78%, 620px);
+  grid-template-columns: 26px minmax(0, 1fr);
+  width: min(78%, 620px);
+  border: 1px solid var(--line-soft);
+  border-radius:  4px;
+  margin: 4px 8px;
+  background: #111820;
+}
+
+.chat-line.mine {
+  align-self: flex-end;
+  grid-template-columns: minmax(0, 1fr) 26px;
+  text-align: right;
+}
+
+.chat-line.mine .chat-avatar {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.chat-line.mine .chat-name,
+.chat-line.mine .chat-text {
+  grid-column: 1;
+}
+
+.chat-line.theirs .chat-name {
+  grid-column: 2;
+}
+
+.chat-line.theirs .chat-avatar {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.chat-line.bubble .chat-text {
+  grid-row: 2;
+}
+
+.chat-line.theirs .chat-text {
+  grid-column: 2;
+}
+
+.chat-line.system,
+.chat-line.judge {
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.chat-name,
+.name-button {
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  justify-content: flex-start;
+  white-space: normal;
+}
+
+.title-name {
+  display: inline;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font: inherit;
 }
 
 .chat-text {
@@ -946,7 +1098,8 @@ img.chat-avatar {
 }
 
 .end-overlay,
-.ban-overlay {
+.ban-overlay,
+.profile-overlay {
   position: fixed;
   inset: 0;
   z-index: 50;
@@ -970,7 +1123,7 @@ img.chat-avatar {
 .toast {
   border: 1px solid var(--line);
   border-left: 4px solid var(--green);
-  border-radius: 8px;
+  border-radius:  4px;
   background: rgb(13 17 23 / 0.96);
   box-shadow: 0 14px 34px rgb(0 0 0 / 0.36);
   padding: 10px 12px;
@@ -1005,7 +1158,7 @@ img.chat-avatar {
 .ban-overlay > div {
   width: min(560px, 100%);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius:  4px;
   background: var(--bg);
   box-shadow: 0 18px 44px rgb(0 0 0 / 0.4);
   padding: 28px;
@@ -1029,6 +1182,100 @@ img.chat-avatar {
   color: var(--muted);
 }
 
+.profile-page {
+  min-height: calc(100vh - 52px);
+  overflow: auto;
+  padding: 16px;
+}
+
+.profile-card {
+  position: relative;
+  width: 100%;
+  margin: 0 auto;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius:  4px;
+  background: var(--bg);
+  box-shadow: 0 18px 44px rgb(0 0 0 / 0.44);
+  padding: 18px;
+}
+
+.profile-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+}
+
+.profile-head {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 18px;
+}
+
+.profile-avatar {
+  width: 128px;
+  height: 128px;
+  border: 1px solid var(--line);
+  border-radius:  4px;
+  object-fit: cover;
+}
+
+.profile-html {
+  min-height: 160px;
+  border: 1px solid var(--line-soft);
+  border-radius:  4px;
+  padding: 12px;
+  overflow-wrap: anywhere;
+}
+
+.profile-editor {
+  min-height: 96px;
+  margin-top: 12px;
+}
+
+.profile-stats,
+.profile-section p {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--line-soft);
+  padding: 8px 0;
+}
+
+.profile-section h2 {
+  font-size: 15px;
+}
+
+.achievement-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.achievement {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 8px;
+  min-height: 118px;
+  border: 1px solid var(--line-soft);
+  border-radius:  4px;
+  padding: 10px;
+}
+
+.achievement > svg {
+  color: var(--green);
+}
+
+.achievement h3,
+.achievement p {
+  margin: 0;
+}
+
+.achievement span {
+  color: var(--green);
+  font: 800 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 @media (max-width: 1180px) {
   .home-grid,
   .room-grid {
@@ -1048,6 +1295,11 @@ img.chat-avatar {
   }
 
   .arena-head {
+    grid-template-columns: 1fr;
+  }
+
+  .profile-head,
+  .achievement-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -1124,11 +1376,19 @@ img.chat-avatar {
     grid-template-columns: 1fr;
   }
 
-  .chat-log p {
+  .chat-line {
     grid-template-columns: 26px minmax(0, 1fr);
+  }
+
+  .chat-line.bubble {
+    width: calc(100% - 16px);
   }
 
   .chat-text {
     grid-column: 2;
+  }
+
+  .chat-line.mine .chat-text {
+    grid-column: 1;
   }
 }

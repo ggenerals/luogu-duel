@@ -6,8 +6,24 @@ export type RoomListing = {
   host: string;
   createdAt: number;
   problemCount: number;
-  status: "lobby" | "arena";
+  status: "lobby" | "arena" | "finished";
   startedAt?: number;
+  endedAt?: number;
+  winner?: "red" | "blue" | "draw";
+  redPlayers?: string[];
+  bluePlayers?: string[];
+};
+
+export type UserRecord = {
+  name: string;
+  rating: number;
+  wins: number;
+  losses: number;
+  games: number;
+  avatar?: string;
+  color?: string;
+  profileHtml?: string;
+  updatedAt: number;
 };
 
 export type ServerMessage =
@@ -26,6 +42,39 @@ export const fetchRooms = async (): Promise<RoomListing[]> => {
   if (!response.ok) throw new Error(`room directory failed: ${response.status}`);
   const data = (await response.json()) as { rooms?: RoomListing[] };
   return Array.isArray(data.rooms) ? data.rooms : [];
+};
+
+export const fetchUsers = async (): Promise<UserRecord[]> => {
+  const response = await fetch("/api/users", {
+    cache: "no-store",
+    signal: AbortSignal.timeout(requestTimeoutMs)
+  });
+  if (!response.ok) throw new Error(`users request failed: ${response.status}`);
+  const data = (await response.json()) as { users?: UserRecord[] };
+  return Array.isArray(data.users) ? data.users : [];
+};
+
+export const fetchUserRecord = async (name: string): Promise<UserRecord | null> => {
+  const response = await fetch(`/api/users/${encodeURIComponent(name)}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(requestTimeoutMs)
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`user request failed: ${response.status}`);
+  const data = (await response.json()) as { user?: UserRecord };
+  return data.user ?? null;
+};
+
+export const saveUserRecord = async (user: Partial<UserRecord> & { name: string }): Promise<UserRecord> => {
+  const response = await fetch(`/api/users/${encodeURIComponent(user.name)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(user),
+    signal: AbortSignal.timeout(requestTimeoutMs)
+  });
+  if (!response.ok) throw new Error(`user save failed: ${response.status}`);
+  const data = (await response.json()) as { user: UserRecord };
+  return data.user;
 };
 
 export const fetchSnapshot = async (roomId: string, secret: string): Promise<SignedEnvelope[]> => {
