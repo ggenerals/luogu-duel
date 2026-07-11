@@ -17,6 +17,8 @@ import {
   LogOut,
   Medal,
   MessageSquare,
+  Monitor,
+  Moon,
   Play,
   Radio,
   RefreshCw,
@@ -24,6 +26,7 @@ import {
   Shield,
   Sprout,
   Star,
+  Sun,
   Swords,
   Terminal,
   Trash2,
@@ -54,7 +57,7 @@ import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope
 import { fetchLuoguRecords, fetchLuoguUser } from "./luogu";
 import { cachedProblemCount, difficultyMeta, pickLuoguProblems, pickLuoguReplacementProblem, type DifficultyLevel } from "./problemPicker";
 import { completeCpOAuthLogin, consumeCpOAuthError, loadCpSession, logoutCpSession, startCpOAuthLogin, type CpSession } from "./oauth";
-import { fetchRooms, fetchSnapshot, fetchUserRecord, fetchUsers, publishEnvelope, roomWebSocketUrl, saveUserRecord, type RoomListing, type ServerMessage, type UserRecord } from "./realtimeStore";
+import { directoryWebSocketUrl, fetchRooms, fetchSnapshot, fetchUserRecord, fetchUsers, publishEnvelope, roomWebSocketUrl, saveUserRecord, type RoomListing, type ServerMessage, type UserRecord } from "./realtimeStore";
 import type { ChatMessage, DuelEvent, DuelState, Player, Problem, Seat, SignedEnvelope, VoteKind } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -80,9 +83,15 @@ let state: DuelState = createInitialState(roomId);
 let globalModeration: DuelState = createInitialState("global");
 let rooms: RoomListing[] = [];
 let users: UserRecord[] = [];
+let usersLoaded = false;
 let profileUserName = initialProfileUserName;
+let bootScreenVisible = true;
+let bootScreenLeaving = false;
 let socket: WebSocket | null = null;
+let directorySocket: WebSocket | null = null;
 let reconnectTimer: number | undefined;
+let directoryReconnectTimer: number | undefined;
+let lastDirectoryHttpSync = 0;
 let finishReturnTimer: number | undefined;
 let clockTimer: number | undefined;
 let syncTimer: number | undefined;
@@ -91,16 +100,24 @@ let statusTone: "info" | "error" = "info";
 let authErrorText = "";
 let toasts: ToastMessage[] = [];
 const notifiedKeys = new Set<string>();
+const systemLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/w7fiiov1.png";
+const darkBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/a32tmuh8.png";
+const lightBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/w7fiiov1.png";
 const avatarCacheKey = "luogu-duel.avatar-cache.v1";
 const userCacheKey = "luogu-duel.user-cache.v1";
+const registrationCacheKey = "luogu-duel.registration-cache.v1";
 const userCacheTtl = 24 * 60 * 60 * 1000;
+const themeModeKey = "luogu-duel.theme-mode.v1";
 const avatarCache: Record<string, string> = readAvatarCache();
 const userCache: Record<string, { user: UserRecord; cachedAt: number }> = readUserCache();
 const avatarLoading = new Set<string>();
 const avatarMissing = new Set<string>();
+let themeMode = readThemeMode();
+const themeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
 const draft = {
   userMenuOpen: false,
+  themeMenuOpen: false,
   roomTab: "duel" as "duel" | "ranking",
   profileEditing: false,
   chat: "",
@@ -131,18 +148,40 @@ const notify = (forceStickChat = false) => {
   render(<App />, app);
   if (stickChat) queueMicrotask(scrollChatsToBottom);
 };
+const applyTheme = () => {
+  const effective = themeMode === "system" ? (themeQuery.matches ? "dark" : "light") : themeMode;
+  document.documentElement.dataset.theme = effective;
+};
 const setStatus = (text: string, tone: "info" | "error" = "info") => {
   statusText = text;
   statusTone = tone;
   notify();
 };
 
+const finishBootScreen = () => {
+  if (!bootScreenVisible || bootScreenLeaving) return;
+  bootScreenLeaving = true;
+  notify();
+  window.setTimeout(() => {
+    bootScreenVisible = false;
+    notify();
+  }, 260);
+};
+
 const boot = async () => {
   identity = await loadIdentity();
+  applyTheme();
+  themeQuery.addEventListener("change", () => {
+    if (themeMode === "system") applyTheme();
+    notify();
+  });
   clockTimer ??= window.setInterval(() => notify(), 1000);
   syncTimer ??= window.setInterval(() => void periodicSync(), 20_000);
   window.addEventListener("hashchange", () => void enterFromHash());
-  window.addEventListener("online", () => void connectRoom());
+  window.addEventListener("online", () => {
+    connectRoom();
+    connectDirectory();
+  });
 
   try {
     await completeCpOAuthLogin();
@@ -157,6 +196,7 @@ const boot = async () => {
     if (oauthError) {
       authErrorText = oauthError;
       bootPhase = "auth-error";
+      finishBootScreen();
       notify();
       return;
     }
@@ -165,11 +205,13 @@ const boot = async () => {
       sessionStorage.removeItem("luogu-duel.oauth.callback-returned");
       authErrorText = "CP OAuth 回调已返回，但未能建立登录会话。请重新登录；如果仍失败，请看 /api/auth/exchange 的响应。";
       bootPhase = "auth-error";
+      finishBootScreen();
       notify();
       return;
     }
     authErrorText = "请先通过 CP OAuth 登录。";
     bootPhase = "auth-error";
+    finishBootScreen();
     notify();
     return;
   }
@@ -179,6 +221,7 @@ const boot = async () => {
   await registerCurrentUser();
   await refreshGlobalModeration();
   await enterFromHash();
+  finishBootScreen();
 };
 
 const enterFromHash = async () => {
@@ -189,6 +232,7 @@ const enterFromHash = async () => {
     roomSecret = "public-lobby";
     profileUserName = profileName;
     closeSocket();
+    connectDirectory();
     await Promise.all([loadDirectory(), loadUsers()]);
     await ensureUserLoaded(profileName);
     notify();
@@ -204,6 +248,7 @@ const enterFromHash = async () => {
   draft.closeReason = isAdmin() ? "管理员强制关闭房间" : "房主关闭房间";
 
   if (mode === "home") {
+    connectDirectory();
     state = createInitialState("global");
     envelopes = [];
     await Promise.all([loadDirectory(), loadUsers()]);
@@ -212,6 +257,7 @@ const enterFromHash = async () => {
   }
 
   state = createInitialState(roomId);
+  closeDirectory();
   envelopes = [];
   notify();
   await loadSnapshot();
@@ -225,7 +271,6 @@ const loadDirectory = async () => {
   try {
     await refreshGlobalModeration();
     if (mode === "home") state = globalModeration;
-    await ensureHomeJoined();
     rooms = await fetchRooms();
     statusTone = "info";
     statusText = `大厅在线，${rooms.length} 个房间可见`;
@@ -244,8 +289,32 @@ const loadUsers = async () => {
     users = Object.values(userCache)
       .filter((entry) => Date.now() - entry.cachedAt < userCacheTtl)
       .map((entry) => entry.user);
+  } finally {
+    usersLoaded = true;
   }
 };
+
+const setThemeMode = (next: "system" | "light" | "dark") => {
+  themeMode = next;
+  try {
+    localStorage.setItem(themeModeKey, next);
+  } catch {
+    // ignore
+  }
+  applyTheme();
+  draft.themeMenuOpen = false;
+  notify();
+};
+
+function readThemeMode(): "system" | "light" | "dark" {
+  try {
+    const stored = localStorage.getItem(themeModeKey);
+    if (stored === "light" || stored === "dark" || stored === "system") return stored;
+  } catch {
+    // ignore
+  }
+  return "system";
+}
 
 const loadSnapshot = async () => {
   try {
@@ -263,8 +332,13 @@ const loadSnapshot = async () => {
 const periodicSync = async () => {
   if (bootPhase !== "ready") return;
   if (mode === "home" || mode === "profile") {
+    connectDirectory();
+    if (directorySocket?.readyState === WebSocket.OPEN) return;
+    if (Date.now() - lastDirectoryHttpSync < 5 * 60_000) return;
+    lastDirectoryHttpSync = Date.now();
     await Promise.all([loadDirectory(), loadUsers()]);
   } else {
+    if (socket?.readyState === WebSocket.OPEN) return;
     await loadSnapshot();
   }
   notify();
@@ -303,6 +377,59 @@ const closeSocket = (clearTimer = true) => {
   socket = null;
 };
 
+const connectDirectory = () => {
+  if (mode !== "home" && mode !== "profile") return;
+  if (directorySocket?.readyState === WebSocket.OPEN || directorySocket?.readyState === WebSocket.CONNECTING) return;
+  closeDirectory(false);
+  directorySocket = new WebSocket(directoryWebSocketUrl());
+  directorySocket.addEventListener("open", () => {
+    statusTone = "info";
+    statusText = "大厅实时连接已建立";
+    notify();
+  });
+  directorySocket.addEventListener("message", (event) => void handleDirectoryMessage(event.data));
+  directorySocket.addEventListener("close", () => {
+    directorySocket = null;
+    if (mode === "home" || mode === "profile") {
+      statusTone = "error";
+      statusText = "大厅实时连接断开，使用低频 HTTP 兜底";
+      directoryReconnectTimer = window.setTimeout(connectDirectory, 5000);
+      notify();
+    }
+  });
+  directorySocket.addEventListener("error", () => {
+    statusTone = "error";
+    statusText = "大厅实时连接错误，使用低频 HTTP 兜底";
+    notify();
+  });
+};
+
+const closeDirectory = (clearTimer = true) => {
+  if (clearTimer && directoryReconnectTimer) window.clearTimeout(directoryReconnectTimer);
+  directoryReconnectTimer = undefined;
+  if (directorySocket) directorySocket.close();
+  directorySocket = null;
+};
+
+const handleDirectoryMessage = async (raw: string) => {
+  const message = JSON.parse(raw) as ServerMessage;
+  if (message.type === "directory") {
+    rooms = message.rooms;
+    statusTone = "info";
+    statusText = `大厅在线，${rooms.length} 个房间可见`;
+  }
+  if (message.type === "users") {
+    users = message.users;
+    for (const user of users) writeCachedUser(user);
+    usersLoaded = true;
+  }
+  if (message.type === "error") {
+    statusTone = "error";
+    statusText = message.message;
+  }
+  notify();
+};
+
 const handleServerMessage = async (raw: string) => {
   const message = JSON.parse(raw) as ServerMessage;
   if (message.type === "hello" || message.type === "sync") {
@@ -322,7 +449,7 @@ const mergeEnvelopes = async (incoming: SignedEnvelope[]) => {
 };
 
 const ensureJoined = async () => {
-  if (mode !== "room" || state.players[identity.id] || bannedRecord()) return;
+  if (mode !== "room" || state.phase !== "lobby" || state.players[identity.id] || bannedRecord()) return;
   const seat = preferredSeat();
   await emit({ ...baseEvent("player.joined"), luoguName: identity.luoguName, team: seat });
   rememberSeat(seat);
@@ -340,7 +467,7 @@ const receiveEnvelope = async (envelope: SignedEnvelope, renderNow = true) => {
   const previousSystemCount = state.system.length;
   envelopes.push(envelope);
   envelopes.sort(compareEnvelopes);
-  state = applyEvent(state, envelope.event);
+  state = applyEvents(roomId, envelopes.map((item) => item.event));
   if (roomId === "global") globalModeration = state;
   saveHistory();
   scheduleFinishReturn();
@@ -369,10 +496,11 @@ const emit = async (event: DuelEvent) => {
 const pushToastsForEvent = (event: DuelEvent, previousPhase: DuelState["phase"], previousSystemCount: number) => {
   if (mode !== "room" && event.roomId !== "global") return;
   if (event.type === "game.started") {
-    notifyImportant(`${event.id}:start`, "比赛开始", matchTitle(), "success");
+    notifyImportant(`start:${roomId}:${state.startedAt ?? event.issuedAt}:${matchTitle()}`, "比赛开始", matchTitle(), "success");
   }
   if (previousPhase !== "finished" && state.phase === "finished") {
-    notifyImportant(`${event.id}:end`, "比赛结束", state.closed?.reason ?? (state.winner === "draw" ? "双方平局" : `${teamName(state.winner)} 获胜`), "warning");
+    const text = state.closed?.reason ?? (state.winner === "draw" ? "双方平局" : `${teamName(state.winner)} 获胜`);
+    notifyImportant(`end:${roomId}:${state.closed?.at ?? event.issuedAt}:${text}`, "比赛结束", text, "warning");
   }
   if (event.type === "chat.sent" && event.visibility === "team" && state.phase === "arena") {
     const chat = state.chats.find((item) => item.id === event.id);
@@ -382,14 +510,15 @@ const pushToastsForEvent = (event: DuelEvent, previousPhase: DuelState["phase"],
   }
   if (event.type !== "game.started" && (state.phase === "arena" || event.type.startsWith("vote.") || event.type === "judge.recordSeen" || event.type === "room.closed")) {
     for (const message of state.system.slice(previousSystemCount)) {
-      notifyImportant(`${message.id}:system`, "系统", message.text, event.type === "judge.recordSeen" ? "success" : "info");
+      notifyImportant(`system:${roomId}:${message.at}:${message.text}`, "系统", message.text, event.type === "judge.recordSeen" ? "success" : "info");
     }
   }
 };
 
 const notifyImportant = async (key: string, title: string, text: string, tone: ToastMessage["tone"] = "info") => {
-  if (notifiedKeys.has(key)) return;
-  notifiedKeys.add(key);
+  const normalizedKey = `${key}:${title}:${text}`.replace(/\s+/g, " ").trim();
+  if (notifiedKeys.has(normalizedKey)) return;
+  notifiedKeys.add(normalizedKey);
   const gmNotify = (globalThis as unknown as { GM_notification?: (options: { title: string; text: string; timeout?: number }) => void }).GM_notification;
   if (gmNotify) {
     gmNotify({ title: `Luogu Duel · ${title}`, text, timeout: 4200 });
@@ -407,7 +536,7 @@ const notifyImportant = async (key: string, title: string, text: string, tone: T
     if (permission === "granted") {
       new Notification(`Luogu Duel · ${title}`, {
         body: text,
-        icon: "https://gengen.qzz.io/favicon.ico"
+        icon: systemLogoUrl
       });
       return;
     }
@@ -416,6 +545,7 @@ const notifyImportant = async (key: string, title: string, text: string, tone: T
 };
 
 const pushToast = (title: string, text: string, tone: ToastMessage["tone"] = "info") => {
+  if (toasts.some((item) => item.title === title && item.text === text)) return;
   const toast: ToastMessage = { id: crypto.randomUUID(), title, text, tone };
   toasts = [...toasts.slice(-3), toast];
   window.setTimeout(() => {
@@ -425,6 +555,7 @@ const pushToast = (title: string, text: string, tone: ToastMessage["tone"] = "in
 };
 
 const emitChat = async (text: string, visibility: "all" | "team") => {
+  if (mode === "home") await ensureHomeJoined();
   await emit({ ...baseEvent("chat.sent"), text, visibility });
 };
 
@@ -435,10 +566,27 @@ const emitDirect = async (event: Extract<DuelEvent, { type: "room.closed" | "pla
 const refreshGlobalModeration = async () => {
   try {
     const remote = await fetchSnapshot("global", "public-lobby");
+    if (mode === "home" && roomId === "global") {
+      await mergeHomeGlobalSnapshot(remote);
+      return;
+    }
     globalModeration = applyEvents("global", remote.map((item) => item.event));
   } catch {
-    globalModeration = createInitialState("global");
+    globalModeration = mode === "home" && roomId === "global" ? state : createInitialState("global");
   }
+};
+
+const mergeHomeGlobalSnapshot = async (incoming: SignedEnvelope[]) => {
+  for (const envelope of incoming) {
+    if (envelope.event.roomId !== "global") continue;
+    if (envelopes.some((item) => item.event.id === envelope.event.id)) continue;
+    if (await verifyEnvelope(envelope)) envelopes.push(envelope);
+  }
+  envelopes = envelopes.filter((item) => item.event.roomId === "global");
+  envelopes.sort(compareEnvelopes);
+  state = applyEvents("global", envelopes.map((item) => item.event));
+  globalModeration = state;
+  saveHistory();
 };
 
 const ensureGlobalAdminJoined = async () => {
@@ -579,6 +727,7 @@ const toggleReady = async () => {
 
 const maybeAutoStart = () => {
   if (!canStart(state)) return;
+  if (state.hostId !== identity.id) return;
   if (envelopes.some((item) => item.event.type === "game.started")) return;
   void emit({ ...baseEvent("game.started") });
 };
@@ -624,13 +773,17 @@ const judgeProblem = async (pid: string) => {
 
 const App = () => {
   if (bootPhase === "loading") {
+    return <BootScreen leaving={false} />;
+  }
+  const bootOverlay = bootScreenVisible ? <BootScreen leaving={bootScreenLeaving} /> : null;
+  if (bootPhase === "auth-error") {
     return (
-      <Shell title="Luogu Duel" subtitle={profileNameFromPath() ? "user" : "initializing"}>
-        {profileNameFromPath() ? <ProfileLoading /> : <Loading />}
-      </Shell>
+      <>
+        <AuthError />
+        {bootOverlay}
+      </>
     );
   }
-  if (bootPhase === "auth-error") return <AuthError />;
   return (
     <>
       <Shell title="Luogu Duel" subtitle={mode === "profile" ? "user" : mode === "home" ? "control room" : `${roomId} / ${state.phase}`}>
@@ -639,8 +792,14 @@ const App = () => {
       <ToastStack />
       <BanOverlay />
       <EndOverlay />
+      {bootOverlay}
     </>
   );
+};
+
+const ThemeModeIcon = () => {
+  const Icon = themeMode === "system" ? Monitor : themeMode === "light" ? Sun : Moon;
+  return <Icon size={16} />;
 };
 
 const Shell = ({ title, subtitle, children }: { title: string; subtitle: string; children: ComponentChildren }) => (
@@ -650,7 +809,7 @@ const Shell = ({ title, subtitle, children }: { title: string; subtitle: string;
         if (mode === "profile") location.href = "/";
         else location.hash = "";
       }}>
-        <img src="https://cdn.luogu.com.cn/upload/image_hosting/a32tmuh8.png" style=" width: 25px; "></img>
+        <img src={document.documentElement.dataset.theme === "light" ? lightBrandLogoUrl : darkBrandLogoUrl} alt="" />
         <span>{title}</span>
         <em>{subtitle}</em>
       </button>
@@ -659,6 +818,21 @@ const Shell = ({ title, subtitle, children }: { title: string; subtitle: string;
         <span>{statusText}</span>
       </div>
       <div class="session">
+        <div class="theme-picker">
+          <button class="ghost icon-only" onClick={() => {
+            draft.themeMenuOpen = !draft.themeMenuOpen;
+            notify();
+          }}>
+            <ThemeModeIcon />
+          </button>
+          {draft.themeMenuOpen ? (
+            <div class="theme-menu">
+              <button class={themeMode === "system" ? "active" : ""} onClick={() => setThemeMode("system")}><Monitor size={14} />跟随系统</button>
+              <button class={themeMode === "light" ? "active" : ""} onClick={() => setThemeMode("light")}><Sun size={14} />浅色</button>
+              <button class={themeMode === "dark" ? "active" : ""} onClick={() => setThemeMode("dark")}><Moon size={14} />深色</button>
+            </div>
+          ) : null}
+        </div>
         <button class="session-user" onClick={() => {
           openProfile(identity?.luoguName ?? "");
         }}>
@@ -680,9 +854,11 @@ const Home = () => (
         <div>
           <h1>创建 Luogu Duel</h1>
           <p>与你的朋友产生一场亲切的对决！</p>
-          <h3>公告</h3>
-          <p>我们创建了一个 QQ 群：1059528564，可以反馈修改建议或进行学术讨论<br/>并且由于此页面采用轻服务器设计<br/>所以许多功能快速访问有bug</p>
         </div>
+      </div>
+      <div class="home-announcement">
+        <h3>公告</h3>
+        <p>我们创建了一个 QQ 群：1059528564，可以反馈修改建议或进行学术讨论<br/>并且由于此页面采用轻服务器设计<br/>所以许多功能快速访问有bug</p>
       </div>
       <form class="create-form" onSubmit={(event) => void submitCreateRoom(event)}>
         <label>
@@ -883,7 +1059,7 @@ const ScoreBar = () => {
 };
 
 const RoomList = () => {
-  const fresh = sortedRooms().slice(0, 20);
+  const fresh = sortedRooms().filter((room) => !(room.status === "finished" && !room.winner && playerCount(room) <= 1)).slice(0, 20);
   if (!fresh.length) return <p class="muted">暂无公开房间。</p>;
   return (
     <div class="duel-table">
@@ -895,8 +1071,8 @@ const RoomList = () => {
       {fresh.map((room) => (
         <button class="duel-row" key={room.roomId} onClick={() => joinRoom(room)}>
           <code>{shortRoomId(room.roomId)}</code>
-          <span>{roomLine(room)}</span>
-          <em class={room.status}>{roomStatusLabel(room)}</em>
+          <RoomLineView room={room} />
+          <em class={roomStatusClass(room)}>{roomStatusLabel(room)}</em>
         </button>
       ))}
     </div>
@@ -912,6 +1088,31 @@ const sortedRooms = (): RoomListing[] => {
   );
 };
 
+const RoomLineView = ({ room }: { room: RoomListing }) => {
+  const red = room.redPlayers?.length ? room.redPlayers : [room.host];
+  const blue = room.bluePlayers ?? [];
+  if (room.status === "finished" && room.winner && room.winner !== "draw") {
+    const winner = room.winner === "red" ? red : blue.length ? blue : ["蓝方"];
+    const loser = room.winner === "red" ? (blue.length ? blue : ["蓝方"]) : red;
+    return <span class="room-line"><PlayerNameList names={winner} /> <em class="result-win">胜</em> <PlayerNameList names={loser} /></span>;
+  }
+  if (room.status === "finished" && room.winner === "draw") {
+    return <span class="room-line"><PlayerNameList names={red} /> <em class="result-draw">平</em> <PlayerNameList names={blue.length ? blue : ["蓝方"]} /></span>;
+  }
+  return <span class="room-line"><PlayerNameList names={red} /> <em>vs</em> <PlayerNameList names={blue.length ? blue : ["等待蓝方"]} /></span>;
+};
+
+const PlayerNameList = ({ names }: { names: string[] }) => (
+  <>
+    {names.map((name, index) => (
+      <span class="room-player" style={{ color: nameColor(name) }} key={`${name}:${index}`}>
+        {index > 0 ? " & " : ""}
+        {name}
+      </span>
+    ))}
+  </>
+);
+
 const roomLine = (room: RoomListing): string => {
   const red = (room.redPlayers?.length ? room.redPlayers : [room.host]).join(" & ");
   const blue = (room.bluePlayers ?? []).join(" & ");
@@ -925,7 +1126,10 @@ const roomLine = (room: RoomListing): string => {
 };
 
 const roomStatusLabel = (room: RoomListing): string =>
-  room.status === "lobby" ? "准备" : room.status === "arena" ? "进行中" : "已结束";
+  room.status === "lobby" ? "准备" : room.status === "arena" ? "进行中" : room.winner ? "已结束" : "已关闭";
+
+const roomStatusClass = (room: RoomListing): string =>
+  room.status === "finished" && !room.winner ? "closed" : room.status;
 
 const shortRoomId = (id: string): string => id.replace(/\D/g, "").slice(-5) || id.slice(0, 5);
 
@@ -1016,7 +1220,7 @@ const AdminPanel = () => {
       </div>
       <div class="admin-room-list">
         {rooms.length ? (
-          rooms.map((room) => (
+          rooms.filter((room) => room.status !== "finished").map((room) => (
             <div class="admin-room" key={room.roomId}>
               <code>{room.roomId}</code>
               <span>{room.host} / {room.status}</span>
@@ -1049,6 +1253,11 @@ const forceCloseRoom = async (room: RoomListing) => {
   await publishEnvelope(room.roomId, room.secret, envelope);
   rooms = rooms.filter((item) => item.roomId !== room.roomId);
   setStatus(`已删除房间 ${room.roomId}`);
+};
+
+const playerCount = (room: RoomListing): number => {
+  const names = [room.host, ...(room.redPlayers ?? []), ...(room.bluePlayers ?? [])];
+  return new Set(names.filter(Boolean).map((name) => normalizeName(name))).size;
 };
 
 const Roster = () => (
@@ -1213,6 +1422,7 @@ const ToastStack = () => {
     <div class="toast-stack">
       {toasts.map((toast) => (
         <div class={`toast ${toast.tone}`} key={toast.id}>
+          <img src={systemLogoUrl} alt="" />
           <strong>{toast.title}</strong>
           <span>{toast.text}</span>
         </div>
@@ -1372,7 +1582,7 @@ const AuthError = () => (
   <Shell title="Luogu Duel" subtitle="auth error">
     <main class="center-screen">
       <Bot size={42} />
-      <h1>登录失败</h1>
+      <h1>请登录</h1>
       <p>{authErrorText}</p>
       <button class="primary" onClick={() => void startCpOAuthLogin(true)}>重新登录</button>
     </main>
@@ -1384,6 +1594,12 @@ const Loading = () => (
     <Bot size={42} />
     <h1>Connecting</h1>
     <p>正在装载身份与房间网络。</p>
+  </main>
+);
+
+const BootScreen = ({ leaving }: { leaving: boolean }) => (
+  <main class={`boot-screen${leaving ? " leaving" : ""}`}>
+    <div class="boot-loading">Loading</div>
   </main>
 );
 
@@ -1519,6 +1735,25 @@ const writeCachedUser = (user: UserRecord) => {
   userCache[normalizeName(user.name)] = { user, cachedAt: Date.now() };
   writeUserCache();
 };
+const registrationFresh = (nameKey: string): boolean => {
+  try {
+    const raw = localStorage.getItem(registrationCacheKey);
+    const entries = raw ? JSON.parse(raw) as Record<string, number> : {};
+    return Date.now() - (entries[nameKey] ?? 0) < userCacheTtl;
+  } catch {
+    return false;
+  }
+};
+const rememberRegistered = (nameKey: string) => {
+  try {
+    const raw = localStorage.getItem(registrationCacheKey);
+    const entries = raw ? JSON.parse(raw) as Record<string, number> : {};
+    entries[nameKey] = Date.now();
+    localStorage.setItem(registrationCacheKey, JSON.stringify(entries));
+  } catch {
+    // Registration cache only reduces duplicate writes.
+  }
+};
 const userRecordFor = (name: string): UserRecord | null => {
   const key = normalizeName(name);
   const cached = userCache[key];
@@ -1557,9 +1792,16 @@ const updateLocalUser = (name: string, patch: Partial<UserRecord>, renderNow = t
 };
 const registerCurrentUser = async () => {
   if (!identity?.luoguName) return;
+  const key = normalizeName(identity.luoguName);
+  const cached = userCache[key];
+  if (cached && Date.now() - cached.cachedAt < userCacheTtl && registrationFresh(key)) {
+    updateLocalUser(cached.user.name, cached.user, false);
+    return;
+  }
   try {
     const user = await saveUserRecord({ name: identity.luoguName });
     updateLocalUser(user.name, user, false);
+    rememberRegistered(key);
   } catch {
     updateLocalUser(identity.luoguName, {}, false);
   }
@@ -1599,16 +1841,18 @@ const nameColor = (name: string, rating = ratingRowFor(name).rating): string => 
 const playerRooms = (name: string): RoomListing[] =>
   sortedRooms().filter((room) => [...(room.redPlayers ?? []), ...(room.bluePlayers ?? [])].some((player) => normalizeName(player) === normalizeName(name)));
 const achievementsFor = (name: string, row: RatingRow) => {
-  const rank = ratingRows().findIndex((item) => normalizeName(item.name) === normalizeName(name)) + 1;
+  const rows = ratingRows();
+  const rank = rows.findIndex((item) => normalizeName(item.name) === normalizeName(name)) + 1;
   const roomsForPlayer = playerRooms(name);
   const firstDone = row.games > 0;
   const fastWin = roomsForPlayer.some((room) => room.startedAt && room.endedAt && room.endedAt - room.startedAt <= 180000);
+  const championDone = usersLoaded && row.games > 0 && rank === 1;
   return [
     { Icon: Star, title: "一等星", text: "进入排行榜前 20。", progress: rank > 0 && rank <= 20 ? 100 : 0 },
     { Icon: Swords, title: "决斗家", text: "获得 10 场胜利。", progress: Math.min(100, row.wins * 10) },
     { Icon: Sprout, title: "初出茅庐", text: "完成第一场决斗。", progress: firstDone ? 100 : 0 },
     { Icon: Zap, title: "闪电战", text: "在 3 分钟内结束一场对局。", progress: fastWin ? 100 : 0 },
-    { Icon: Trophy, title: "冠军", text: "登上排行榜第一名。", progress: rank === 1 ? 100 : 0 },
+    { Icon: Trophy, title: "冠军", text: "登上排行榜第一名。", progress: championDone ? 100 : 0 },
     { Icon: Medal, title: "常胜", text: "胜率达到 70%，且至少完成 5 场。", progress: row.games >= 5 ? Math.min(100, Math.round((row.wins / row.games / 0.7) * 100)) : Math.min(80, row.games * 16) }
   ];
 };

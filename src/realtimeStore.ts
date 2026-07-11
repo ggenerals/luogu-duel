@@ -30,6 +30,8 @@ export type ServerMessage =
   | { type: "hello"; envelopes: SignedEnvelope[] }
   | { type: "event"; envelope: SignedEnvelope }
   | { type: "sync"; envelopes: SignedEnvelope[] }
+  | { type: "directory"; rooms: RoomListing[] }
+  | { type: "users"; users: UserRecord[] }
   | { type: "error"; message: string };
 
 const requestTimeoutMs = 6500;
@@ -99,6 +101,12 @@ export const publishEnvelope = async (roomId: string, secret: string, envelope: 
 
 export const roomWebSocketUrl = (roomId: string, secret: string): string => {
   const url = roomApiUrl(roomId, secret, "ws");
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString();
+};
+
+export const directoryWebSocketUrl = (): string => {
+  const url = new URL("/api/rooms/ws", location.origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
 };

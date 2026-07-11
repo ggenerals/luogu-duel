@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { DurableObject } from "cloudflare:workers";
-import { applyEvents, createInitialState } from "./domain";
+import { applyEvent, applyEvents, createInitialState } from "./domain";
 import type { DuelEvent, SignedEnvelope } from "./types";
 
 type Env = {
@@ -40,11 +40,21 @@ type UserRecord = {
 };
 
 type ClientMessage = { type: "event"; envelope: SignedEnvelope };
+type SocketKind = "room" | "directory";
 
 const oauthBase = "https://www.cpoauth.com";
 const oauthScope = "openid profile cp:linked link:luogu";
 
 export class DuelRoom extends DurableObject<Env> {
+  private eventsCache: SignedEnvelope[] | null = null;
+  private eventIds = new Set<string>();
+  private cachedState = createInitialState("");
+  private firstEvent: DuelEvent | null = null;
+  private roomSecret: string | null = null;
+  private listingsCache: Map<string, RoomListing> | null = null;
+  private usersCache: Map<string, UserRecord> | null = null;
+  private processedResultsCache: Set<string> | null = null;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
@@ -83,7 +93,8 @@ export class DuelRoom extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const secret = url.searchParams.get("secret");
-    if (secret) await this.ctx.storage.put("secret", secret);
+    if (secret) await this.rememberSecret(secret);
+    if (url.pathname.endsWith("/directory/ws")) return this.handleDirectoryWebSocket(request);
     if (url.pathname.endsWith("/directory")) return this.handleDirectory(request);
     if (url.pathname.endsWith("/users")) return this.handleUsers(request);
     if (url.pathname.endsWith("/clear-all")) return this.handleClearAll(request);
@@ -105,6 +116,8 @@ export class DuelRoom extends DurableObject<Env> {
     if (typeof message !== "string") return;
     try {
       const data = JSON.parse(message) as Partial<ClientMessage>;
+      const attachment = ws.deserializeAttachment() as { kind?: SocketKind } | undefined;
+      if (attachment?.kind === "directory") return;
       if (data.type !== "event" || !data.envelope) return;
       const saved = await this.acceptEnvelope(data.envelope);
       if (saved) this.broadcast({ type: "event", envelope: data.envelope });
@@ -122,15 +135,26 @@ export class DuelRoom extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ connectedAt: Date.now() });
+    server.serializeAttachment({ kind: "room" satisfies SocketKind, connectedAt: Date.now() });
     server.send(JSON.stringify({ type: "hello", envelopes: this.listEvents() }));
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  private handleDirectoryWebSocket(request: Request): Response {
+    if (request.headers.get("Upgrade") !== "websocket") return jsonError("expected websocket", 426);
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({ kind: "directory" satisfies SocketKind, connectedAt: Date.now() });
+    server.send(JSON.stringify({ type: "directory", rooms: this.listRooms() }));
+    server.send(JSON.stringify({ type: "users", users: this.listUsers() }));
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
   private async acceptEnvelope(envelope: SignedEnvelope): Promise<boolean> {
+    this.hydrateEvents();
     const event = envelope.event;
-    const saved = this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM events WHERE id = ?", event.id).toArray();
-    if (saved.length > 0) return false;
+    if (this.eventIds.has(event.id)) return false;
 
     this.ctx.storage.sql.exec(
       "INSERT INTO events (id, room_id, issued_at, lamport, envelope) VALUES (?, ?, ?, ?, ?)",
@@ -140,22 +164,38 @@ export class DuelRoom extends DurableObject<Env> {
       event.lamport,
       JSON.stringify(envelope)
     );
+    this.eventsCache!.push(envelope);
+    this.eventsCache!.sort(compareEnvelopes);
+    this.eventIds.add(event.id);
+    this.firstEvent ??= event;
+    this.cachedState = applyEvent(this.cachedState.roomId === event.roomId ? this.cachedState : createInitialState(event.roomId), event);
     await this.updateDirectory(event.roomId, event);
     return true;
   }
 
   private listEvents(): SignedEnvelope[] {
-    return this.ctx.storage.sql
+    this.hydrateEvents();
+    return this.eventsCache!;
+  }
+
+  private hydrateEvents(): void {
+    if (this.eventsCache) return;
+    this.eventsCache = this.ctx.storage.sql
       .exec<{ envelope: string }>("SELECT envelope FROM events ORDER BY lamport ASC, issued_at ASC, id ASC LIMIT 1000")
       .toArray()
       .map((row) => JSON.parse(row.envelope) as SignedEnvelope);
+    this.eventsCache.sort(compareEnvelopes);
+    this.eventIds = new Set(this.eventsCache.map((item) => item.event.id));
+    this.firstEvent = this.eventsCache[0]?.event ?? null;
+    const roomId = this.firstEvent?.roomId ?? "";
+    this.cachedState = roomId ? applyEvents(roomId, this.eventsCache.map((item) => item.event)) : createInitialState("");
   }
 
   private async updateDirectory(roomId: string, latestEvent: DuelEvent): Promise<void> {
     if (roomId === "global" || roomId === "__directory") return;
-    const state = applyEvents(roomId, this.listEvents().map((item) => item.event));
+    const state = this.cachedState.roomId === roomId ? this.cachedState : applyEvents(roomId, this.listEvents().map((item) => item.event));
     const directory = this.env.DUEL_ROOM.getByName("__directory");
-    const firstEvent = this.listEvents()[0]?.event ?? latestEvent;
+    const firstEvent = this.firstEvent ?? latestEvent;
     const firstPlayer = Object.values(state.players)[0];
     const redPlayers = Object.values(state.players).filter((player) => player.team === "red").map((player) => player.luoguName);
     const bluePlayers = Object.values(state.players).filter((player) => player.team === "blue").map((player) => player.luoguName);
@@ -172,7 +212,7 @@ export class DuelRoom extends DurableObject<Env> {
       redPlayers,
       bluePlayers
     };
-    const attachmentSecret = await this.ctx.storage.get<string>("secret");
+    const attachmentSecret = await this.readSecret();
     if (attachmentSecret) listing.secret = attachmentSecret;
     await directory.fetch("https://duel.internal/directory", {
       method: "POST",
@@ -183,12 +223,7 @@ export class DuelRoom extends DurableObject<Env> {
 
   private async handleDirectory(request: Request): Promise<Response> {
     if (request.method === "GET") {
-      const maxAge = Date.now() - 30 * 24 * 60 * 60 * 1000;
-      const rooms = this.ctx.storage.sql
-        .exec<{ listing: string; updated_at: number }>("SELECT listing, updated_at FROM listings WHERE updated_at >= ? ORDER BY updated_at DESC LIMIT 120", maxAge)
-        .toArray()
-        .map((row) => JSON.parse(row.listing) as RoomListing);
-      return Response.json({ rooms });
+      return Response.json({ rooms: this.listRooms() }, { headers: cacheHeaders(15) });
     }
     if (request.method === "POST") {
       const body = (await request.json()) as { listing?: RoomListing };
@@ -201,11 +236,19 @@ export class DuelRoom extends DurableObject<Env> {
       );
       this.registerListingUsers(body.listing);
       this.applyFinishedListingResult(body.listing);
+      this.hydrateDirectory();
+      this.listingsCache!.set(body.listing.roomId, body.listing);
+      this.broadcastDirectory();
       return Response.json({ ok: true });
     }
     if (request.method === "DELETE") {
       const body = (await request.json()) as { roomId?: string };
-      if (body.roomId) this.ctx.storage.sql.exec("DELETE FROM listings WHERE room_id = ?", body.roomId);
+      if (body.roomId) {
+        this.ctx.storage.sql.exec("DELETE FROM listings WHERE room_id = ?", body.roomId);
+        this.hydrateDirectory();
+        this.listingsCache!.delete(body.roomId);
+        this.broadcastDirectory();
+      }
       return Response.json({ ok: true });
     }
     return jsonError("method not allowed", 405);
@@ -213,12 +256,7 @@ export class DuelRoom extends DurableObject<Env> {
 
   private handleUsers(request: Request): Response {
     if (request.method !== "GET") return jsonError("method not allowed", 405);
-    const users = this.ctx.storage.sql
-      .exec<{ user_json: string }>("SELECT user_json FROM users ORDER BY updated_at DESC LIMIT 1000")
-      .toArray()
-      .map((row) => JSON.parse(row.user_json) as UserRecord)
-      .sort((a, b) => b.rating - a.rating || b.wins - a.wins || a.name.localeCompare(b.name));
-    return Response.json({ users });
+    return Response.json({ users: this.listUsers() }, { headers: cacheHeaders(60) });
   }
 
   private async handleUser(request: Request, rawName: string): Promise<Response> {
@@ -246,6 +284,14 @@ export class DuelRoom extends DurableObject<Env> {
     for (const table of ["events", "listings", "users", "processed_results"]) {
       this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
     }
+    this.eventsCache = [];
+    this.eventIds = new Set();
+    this.cachedState = createInitialState("");
+    this.firstEvent = null;
+    this.listingsCache = new Map();
+    this.usersCache = new Map();
+    this.processedResultsCache = new Set();
+    this.broadcastDirectory();
     return Response.json({ ok: true });
   }
 
@@ -258,10 +304,8 @@ export class DuelRoom extends DurableObject<Env> {
     const red = dedupeNames(listing.redPlayers ?? []);
     const blue = dedupeNames(listing.bluePlayers ?? []);
     if (!red.length || !blue.length) return;
-    const processed = this.ctx.storage.sql
-      .exec<{ room_id: string }>("SELECT room_id FROM processed_results WHERE room_id = ?", listing.roomId)
-      .toArray();
-    if (processed.length) return;
+    this.hydrateProcessedResults();
+    if (this.processedResultsCache!.has(listing.roomId)) return;
 
     const redRows = red.map((name) => this.upsertUser({ name }));
     const blueRows = blue.map((name) => this.upsertUser({ name }));
@@ -273,14 +317,13 @@ export class DuelRoom extends DurableObject<Env> {
     for (const user of redRows) this.writeUser(applyRatingDelta(user, delta, redScore === 1));
     for (const user of blueRows) this.writeUser(applyRatingDelta(user, -delta, redScore === 0));
     this.ctx.storage.sql.exec("INSERT INTO processed_results (room_id, processed_at) VALUES (?, ?)", listing.roomId, Date.now());
+    this.processedResultsCache!.add(listing.roomId);
   }
 
   private readUser(name: string): UserRecord | null {
+    this.hydrateUsers();
     const key = normalizeName(name);
-    const rows = this.ctx.storage.sql
-      .exec<{ user_json: string }>("SELECT user_json FROM users WHERE name_key = ?", key)
-      .toArray();
-    return rows[0] ? JSON.parse(rows[0].user_json) as UserRecord : null;
+    return this.usersCache!.get(key) ?? null;
   }
 
   private upsertUser(input: { name: string; avatar?: string; color?: string; profileHtml?: string }): UserRecord {
@@ -306,12 +349,80 @@ export class DuelRoom extends DurableObject<Env> {
       JSON.stringify(user),
       user.updatedAt
     );
+    this.hydrateUsers();
+    this.usersCache!.set(normalizeName(user.name), user);
     return user;
   }
 
-  private broadcast(payload: unknown): void {
+  private listRooms(): RoomListing[] {
+    this.hydrateDirectory();
+    const maxAge = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    return [...this.listingsCache!.values()]
+      .filter((room) => room.createdAt >= maxAge || (room.endedAt ?? room.startedAt ?? room.createdAt) >= maxAge)
+      .sort((a, b) => (b.endedAt ?? b.startedAt ?? b.createdAt) - (a.endedAt ?? a.startedAt ?? a.createdAt))
+      .slice(0, 120);
+  }
+
+  private listUsers(): UserRecord[] {
+    this.hydrateUsers();
+    return [...this.usersCache!.values()]
+      .sort((a, b) => b.rating - a.rating || b.wins - a.wins || a.name.localeCompare(b.name))
+      .slice(0, 1000);
+  }
+
+  private hydrateDirectory(): void {
+    if (this.listingsCache) return;
+    const rows = this.ctx.storage.sql
+      .exec<{ listing: string }>("SELECT listing FROM listings")
+      .toArray();
+    this.listingsCache = new Map(rows.map((row) => {
+      const listing = JSON.parse(row.listing) as RoomListing;
+      return [listing.roomId, listing];
+    }));
+  }
+
+  private hydrateUsers(): void {
+    if (this.usersCache) return;
+    const rows = this.ctx.storage.sql
+      .exec<{ user_json: string }>("SELECT user_json FROM users")
+      .toArray();
+    this.usersCache = new Map(rows.map((row) => {
+      const user = JSON.parse(row.user_json) as UserRecord;
+      return [normalizeName(user.name), user];
+    }));
+  }
+
+  private hydrateProcessedResults(): void {
+    if (this.processedResultsCache) return;
+    const rows = this.ctx.storage.sql
+      .exec<{ room_id: string }>("SELECT room_id FROM processed_results")
+      .toArray();
+    this.processedResultsCache = new Set(rows.map((row) => row.room_id));
+  }
+
+  private async rememberSecret(secret: string): Promise<void> {
+    if (this.roomSecret === secret) return;
+    this.roomSecret = secret;
+    await this.ctx.storage.put("secret", secret);
+  }
+
+  private async readSecret(): Promise<string | null> {
+    if (this.roomSecret !== null) return this.roomSecret;
+    this.roomSecret = await this.ctx.storage.get<string>("secret") ?? "";
+    return this.roomSecret;
+  }
+
+  private broadcastDirectory(): void {
+    this.broadcast({ type: "directory", rooms: this.listRooms() }, "directory");
+    this.broadcast({ type: "users", users: this.listUsers() }, "directory");
+  }
+
+  private broadcast(payload: unknown, kind: SocketKind = "room"): void {
     const message = JSON.stringify(payload);
-    for (const ws of this.ctx.getWebSockets()) ws.send(message);
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() as { kind?: SocketKind } | undefined;
+      if ((attachment?.kind ?? "room") === kind) ws.send(message);
+    }
   }
 }
 
@@ -330,6 +441,7 @@ export default {
     if (url.pathname === "/api/luogu/records") return fetchLuoguRecords(url, env);
     if (url.pathname === "/api/luogu/user/search") return fetchLuoguUserSearch(url, env);
     if (url.pathname === "/api/rooms") return env.DUEL_ROOM.getByName("__directory").fetch("https://duel.internal/directory");
+    if (url.pathname === "/api/rooms/ws") return env.DUEL_ROOM.getByName("__directory").fetch(new Request("https://duel.internal/directory/ws", request));
     if (url.pathname === "/api/users") return env.DUEL_ROOM.getByName("__directory").fetch("https://duel.internal/users", request);
     if (url.pathname === "/api/admin/clear-all" && request.method === "POST") {
       return env.DUEL_ROOM.getByName("__directory").fetch("https://duel.internal/clear-all", request);
@@ -536,6 +648,13 @@ const applyRatingDelta = (user: UserRecord, delta: number, won: boolean): UserRe
   losses: user.losses + (won ? 0 : 1),
   games: user.games + 1,
   updatedAt: Date.now()
+});
+
+const compareEnvelopes = (a: SignedEnvelope, b: SignedEnvelope): number =>
+  a.event.lamport - b.event.lamport || a.event.issuedAt - b.event.issuedAt || a.event.id.localeCompare(b.event.id);
+
+const cacheHeaders = (maxAge: number): HeadersInit => ({
+  "cache-control": `public, max-age=${maxAge}, stale-while-revalidate=${maxAge * 4}`
 });
 
 const maintenanceHtml = (): string => `<!doctype html>
