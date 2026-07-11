@@ -913,7 +913,7 @@ img.chat-avatar {
   width: fit-content;
   max-width: min(78%, 620px);
   grid-template-columns: 26px minmax(0, 1fr);
-  width: min(78%, 620px);
+  width:fit-content;
   border: 1px solid var(--line-soft);
   border-radius:  4px;
   margin: 4px 8px;
