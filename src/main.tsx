@@ -13,7 +13,6 @@ import {
   Eye,
   Flame,
   Flag,
-  Gauge,
   Handshake,
   LogOut,
   Medal,
@@ -44,7 +43,6 @@ import {
   createInitialState,
   isAdminName,
   isTeam,
-  makeProblemSet,
   normalizeName,
   scoreOf,
   sortProblemsByDifficulty,
@@ -65,8 +63,14 @@ if (!app) throw new Error("Missing #app");
 type BootPhase = "loading" | "auth-error" | "ready";
 type ViewMode = "home" | "room" | "profile";
 
+function profileNameFromPath(): string {
+  const match = decodeURIComponent(location.pathname).match(/^\/user\/([^/]+)\/?$/);
+  return match?.[1]?.trim() ?? "";
+}
+
+const initialProfileUserName = profileNameFromPath();
 let bootPhase: BootPhase = "loading";
-let mode: ViewMode = "home";
+let mode: ViewMode = initialProfileUserName ? "profile" : "home";
 let identity: LocalIdentity;
 let cpSession: CpSession | null = null;
 let roomId = "global";
@@ -76,7 +80,7 @@ let state: DuelState = createInitialState(roomId);
 let globalModeration: DuelState = createInitialState("global");
 let rooms: RoomListing[] = [];
 let users: UserRecord[] = [];
-let profileUserName = "";
+let profileUserName = initialProfileUserName;
 let socket: WebSocket | null = null;
 let reconnectTimer: number | undefined;
 let finishReturnTimer: number | undefined;
@@ -98,9 +102,9 @@ const avatarMissing = new Set<string>();
 const draft = {
   userMenuOpen: false,
   roomTab: "duel" as "duel" | "ranking",
+  profileEditing: false,
   chat: "",
   roomCount: 9,
-  manualProblems: "",
   difficultyLow: 1 as DifficultyLevel,
   difficultyHigh: 3 as DifficultyLevel,
   pickerStatus: "",
@@ -508,19 +512,13 @@ const submitCreateRoom = async (event: Event) => {
   const nextRoom = compactId();
   const nextSecret = compactId() + compactId();
   const count = clamp(draft.roomCount, 1, 21);
-  const manual = draft.manualProblems.trim();
-
   let problems: Problem[];
   try {
-    if (manual) {
-      problems = makeProblemSet(count, nextRoom, manual);
-    } else {
-      draft.pickerStatus = "读取洛谷题库缓存";
-      notify();
-      problems = await pickLuoguProblems(count, nextRoom, draft.difficultyLow, draft.difficultyHigh);
-      draft.pickerStatus = `已抽取 ${problems.length} 题`;
-    }
+    draft.pickerStatus = "读取洛谷题库缓存";
+    notify();
+    problems = await pickLuoguProblems(count, nextRoom, draft.difficultyLow, draft.difficultyHigh);
     problems = sortProblemsByDifficulty(problems);
+    draft.pickerStatus = `已抽取 ${problems.length} 题`;
   } catch (error) {
     draft.pickerStatus = "";
     setStatus(error instanceof Error ? error.message : "题库抽取失败", "error");
@@ -554,7 +552,9 @@ const closeRoom = async () => {
 };
 
 const leaveRoom = async () => {
-  if (mode !== "room" || state.phase !== "lobby") return;
+  const seat = state.players[identity.id]?.team ?? preferredSeat();
+  if (mode !== "room") return;
+  if (seat !== "spectator" && state.phase !== "lobby") return;
   if (state.hostId === identity.id) {
     setStatus("房主不能退出，只能关闭房间", "error");
     return;
@@ -623,7 +623,13 @@ const judgeProblem = async (pid: string) => {
 };
 
 const App = () => {
-  if (bootPhase === "loading") return <Shell title="Luogu Duel" subtitle="initializing"><Loading /></Shell>;
+  if (bootPhase === "loading") {
+    return (
+      <Shell title="Luogu Duel" subtitle={profileNameFromPath() ? "user" : "initializing"}>
+        {profileNameFromPath() ? <ProfileLoading /> : <Loading />}
+      </Shell>
+    );
+  }
   if (bootPhase === "auth-error") return <AuthError />;
   return (
     <>
@@ -644,7 +650,7 @@ const Shell = ({ title, subtitle, children }: { title: string; subtitle: string;
         if (mode === "profile") location.href = "/";
         else location.hash = "";
       }}>
-        <Swords size={20} />
+        <img src="https://cdn.luogu.com.cn/upload/image_hosting/a32tmuh8.png" style=" width: 25px; "></img>
         <span>{title}</span>
         <em>{subtitle}</em>
       </button>
@@ -673,7 +679,9 @@ const Home = () => (
         <Terminal size={18} />
         <div>
           <h1>创建 Luogu Duel</h1>
-          <p>与你的朋友产生一次情切的对决！</p>
+          <p>与你的朋友产生一场亲切的对决！</p>
+          <h3>公告</h3>
+          <p>我们创建了一个 QQ 群：1059528564，可以反馈修改建议或进行学术讨论<br/>并且由于此页面采用轻服务器设计<br/>所以许多功能快速访问有bug</p>
         </div>
       </div>
       <form class="create-form" onSubmit={(event) => void submitCreateRoom(event)}>
@@ -681,12 +689,10 @@ const Home = () => (
           <span>题目数量</span>
           <input type="number" min={1} max={21} value={draft.roomCount} onInput={(event) => (draft.roomCount = Number(event.currentTarget.value))} />
         </label>
-        <label class="wide">
-          <span>手动题号</span>
-          <input value={draft.manualProblems} placeholder="P1001 P1002，留空则自动抽题" onInput={(event) => (draft.manualProblems = event.currentTarget.value)} />
-        </label>
-        <DifficultyControl label="最低难度" value={draft.difficultyLow} set={(value) => (draft.difficultyLow = value)} />
-        <DifficultyControl label="最高难度" value={draft.difficultyHigh} set={(value) => (draft.difficultyHigh = value)} />
+        <div class="difficulty-row wide">
+          <DifficultyControl label="最低难度" value={draft.difficultyLow} set={(value) => (draft.difficultyLow = value)} />
+          <DifficultyControl label="最高难度" value={draft.difficultyHigh} set={(value) => (draft.difficultyHigh = value)} />
+        </div>
         <button class="primary wide">
           <Play size={17} />
           生成房间
@@ -793,9 +799,11 @@ const RoomControls = () => {
   const player = state.players[identity.id];
   const canClose = canCloseRoom(state, identity.id, identity.luoguName);
   const canPlayAction = state.phase === "arena" && isTeam(player?.team) && !blockedByBan();
+  const canLeaveSpectator = mode === "room" && (player?.team === "spectator" || (!player && preferredSeat() === "spectator"));
+  const showLobbyControls = state.phase === "lobby";
   return (
     <div class="room-controls">
-      {state.phase === "lobby" ? (
+      {showLobbyControls ? (
         <>
           <div class="segmented">
             <button class="leave-seat" disabled={state.hostId === identity.id || blockedByBan()} onClick={() => void leaveRoom()}>
@@ -814,6 +822,14 @@ const RoomControls = () => {
             {player?.ready ? "已准备" : "准备"}
           </button>
         </>
+      ) : null}
+      {!showLobbyControls && canLeaveSpectator ? (
+        <div class="segmented">
+          <button class="leave-seat" disabled={blockedByBan()} onClick={() => void leaveRoom()}>
+            <DoorClosed size={15} />
+            退出观赛
+          </button>
+        </div>
       ) : null}
       {canPlayAction ? (
         <div class="match-actions">
@@ -1210,6 +1226,7 @@ const ProfilePage = () => {
   const user = userRecordFor(name);
   const row = ratingRowFor(name);
   const mine = normalizeName(name) === normalizeName(identity.luoguName);
+  const source = user?.profileHtml || "";
   return (
     <main class="profile-page">
       <div class="profile-card">
@@ -1218,16 +1235,36 @@ const ProfilePage = () => {
             <UserAvatar name={name} className="profile-avatar" />
             <h1 style={{ color: nameColor(name) }}>{name}</h1>
           </div>
-          <div class="profile-html" dangerouslySetInnerHTML={{ __html: sanitizeProfileHtml(user?.profileHtml || "<p>这个用户还没有写主页。</p>") }} />
+          <div class="profile-html">
+            {draft.profileEditing && mine ? (
+              <textarea
+                class="profile-editor"
+                value={source}
+                placeholder="用纯文本内嵌 HTML 自定义主页"
+                onInput={(event) => updateLocalUser(name, { profileHtml: event.currentTarget.value }, false)}
+              />
+            ) : (
+              <pre class="profile-source" dangerouslySetInnerHTML={{ __html: sanitizeProfileHtml(source || "这个用户还没有写主页。") }} />
+            )}
+          </div>
         </div>
         {mine ? (
-          <textarea
-            class="profile-editor"
-            value={user?.profileHtml ?? ""}
-            placeholder="用纯文本内嵌 HTML 自定义主页"
-            onInput={(event) => updateLocalUser(name, { profileHtml: event.currentTarget.value })}
-            onBlur={(event) => void persistUserProfile(name, event.currentTarget.value)}
-          />
+          <div class="profile-actions">
+            {draft.profileEditing ? (
+              <>
+                <button class="primary" onClick={() => void persistUserProfile(name, userRecordFor(name)?.profileHtml ?? "")}>完成</button>
+                <button class="ghost" onClick={() => {
+                  draft.profileEditing = false;
+                  notify();
+                }}>取消</button>
+              </>
+            ) : (
+              <button class="primary" onClick={() => {
+                draft.profileEditing = true;
+                notify();
+              }}>编辑</button>
+            )}
+          </div>
         ) : null}
         <div class="profile-stats">
           <strong>Rating {Math.round(row.rating)}</strong>
@@ -1239,7 +1276,7 @@ const ProfilePage = () => {
         </div>
         <div class="achievement-grid">
           {achievementsFor(name, row).map((achievement) => (
-            <article class="achievement" key={achievement.title}>
+            <article class={`achievement ${achievement.progress >= 100 ? "complete" : ""}`} key={achievement.title}>
               <achievement.Icon size={26} />
               <div><h3>{achievement.title}</h3><p>{achievement.text}</p><span>进度 {achievement.progress}%</span></div>
             </article>
@@ -1347,6 +1384,12 @@ const Loading = () => (
     <Bot size={42} />
     <h1>Connecting</h1>
     <p>正在装载身份与房间网络。</p>
+  </main>
+);
+
+const ProfileLoading = () => (
+  <main class="profile-page">
+    <div class="profile-loading-overlay" aria-label="loading user profile" />
   </main>
 );
 
@@ -1521,14 +1564,11 @@ const registerCurrentUser = async () => {
     updateLocalUser(identity.luoguName, {}, false);
   }
 };
-const profileNameFromPath = (): string => {
-  const match = decodeURIComponent(location.pathname).match(/^\/user\/([^/]+)\/?$/);
-  return match?.[1]?.trim() ?? "";
-};
 const persistUserProfile = async (name: string, profileHtml: string) => {
   updateLocalUser(name, { profileHtml });
   try {
     const user = await saveUserRecord({ name, profileHtml });
+    draft.profileEditing = false;
     updateLocalUser(user.name, user);
   } catch (error) {
     setStatus(friendlyError(error, "主页保存失败"), "error");
