@@ -21,6 +21,7 @@ export type ModerationRecord = {
 
 export type Problem = {
   pid: string;
+  platform?: "luogu" | "codeforces" | "atcoder";
   score: number;
   title?: string;
   difficulty?: number;
@@ -74,8 +75,10 @@ export type Vote = {
 export type DuelState = {
   roomId: string;
   phase: Phase;
+  rated: boolean;
   hostId?: string;
   startedAt?: number;
+  endedAt?: number;
   closed?: {
     reason: string;
     at: number;
@@ -103,6 +106,7 @@ export type DuelEvent =
       lamport: number;
       issuedAt: number;
       problems: Problem[];
+      rated?: boolean;
     }
   | {
       type: "player.joined";

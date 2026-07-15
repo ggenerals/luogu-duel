@@ -1,0 +1,5 @@
+/
+  Cache-Control: public, max-age=0, must-revalidate, s-maxage=86400, stale-while-revalidate=604800
+
+/*.html
+  Cache-Control: no-store

@@ -1,81 +1,36 @@
-const errorKey = "luogu-duel.oauth.error";
-const sessionKey = "luogu-duel.cp-session.v1";
+const sessionKey = "vjudge-duel.session.v1";
 
-export type CpSession = {
-  luoguName: string;
+export type VJudgeSession = {
+  username: string;
+  avatar?: string;
   signedInAt: number;
 };
 
-export const hasPendingCpOAuthLogin = (): boolean => false;
+export const createVJudgeChallenge = (): string =>
+  String(crypto.getRandomValues(new Uint32Array(1))[0] % 900_000 + 100_000);
 
-export const startCpOAuthLogin = async (_force = false) => {
-  const url = new URL("/api/auth/login", location.origin);
-  url.searchParams.set("returnTo", safeReturnTo());
-  location.href = url.toString();
+export const verifyVJudgeLogin = async (username: string, challenge: string): Promise<VJudgeSession> => {
+  const response = await fetch("/api/auth/vjudge/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, challenge }),
+    signal: AbortSignal.timeout(12_000)
+  });
+  const payload = (await response.json().catch(() => ({}))) as { error?: string; session?: VJudgeSession };
+  if (!response.ok || !payload.session) throw new Error(payload.error || "VJudge 验证失败");
+  localStorage.setItem(sessionKey, JSON.stringify(payload.session));
+  return payload.session;
 };
 
-export const completeCpOAuthLogin = async (): Promise<string | null> => {
-  const params = new URLSearchParams(location.search);
-  const authSession = params.get("auth_session");
-  const authError = params.get("auth_error");
-  if (authSession || authError) {
-    params.delete("auth_session");
-    params.delete("auth_error");
-    history.replaceState(null, "", `${location.pathname}${params.toString() ? `?${params}` : ""}${location.hash}`);
-  }
-  if (authSession) {
-    const session = JSON.parse(authSession) as CpSession;
-    localStorage.setItem(sessionKey, JSON.stringify(session));
-    return session.luoguName;
-  }
-  if (authError) {
-    localStorage.setItem(errorKey, authError);
+export const loadVJudgeSession = (): VJudgeSession | null => {
+  try {
+    const raw = localStorage.getItem(sessionKey);
+    if (!raw) return null;
+    const session = JSON.parse(raw) as VJudgeSession;
+    return session.username?.trim() ? session : null;
+  } catch {
     return null;
   }
-  const session = loadCpSession();
-  return session?.luoguName ?? null;
 };
 
-export const loadCpSession = (): CpSession | null => {
-  const raw = localStorage.getItem(sessionKey);
-  if (raw) return JSON.parse(raw) as CpSession;
-  const cookieSession = getCookie("luogu_duel_cp_session");
-  if (!cookieSession) return null;
-  const session = JSON.parse(cookieSession) as CpSession;
-  localStorage.setItem(sessionKey, JSON.stringify(session));
-  return session;
-};
-
-export const consumeCpOAuthError = (): string => {
-  const message = localStorage.getItem(errorKey) || getCookie("luogu_duel_oauth_error") || "";
-  localStorage.removeItem(errorKey);
-  clearCookieByName("luogu_duel_oauth_error");
-  return message;
-};
-
-export const saveCpSession = (luoguName: string): CpSession => {
-  const session = { luoguName, signedInAt: Date.now() };
-  localStorage.setItem(sessionKey, JSON.stringify(session));
-  document.cookie = `luogu_duel_cp_session=${encodeURIComponent(JSON.stringify(session))}; Path=/; Max-Age=${30 * 24 * 60 * 60}; SameSite=Lax; Secure`;
-  return session;
-};
-
-export const logoutCpSession = () => {
-  localStorage.removeItem(sessionKey);
-  clearCookieByName("luogu_duel_cp_session");
-  clearCookieByName("luogu_duel_oauth_error");
-};
-
-const getCookie = (name: string): string => {
-  const value = document.cookie.split("; ").find((row) => row.startsWith(`${name}=`))?.split("=").slice(1).join("=") || "";
-  return value ? decodeURIComponent(value) : "";
-};
-
-const clearCookieByName = (name: string) => {
-  document.cookie = `${name}=; Path=/; Max-Age=0; SameSite=Lax; Secure`;
-};
-
-const safeReturnTo = (): string => {
-  const current = `${location.pathname}${location.search}${location.hash}`;
-  return current.startsWith("/api/auth/") ? "/" : current;
-};
+export const logoutVJudgeSession = () => localStorage.removeItem(sessionKey);

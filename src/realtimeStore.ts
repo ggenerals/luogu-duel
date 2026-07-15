@@ -10,6 +10,8 @@ export type RoomListing = {
   startedAt?: number;
   endedAt?: number;
   winner?: "red" | "blue" | "draw";
+  rated?: boolean;
+  closedReason?: string;
   redPlayers?: string[];
   bluePlayers?: string[];
 };
@@ -35,10 +37,33 @@ export type ServerMessage =
   | { type: "error"; message: string };
 
 const requestTimeoutMs = 6500;
+const requestLimitPerMinute = 60;
+let requestTimes: number[] = [];
+let requestWarningHandler: (() => void) | undefined;
+
+export const setServerRequestWarningHandler = (handler: () => void) => {
+  requestWarningHandler = handler;
+};
+
+export const allowServerRequest = (): boolean => {
+  const now = Date.now();
+  requestTimes = requestTimes.filter((at) => now - at < 60_000);
+  if (requestTimes.length >= requestLimitPerMinute) {
+    requestWarningHandler?.();
+    return false;
+  }
+  requestTimes.push(now);
+  return true;
+};
+
+const requireServerRequest = () => {
+  if (!allowServerRequest()) throw new Error("操作已取消");
+};
 
 export const fetchRooms = async (): Promise<RoomListing[]> => {
+  requireServerRequest();
   const response = await fetch("/api/rooms", {
-    cache: "no-store",
+    cache: "default",
     signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`room directory failed: ${response.status}`);
@@ -47,8 +72,9 @@ export const fetchRooms = async (): Promise<RoomListing[]> => {
 };
 
 export const fetchUsers = async (): Promise<UserRecord[]> => {
+  requireServerRequest();
   const response = await fetch("/api/users", {
-    cache: "no-store",
+    cache: "default",
     signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`users request failed: ${response.status}`);
@@ -57,8 +83,9 @@ export const fetchUsers = async (): Promise<UserRecord[]> => {
 };
 
 export const fetchUserRecord = async (name: string): Promise<UserRecord | null> => {
+  requireServerRequest();
   const response = await fetch(`/api/users/${encodeURIComponent(name)}`, {
-    cache: "no-store",
+    cache: "default",
     signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (response.status === 404) return null;
@@ -68,6 +95,7 @@ export const fetchUserRecord = async (name: string): Promise<UserRecord | null> 
 };
 
 export const saveUserRecord = async (user: Partial<UserRecord> & { name: string }): Promise<UserRecord> => {
+  requireServerRequest();
   const response = await fetch(`/api/users/${encodeURIComponent(user.name)}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -79,7 +107,21 @@ export const saveUserRecord = async (user: Partial<UserRecord> & { name: string 
   return data.user;
 };
 
-export const fetchSnapshot = async (roomId: string, secret: string): Promise<SignedEnvelope[]> => {
+export const updateUserRating = async (name: string, rating: number, adminName: string): Promise<UserRecord> => {
+  requireServerRequest();
+  const response = await fetch(`/api/users/${encodeURIComponent(name)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-admin-name": adminName },
+    body: JSON.stringify({ rating }),
+    signal: AbortSignal.timeout(requestTimeoutMs)
+  });
+  if (!response.ok) throw new Error(`rating update failed: ${response.status}`);
+  const data = (await response.json()) as { user: UserRecord };
+  return data.user;
+};
+
+export const fetchSnapshot = async (roomId: string, secret: string, guard = true): Promise<SignedEnvelope[]> => {
+  if (guard) requireServerRequest();
   const response = await fetch(roomApiUrl(roomId, secret, "snapshot"), {
     cache: "no-store",
     signal: AbortSignal.timeout(requestTimeoutMs)
@@ -96,7 +138,10 @@ export const publishEnvelope = async (roomId: string, secret: string, envelope: 
     body: JSON.stringify({ envelope }),
     signal: AbortSignal.timeout(requestTimeoutMs)
   });
-  if (!response.ok) throw new Error(`room event failed: ${response.status}`);
+  if (!response.ok) {
+    const data = await response.json().catch(() => null) as { error?: string } | null;
+    throw new Error(data?.error || `room event failed: ${response.status}`);
+  }
 };
 
 export const roomWebSocketUrl = (roomId: string, secret: string): string => {

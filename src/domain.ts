@@ -25,11 +25,11 @@ const statusRank: Record<JudgeStatus, number> = {
   PD: 8
 };
 
-export const ADMIN_NAMES = new Set(["general0826","slmxf","general826", "gcend", "gcsg01"]);
+export const ADMIN_NAMES = new Set(["general0826", "slmxf", "liyifan202201", "gcend", "gcsg01"]);
 export const SYSTEM_CHAT_PREFIX = "@@luogu-duel-system:";
 
 export type SystemChatCommand =
-  | { kind: "room.configured"; problems: Problem[] }
+  | { kind: "room.configured"; problems: Problem[]; rated?: boolean }
   | { kind: "player.joined"; luoguName: string; team: Seat }
   | { kind: "player.teamChanged"; team: Seat }
   | { kind: "player.readyChanged"; ready: boolean }
@@ -45,6 +45,7 @@ export const encodeSystemChatCommand = (command: SystemChatCommand): string =>
 export const createInitialState = (roomId: string): DuelState => ({
   roomId,
   phase: roomId === "global" ? "home" : "lobby",
+  rated: true,
   players: {},
   problems: [],
   chats: [],
@@ -108,12 +109,14 @@ export const applyEvents = (roomId: string, events: DuelEvent[]): DuelState =>
     .reduce(applyEvent, createInitialState(roomId));
 
 export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
+  // A completed room is an archive. Ignore late or retried room events during replay.
+  if (state.roomId !== "global" && state.phase === "finished") return state;
   const next = cloneState(state);
   next.lamport = Math.max(next.lamport, event.lamport);
 
   switch (event.type) {
     case "room.configured":
-      configureRoom(next, event.actorId, event.problems, event.issuedAt);
+      configureRoom(next, event.actorId, event.problems, event.issuedAt, event.rated);
       break;
     case "player.joined":
       joinPlayer(next, event.actorId, event.luoguName, event.team, event.issuedAt);
@@ -135,7 +138,7 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
       }
       break;
     case "game.started":
-      if (canStart(next)) {
+      if (canAcceptStart(next)) {
         next.phase = "arena";
         next.startedAt = event.issuedAt;
         pushSystem(next, `${matchTitle(next)} 开始`, event.issuedAt);
@@ -174,7 +177,7 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
       break;
   }
 
-  updateWinner(next);
+  updateWinner(next, event.issuedAt);
   return next;
 };
 
@@ -198,8 +201,22 @@ export const canStart = (state: DuelState): boolean => {
   );
 };
 
+// Readiness is required before a host creates the start event, but not while
+// replaying that already-created event: ready events can be ordered differently
+// across clients with concurrent Lamport clocks.
+export const canAcceptStart = (state: DuelState): boolean => {
+  const players = participants(state);
+  return (
+    state.phase === "lobby" &&
+    state.problems.length > 0 &&
+    players.length >= 2 &&
+    players.some((player) => player.team === "red") &&
+    players.some((player) => player.team === "blue")
+  );
+};
+
 export const canCloseRoom = (state: DuelState, actorId: string, actorName: string): boolean =>
-  isAdminName(actorName) || (state.phase === "lobby" && state.hostId === actorId);
+  isAdminName(actorName) || (state.phase !== "finished" && state.hostId === actorId);
 
 export const visibleChats = (state: DuelState, viewerId: string): ChatMessage[] => {
   const viewer = state.players[viewerId];
@@ -246,9 +263,10 @@ export const buildVote = (
   replacement
 });
 
-const configureRoom = (state: DuelState, actorId: string, problems: Problem[], at: number) => {
+const configureRoom = (state: DuelState, actorId: string, problems: Problem[], at: number, rated = true) => {
   if (state.problems.length > 0 || problems.length === 0) return;
   state.hostId = state.hostId ?? actorId;
+  state.rated = rated;
   state.problems = sortProblemsByDifficulty(problems);
   pushSystem(state, `房间题目已生成，共 ${problems.length} 题`, at);
 };
@@ -289,7 +307,7 @@ const joinPlayer = (state: DuelState, actorId: string, luoguName: string, reques
 
 const leavePlayer = (state: DuelState, actorId: string, at: number) => {
   const player = state.players[actorId];
-  if (!player || state.phase !== "lobby") return;
+  if (!player || state.phase === "finished") return;
   delete state.players[actorId];
   delete state.muted[actorId];
   delete state.kicked[actorId];
@@ -302,7 +320,7 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
   if (!command) return false;
   switch (command.kind) {
     case "room.configured":
-      configureRoom(state, event.actorId, command.problems, event.issuedAt);
+      configureRoom(state, event.actorId, command.problems, event.issuedAt, command.rated);
       return true;
     case "player.joined":
       joinPlayer(state, event.actorId, command.luoguName, command.team, event.issuedAt);
@@ -319,7 +337,7 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
       }
       return true;
     case "game.started":
-      if (canStart(state)) {
+      if (canAcceptStart(state)) {
         state.phase = "arena";
         state.startedAt = event.issuedAt;
         pushSystem(state, `${matchTitle(state)} 开始`, event.issuedAt);
@@ -367,17 +385,31 @@ const pushChat = (state: DuelState, event: Extract<DuelEvent, { type: "chat.sent
 const closeRoom = (state: DuelState, actorId: string, actorName: string, reason: string, at: number) => {
   if (!canCloseRoom(state, actorId, actorName) || state.phase === "finished") return;
   state.phase = "finished";
+  state.endedAt = at;
   state.closed = { reason: reason.trim() || "房间已关闭", by: actorName, at };
   pushSystem(state, `房间已关闭：${state.closed.reason}`, at);
 };
 
 const kickPlayer = (state: DuelState, actorId: string, targetId: string, targetName: string | undefined, reason: string, at: number) => {
   const actor = state.players[actorId];
-  const target = state.players[targetId];
+  const resolvedTargetId = state.players[targetId]
+    ? targetId
+    : Object.values(state.players).find((player) => normalizeName(player.luoguName) === normalizeName(targetName || ""))?.id;
+  const target = resolvedTargetId ? state.players[resolvedTargetId] : undefined;
   const finalTargetName = target?.luoguName || targetName || targetId;
-  if (!actor || !isAdminName(actor.luoguName) || isAdminName(finalTargetName)) return;
+  if (!actor || state.hostId === resolvedTargetId || isAdminName(finalTargetName)) return;
+  const lobbyKick = state.phase === "lobby" && (state.hostId === actorId || isAdminName(actor.luoguName));
+  if (!lobbyKick && !isAdminName(actor.luoguName)) return;
+  if (lobbyKick) {
+    if (!target) return;
+    delete state.players[resolvedTargetId!];
+    delete state.muted[resolvedTargetId!];
+    delete state.kicked[resolvedTargetId!];
+    pushSystem(state, `${finalTargetName} 已被${state.hostId === actorId ? "房主" : "管理员"}移出准备房`, at);
+    return;
+  }
   const record: ModerationRecord = {
-    reason: reason.trim() || "管理员封禁",
+    reason: `${reason.trim() || "管理员封禁"}（请找管理员 [sLMxf](https://www.luogu.com.cn/chat?uid=752953) 解封）`,
     by: actor.luoguName,
     at
   };
@@ -442,13 +474,14 @@ const openVote = (
     createdAt
   };
   state.votes[vote.id] = vote;
-  pushSystem(state, `${nameOf(state, actorId)} 发起${voteLabel(vote)}`, createdAt);
+  pushSystem(state, vote.kind === "surrender" ? `${teamName(vote.team)}发起投降` : `${nameOf(state, actorId)} 发起${voteLabel(vote)}`, createdAt);
   settleVote(state, vote, createdAt);
 };
 
 const castVote = (state: DuelState, voteId: string, actorId: string, approve: boolean, at: number) => {
   const vote = state.votes[voteId];
   if (!vote || vote.status !== "open" || !requiredVoters(state, vote).includes(actorId)) return;
+  if (vote.kind === "surrender" && !approve) return;
   if (approve) {
     vote.approvals[actorId] = true;
     delete vote.rejections[actorId];
@@ -483,11 +516,13 @@ const settleVote = (state: DuelState, vote: Vote, at: number) => {
   }
   if (vote.kind === "draw") {
     state.phase = "finished";
+    state.endedAt = at;
     state.winner = "draw";
     pushSystem(state, "双方同意平局", at);
   }
   if (vote.kind === "surrender" && vote.team) {
     state.phase = "finished";
+    state.endedAt = at;
     state.winner = vote.team === "red" ? "blue" : "red";
     pushSystem(state, `${teamName(vote.team)} 投降`, at);
   }
@@ -525,15 +560,17 @@ const claimIfAccepted = (state: DuelState, record: FeedRecord, eventId: string) 
   }
 };
 
-const updateWinner = (state: DuelState) => {
+const updateWinner = (state: DuelState, at: number) => {
   if (state.phase === "finished" || state.problems.length === 0) return;
   const threshold = winThreshold(state);
   if (scoreOf(state, "red") >= threshold) {
     state.phase = "finished";
+    state.endedAt = at;
     state.winner = "red";
   }
   if (scoreOf(state, "blue") >= threshold) {
     state.phase = "finished";
+    state.endedAt = at;
     state.winner = "blue";
   }
 };

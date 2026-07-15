@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "luogu-duel",
+  "name": "vjudge-duel",
   "main": "src/worker.ts",
   "compatibility_date": "2026-07-09",
   "routes": [
@@ -33,9 +33,6 @@
       "new_sqlite_classes": ["DuelRoom"]
     }
   ],
-  "vars": {
-    "CP_CLIENT_ID": "1f292b1b-e3b9-44fe-9f50-5c1f1d5042f2"
-  },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1

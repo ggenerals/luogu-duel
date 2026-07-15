@@ -1,7 +1,7 @@
 {
-  "name": "luogu-duel",
+  "name": "vjudge-duel",
   "version": "1.0.0",
-  "description": "Cloudflare Durable Object powered Luogu lockout duel",
+  "description": "VJudge Duel",
   "scripts": {
     "dev": "npm run build && wrangler dev --port 7860",
     "vite:dev": "vite --host 127.0.0.1",
@@ -19,6 +19,7 @@
     "lucide-preact": "^1.23.0",
     "pako": "^3.0.1",
     "preact": "^10.29.6",
+    "sweetalert2": "^11.26.25",
     "typescript": "^6.0.3",
     "vite": "^8.1.3"
   },
