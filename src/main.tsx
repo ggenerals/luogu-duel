@@ -197,7 +197,7 @@ const boot = async () => {
     if (themeMode === "system") applyTheme();
     notify();
   });
-  clockTimer ??= window.setInterval(() => notify(), 1000);
+  clockTimer ??= window.setInterval(() => notify(), 20_000);
   syncTimer ??= window.setInterval(() => void periodicSync(), 20_000);
   window.addEventListener("hashchange", () => void enterFromHash());
   window.addEventListener("online", () => {
@@ -478,7 +478,8 @@ const replaceRoomSnapshot = async () => {
   envelopes = [];
   state = createInitialState(roomId);
   await mergeEnvelopes(remote);
-  writeEventCache(roomId, envelopes);
+  if (state.closed) localStorage.removeItem(eventCacheKey(roomId));
+  else writeEventCache(roomId, envelopes);
   saveHistory();
 };
 
@@ -1042,7 +1043,7 @@ const Home = () => (
           <DifficultyControl label="最高难度" value={draft.difficultyHigh} set={(value) => (draft.difficultyHigh = value)} />
         </div>
         <label class="wide custom-problems-field">
-          <span>自定义题目 <small>可粘贴 VJudge 链接，或填写 LG-P1000、CF-2061B、AT-abc128_a；使用后自动 UNR</small></span>
+          <span>自定义题目 <small>洛谷：B/P/T/U 开头；AtCoder：AT_abc128_a；Codeforces：CF2061B。使用后自动 UNR</small></span>
           <textarea disabled={creatingRoom} value={draft.customProblems} placeholder="每行一个题目；留空则按题库随机抽取" onInput={(event) => {
             draft.customProblems = event.currentTarget.value;
             const count = parseCustomProblems(draft.customProblems).length;
@@ -1547,6 +1548,8 @@ const forceCloseRoom = async (room: RoomListing) => {
   const envelope = await signEvent(identity, event);
   await publishEnvelope(room.roomId, room.secret, envelope);
   rooms = rooms.filter((item) => item.roomId !== room.roomId);
+  writeDirectoryCache(rooms);
+  localStorage.removeItem(eventCacheKey(room.roomId));
   setStatus(`已删除房间 ${room.roomId}`);
 };
 
@@ -1947,8 +1950,9 @@ const ProfileLoading = () => (
 );
 
 const DifficultyControl = ({ label, value, set }: { label: string; value: DifficultyLevel; set: (value: DifficultyLevel) => void }) => (
-  <label>
+  <label class="difficulty-control">
     <span>{label}</span>
+    <DifficultyBadge level={value} />
     <select disabled={creatingRoom || hasCustomProblems()} value={value} onChange={(event) => set(Number(event.currentTarget.value) as DifficultyLevel)}>
       {difficultyMeta.map((item) => (
         <option value={item.value} key={item.value}>{item.label}</option>

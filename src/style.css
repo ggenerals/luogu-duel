@@ -49,7 +49,7 @@
   --fail: #c94f3d;
   --danger-text: #a83224;
   --success-text: #166534;
-  --warning-text: #8a5a00;
+  --warning-text: #fde68a;
   --private-text: #825300;
   --gold: #996f00;
   --on-accent: #ffffff;
@@ -269,9 +269,11 @@ code {
 }
 
 .brand img {
-  width: 25px;
-  height: 25px;
-  flex: 0 0 25px;
+  width: auto;
+  height: auto;
+  max-width: 25px;
+  max-height: 25px;
+  flex: 0 1 auto;
   object-fit: contain;
 }
 
@@ -774,6 +776,11 @@ button.is-loading { cursor: wait; }
   gap: 10px;
 }
 
+.difficulty-control { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.difficulty-control > span:first-child { grid-column: 1; }
+.difficulty-control > .difficulty-badge { grid-column: 2; justify-self: end; }
+.difficulty-control > select { grid-column: 1 / -1; }
+
 .wide {
   grid-column: 1 / -1;
 }
@@ -941,6 +948,12 @@ button.is-loading { cursor: wait; }
 
 .duel-row em.finished {
   color: var(--warning-text);
+}
+
+:root[data-theme="light"] .duel-row em.finished,
+:root[data-theme="light"] .room-card em.finished {
+  -webkit-text-stroke: .25px #5f4a18;
+  paint-order: stroke fill;
 }
 
 .duel-row em.closed {
@@ -1556,8 +1569,11 @@ body .duel-swal-cancel {
 }
 
 .toast > img {
-  width: 22px;
-  height: 22px;
+  width: auto;
+  height: auto;
+  max-width: 22px;
+  max-height: 22px;
+  object-fit: contain;
   border-radius: 4px;
 }
 

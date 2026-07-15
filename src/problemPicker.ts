@@ -50,14 +50,14 @@ export const parseCustomProblems = (input: string): Problem[] => {
     } else if (/^(?:atcoder|at)-/i.test(value)) {
       platform = "atcoder";
       pid = value.replace(/^(?:atcoder|at)-/i, "");
-    } else if (/^[PB]\d+$/i.test(value)) {
-      platform = "luogu";
-      pid = value;
-    } else if (/^\d+[A-Z][A-Z0-9]*$/i.test(value)) {
-      platform = "codeforces";
-      pid = value;
-    } else if (/^[a-z]+\d+_[a-z0-9]+$/i.test(value)) {
+    } else if (/^AT_[a-z]+\d+_[a-z0-9]+$/i.test(value)) {
       platform = "atcoder";
+      pid = value.slice(3);
+    } else if (/^CF\d+[A-Z][A-Z0-9]*$/i.test(value)) {
+      platform = "codeforces";
+      pid = value.slice(2);
+    } else if (/^[BPTU]\d+$/i.test(value)) {
+      platform = "luogu";
       pid = value;
     } else {
       return [];
