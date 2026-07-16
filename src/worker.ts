@@ -102,6 +102,13 @@ export class DuelRoom extends DurableObject<Env> {
           updated_at INTEGER NOT NULL
         )
       `);
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS snapshots (
+          snapshot_key TEXT PRIMARY KEY,
+          snapshot_json TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        )
+      `);
     });
   }
 
@@ -223,6 +230,7 @@ export class DuelRoom extends DurableObject<Env> {
     this.eventsCache!.push(envelope);
     this.eventsCache!.sort(compareEnvelopes);
     this.eventIds.add(event.id);
+    this.writeSnapshot("events", this.eventsCache!);
     this.firstEvent ??= event;
     this.cachedState = applyEvent(this.cachedState.roomId === event.roomId ? this.cachedState : createInitialState(event.roomId), event);
     if (claimName && !isPlayingSeat(this.cachedState.players[event.actorId]?.team)) {
@@ -309,10 +317,16 @@ export class DuelRoom extends DurableObject<Env> {
 
   private hydrateEvents(): void {
     if (this.eventsCache) return;
-    this.eventsCache = this.ctx.storage.sql
-      .exec<{ envelope: string }>("SELECT envelope FROM events ORDER BY lamport ASC, issued_at ASC, id ASC LIMIT 1000")
-      .toArray()
-      .map((row) => JSON.parse(row.envelope) as SignedEnvelope);
+    const snapshot = this.readSnapshot<SignedEnvelope[]>("events");
+    if (snapshot) {
+      this.eventsCache = snapshot;
+    } else {
+      this.eventsCache = this.ctx.storage.sql
+        .exec<{ envelope: string }>("SELECT envelope FROM events ORDER BY lamport ASC, issued_at ASC, id ASC LIMIT 1000")
+        .toArray()
+        .map((row) => JSON.parse(row.envelope) as SignedEnvelope);
+      this.writeSnapshot("events", this.eventsCache);
+    }
     this.eventsCache.sort(compareEnvelopes);
     this.eventIds = new Set(this.eventsCache.map((item) => item.event.id));
     this.firstEvent = this.eventsCache[0]?.event ?? null;
@@ -372,6 +386,7 @@ export class DuelRoom extends DurableObject<Env> {
       this.hydrateDirectory();
       this.listingsCache!.set(body.listing.roomId, body.listing);
       await this.pruneDirectory();
+      this.writeSnapshot("directory", [...this.listingsCache!.values()]);
       if (this.listingsCache!.size > 500) await this.ctx.storage.setAlarm(Date.now() + 1_000);
       this.broadcastDirectory();
       return Response.json({ ok: true });
@@ -382,6 +397,7 @@ export class DuelRoom extends DurableObject<Env> {
         this.ctx.storage.sql.exec("DELETE FROM listings WHERE room_id = ?", body.roomId);
         this.hydrateDirectory();
         this.listingsCache!.delete(body.roomId);
+        this.writeSnapshot("directory", [...this.listingsCache!.values()]);
         this.broadcastDirectory();
       }
       return Response.json({ ok: true });
@@ -463,7 +479,7 @@ export class DuelRoom extends DurableObject<Env> {
 
   private handleClearAll(request: Request): Response {
     if (request.method !== "POST") return jsonError("method not allowed", 405);
-    for (const table of ["events", "listings", "users", "processed_results", "banned_users", "active_players"]) {
+    for (const table of ["events", "listings", "users", "processed_results", "banned_users", "active_players", "snapshots"]) {
       this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
     }
     this.eventsCache = [];
@@ -488,6 +504,7 @@ export class DuelRoom extends DurableObject<Env> {
     this.cachedState = createInitialState("");
     this.firstEvent = null;
     this.roomSecret = "";
+    this.ctx.storage.sql.exec("DELETE FROM snapshots WHERE snapshot_key = 'events'");
     return Response.json({ ok: true });
   }
 
@@ -505,6 +522,7 @@ export class DuelRoom extends DurableObject<Env> {
       const secret = listing.secret || "public-room";
       await this.env.DUEL_ROOM.getByName(`${listing.roomId}:${secret}`).fetch("https://duel.internal/clear-room", { method: "POST" });
     }
+    if (overflow.length) this.writeSnapshot("directory", [...this.listingsCache!.values()]);
   }
 
   private async isDirectoryObject(): Promise<boolean> {
@@ -538,6 +556,7 @@ export class DuelRoom extends DurableObject<Env> {
     for (const user of blueRows) this.writeUser(applyRatingDelta(user, -delta, redScore === 0));
     this.ctx.storage.sql.exec("INSERT INTO processed_results (room_id, processed_at) VALUES (?, ?)", listing.roomId, Date.now());
     this.processedResultsCache!.add(listing.roomId);
+    this.writeSnapshot("processed-results", [...this.processedResultsCache!]);
   }
 
   private readUser(name: string): UserRecord | null {
@@ -578,6 +597,7 @@ export class DuelRoom extends DurableObject<Env> {
     );
     this.hydrateUsers();
     this.usersCache!.set(key, user);
+    this.writeSnapshot("users", [...this.usersCache!.values()]);
     return user;
   }
 
@@ -594,6 +614,8 @@ export class DuelRoom extends DurableObject<Env> {
     this.hydrateBannedUsers();
     this.usersCache!.delete(key);
     this.bannedUsersCache!.add(key);
+    this.writeSnapshot("users", [...this.usersCache!.values()]);
+    this.writeSnapshot("banned-users", [...this.bannedUsersCache!]);
   }
 
   private listRooms(): RoomListing[] {
@@ -617,18 +639,27 @@ export class DuelRoom extends DurableObject<Env> {
 
   private hydrateDirectory(): void {
     if (this.listingsCache) return;
-    const rows = this.ctx.storage.sql
-      .exec<{ listing: string }>("SELECT listing FROM listings")
-      .toArray();
+    const snapshot = this.readSnapshot<RoomListing[]>("directory");
+    if (snapshot) {
+      this.listingsCache = new Map(snapshot.map((listing) => [listing.roomId, listing]));
+      return;
+    }
+    const rows = this.ctx.storage.sql.exec<{ listing: string }>("SELECT listing FROM listings").toArray();
     this.listingsCache = new Map(rows.map((row) => {
       const listing = JSON.parse(row.listing) as RoomListing;
       return [listing.roomId, listing];
     }));
+    this.writeSnapshot("directory", [...this.listingsCache.values()]);
   }
 
   private hydrateUsers(): void {
     if (this.usersCache) return;
     this.hydrateBannedUsers();
+    const snapshot = this.readSnapshot<UserRecord[]>("users");
+    if (snapshot) {
+      this.usersCache = new Map(snapshot.flatMap((user) => this.bannedUsersCache!.has(normalizeName(user.name)) ? [] : [[normalizeName(user.name), user]]));
+      return;
+    }
     const rows = this.ctx.storage.sql
       .exec<{ user_json: string }>("SELECT user_json FROM users")
       .toArray();
@@ -642,22 +673,57 @@ export class DuelRoom extends DurableObject<Env> {
       }
       if (!this.bannedUsersCache!.has(key)) this.usersCache.set(key, user);
     }
+    this.writeSnapshot("users", [...this.usersCache.values()]);
   }
 
   private hydrateBannedUsers(): void {
     if (this.bannedUsersCache) return;
+    const snapshot = this.readSnapshot<string[]>("banned-users");
+    if (snapshot) {
+      this.bannedUsersCache = new Set(snapshot);
+      return;
+    }
     const rows = this.ctx.storage.sql
       .exec<{ name_key: string }>("SELECT name_key FROM banned_users")
       .toArray();
     this.bannedUsersCache = new Set(rows.map((row) => row.name_key));
+    this.writeSnapshot("banned-users", [...this.bannedUsersCache]);
   }
 
   private hydrateProcessedResults(): void {
     if (this.processedResultsCache) return;
+    const snapshot = this.readSnapshot<string[]>("processed-results");
+    if (snapshot) {
+      this.processedResultsCache = new Set(snapshot);
+      return;
+    }
     const rows = this.ctx.storage.sql
       .exec<{ room_id: string }>("SELECT room_id FROM processed_results")
       .toArray();
     this.processedResultsCache = new Set(rows.map((row) => row.room_id));
+    this.writeSnapshot("processed-results", [...this.processedResultsCache]);
+  }
+
+  private readSnapshot<T>(key: string): T | null {
+    const row = this.ctx.storage.sql
+      .exec<{ snapshot_json: string }>("SELECT snapshot_json FROM snapshots WHERE snapshot_key = ? LIMIT 1", key)
+      .toArray()[0];
+    if (!row) return null;
+    try {
+      return JSON.parse(row.snapshot_json) as T;
+    } catch {
+      this.ctx.storage.sql.exec("DELETE FROM snapshots WHERE snapshot_key = ?", key);
+      return null;
+    }
+  }
+
+  private writeSnapshot(key: string, value: unknown): void {
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO snapshots (snapshot_key, snapshot_json, updated_at) VALUES (?, ?, ?)",
+      key,
+      JSON.stringify(value),
+      Date.now()
+    );
   }
 
   private async rememberSecret(secret: string): Promise<void> {
@@ -687,7 +753,7 @@ export class DuelRoom extends DurableObject<Env> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (env.MAINTENANCE === "1" && !url.pathname.startsWith("/api/admin/clear-all")) {
       return new Response(maintenanceHtml(), {
@@ -696,14 +762,17 @@ export default {
       });
     }
     if (url.pathname === "/api/auth/vjudge/verify" && request.method === "POST") return verifyVJudgeLogin(request, env);
-    if (url.pathname === "/api/problem-bank/atcoder" && request.method === "GET") return proxyAtCoderProblemModels();
+    const problemBankMatch = url.pathname.match(/^\/api\/problem-bank\/(luogu|codeforces|atcoder)$/);
+    if (problemBankMatch && request.method === "GET") {
+      return proxyProblemBank(request, problemBankMatch[1] as ProblemBankSource, ctx);
+    }
     if (url.pathname === "/api/vjudge/status" && request.method === "GET") return fetchVJudgeStatus(url);
     if (url.pathname === "/api/rooms" && request.method === "GET") {
-      return cachedDirectoryResponse(request, env, "https://duel.internal/directory");
+      return directoryJsonResponse(request, env, "https://duel.internal/directory");
     }
     if (url.pathname === "/api/rooms/ws") return env.DUEL_ROOM.getByName("__directory").fetch(new Request("https://duel.internal/directory/ws", request));
     if (url.pathname === "/api/users" && request.method === "GET") {
-      return cachedDirectoryResponse(request, env, "https://duel.internal/users");
+      return directoryJsonResponse(request, env, "https://duel.internal/users");
     }
     if (url.pathname === "/api/admin/clear-all" && request.method === "POST") {
       return env.DUEL_ROOM.getByName("__directory").fetch("https://duel.internal/clear-all", request);
@@ -735,21 +804,54 @@ export default {
   }
 };
 
-const proxyAtCoderProblemModels = async (): Promise<Response> => {
+type ProblemBankSource = "luogu" | "codeforces" | "atcoder";
+
+const problemBankSources: Record<ProblemBankSource, { url: string; accept: string }> = {
+  luogu: {
+    url: "https://cdn.luogu.com.cn/problemset-open/latest.ndjson.gz",
+    accept: "application/gzip, application/octet-stream"
+  },
+  codeforces: {
+    url: "https://codeforces.com/api/problemset.problems",
+    accept: "application/json"
+  },
+  atcoder: {
+    url: "https://kenkoooo.com/atcoder/resources/problem-models.json",
+    accept: "application/json"
+  }
+};
+
+const problemBankCacheSeconds = 30 * 24 * 60 * 60;
+
+const proxyProblemBank = async (request: Request, source: ProblemBankSource, ctx: ExecutionContext): Promise<Response> => {
   try {
-    const upstream = await fetch("https://kenkoooo.com/atcoder/resources/problem-models.json", {
-      headers: { accept: "application/json" },
-      cf: { cacheEverything: true, cacheTtl: 30 * 24 * 60 * 60 },
-      signal: AbortSignal.timeout(30_000)
+    const cacheUrl = new URL(request.url);
+    cacheUrl.search = "";
+    const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+    const cache = (caches as CacheStorage & { default: Cache }).default;
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
+
+    const config = problemBankSources[source];
+    const upstream = await fetch(config.url, {
+      headers: { accept: config.accept },
+      cf: { cacheEverything: true, cacheTtl: problemBankCacheSeconds },
+      signal: AbortSignal.timeout(60_000)
     });
-    if (!upstream.ok) return jsonError(`AtCoder problem models upstream returned ${upstream.status}`, 502);
+    if (!upstream.ok) return jsonError(`${source} problem bank upstream returned ${upstream.status}`, 502);
+
     const headers = new Headers(upstream.headers);
-    headers.set("content-type", "application/json; charset=utf-8");
-    headers.set("cache-control", "public, max-age=2592000, s-maxage=2592000, stale-while-revalidate=604800");
+    headers.set("cache-control", `public, max-age=${problemBankCacheSeconds}, s-maxage=${problemBankCacheSeconds}`);
     headers.delete("set-cookie");
-    return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
+    const response = new Response(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers
+    });
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    return response;
   } catch (error) {
-    return jsonError(error instanceof Error ? error.message : "AtCoder problem models proxy failed", 502);
+    return jsonError(error instanceof Error ? error.message : `${source} problem bank proxy failed`, 502);
   }
 };
 
@@ -784,26 +886,31 @@ const fetchVJudgeStatus = async (requestUrl: URL): Promise<Response> => {
   }
 };
 
-const cachedDirectoryResponse = async (request: Request, env: Env, internalUrl: string): Promise<Response> => {
-  const cacheKey = new Request(request.url, { method: "GET" });
-  const cache = (caches as CacheStorage & { default: Cache }).default;
-  const cached = await cache.match(cacheKey);
-  if (cached) return cached;
+const directoryJsonResponse = async (request: Request, env: Env, internalUrl: string): Promise<Response> => {
+  try {
+    const publicUrl = new URL(request.url);
+    publicUrl.search = "";
+    const cacheKey = new Request(publicUrl.toString(), { method: "GET" });
+    const cache = (caches as CacheStorage & { default: Cache }).default;
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
 
-  const response = await env.DUEL_ROOM.getByName("__directory").fetch(internalUrl);
-  if (!response.ok) return response;
-
-  const headers = new Headers(response.headers);
-  // Browsers revalidate immediately; the shared edge cache shields the directory
-  // Durable Object from HTTP fallback polling between WebSocket updates.
-  headers.set("cache-control", "public, max-age=0, must-revalidate, s-maxage=15, stale-while-revalidate=60");
-  const cacheable = new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
-  await cache.put(cacheKey, cacheable.clone());
-  return cacheable;
+    const response = await env.DUEL_ROOM.getByName("__directory").fetch(internalUrl);
+    if (!response.ok) return jsonError(`directory returned ${response.status}`, response.status);
+    const payload = await response.json();
+    const body = JSON.stringify(payload);
+    const complete = new Response(body, {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": String(new TextEncoder().encode(body).byteLength),
+        "cache-control": "public, max-age=20, s-maxage=20, stale-while-revalidate=20"
+      }
+    });
+    await cache.put(cacheKey, complete.clone());
+    return complete;
+  } catch (error) {
+    return jsonError(error instanceof Error ? error.message : "directory response incomplete", 502);
+  }
 };
 
 const verifyVJudgeLogin = async (request: Request, env: Env): Promise<Response> => {

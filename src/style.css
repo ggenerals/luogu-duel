@@ -30,7 +30,6 @@
   --overlay-bg: rgb(13 17 23 / 0.94);
   --toast-bg: rgb(13 17 23 / 0.96);
   --shadow: 0 18px 44px rgb(0 0 0 / 0.4);
-  --difficulty-outline: #ffffff;
 }
 
 :root[data-theme="light"] {
@@ -59,7 +58,6 @@
   --overlay-bg: rgba(244, 247, 251, 0.94);
   --toast-bg: rgba(255, 255, 255, 0.98);
   --shadow: 0 18px 44px rgb(31 41 51 / 0.16);
-  --difficulty-outline: #000000;
 }
 
 html,
@@ -776,10 +774,14 @@ button.is-loading { cursor: wait; }
   gap: 10px;
 }
 
-.difficulty-control { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
-.difficulty-control > span:first-child { grid-column: 1; }
-.difficulty-control > .difficulty-badge { grid-column: 2; justify-self: end; }
-.difficulty-control > select { grid-column: 1 / -1; }
+.difficulty-select {
+  color: var(--difficulty-color);
+  font-weight: 900;
+}
+
+:root[data-theme="dark"] .difficulty-select[data-difficulty="8"] {
+  color: #f1e296;
+}
 
 .wide {
   grid-column: 1 / -1;
@@ -1245,9 +1247,12 @@ img.chat-avatar {
 .difficulty-badge {
   border-color: color-mix(in srgb, var(--difficulty-color) 55%, var(--line));
   color: var(--difficulty-color);
-  -webkit-text-stroke: .3px var(--difficulty-outline);
-  paint-order: stroke fill;
   font-weight: 900;
+}
+
+:root[data-theme="dark"] .difficulty-badge[data-difficulty="8"] {
+  border-color: color-mix(in srgb, #f1e296 55%, var(--line));
+  color: #f1e296;
 }
 
 .chat {
@@ -1487,6 +1492,17 @@ img.chat-avatar {
 
 .paste-login strong {
   color: var(--text);
+}
+
+.login-mark {
+  color: var(--green);
+  filter: drop-shadow(0 6px 14px color-mix(in srgb, var(--green) 24%, transparent));
+}
+
+.login-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
 }
 
 .paste-login > span {

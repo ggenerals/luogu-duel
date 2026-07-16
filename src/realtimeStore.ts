@@ -63,7 +63,7 @@ const requireServerRequest = () => {
 export const fetchRooms = async (): Promise<RoomListing[]> => {
   requireServerRequest();
   const response = await fetch("/api/rooms", {
-    cache: "default",
+    cache: "no-store",
     signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`room directory failed: ${response.status}`);
@@ -74,7 +74,7 @@ export const fetchRooms = async (): Promise<RoomListing[]> => {
 export const fetchUsers = async (): Promise<UserRecord[]> => {
   requireServerRequest();
   const response = await fetch("/api/users", {
-    cache: "default",
+    cache: "no-store",
     signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`users request failed: ${response.status}`);

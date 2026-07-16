@@ -16,6 +16,7 @@ import {
   Flame,
   Flag,
   Handshake,
+  KeyRound,
   LogOut,
   Medal,
   MessageSquare,
@@ -95,11 +96,14 @@ let socket: WebSocket | null = null;
 let directorySocket: WebSocket | null = null;
 let reconnectTimer: number | undefined;
 let directoryReconnectTimer: number | undefined;
-let lastDirectoryHttpSync = 0;
+let roomReconnectAttempts = 0;
+let directoryReconnectAttempts = 0;
 let directoryLiveSnapshotReceived = false;
+let lastDirectoryLiveAt = 0;
 let finishReturnTimer: number | undefined;
 let clockTimer: number | undefined;
 let syncTimer: number | undefined;
+let syncInFlight = false;
 let statusText = "booting...";
 let statusTone: "info" | "error" = "info";
 let authErrorText = "";
@@ -116,8 +120,8 @@ let toasts: ToastMessage[] = [];
 const notifiedKeys = new Set<string>();
 const joinDeniedRooms = new Set<string>();
 const systemLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/tq5l4861.png";
-const darkBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/giufbahf.png";
-const lightBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/tq5l4861.png";
+const darkBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/nd1187ou.png";
+const lightBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/nd1187ou.png";
 const avatarCacheKey = "luogu-duel.avatar-cache.v1";
 const userCacheKey = "luogu-duel.user-cache.v1";
 const registrationCacheKey = "luogu-duel.registration-cache.v1";
@@ -283,7 +287,7 @@ const loadDirectory = async () => {
     await refreshGlobalModeration();
     if (mode === "home") state = globalModeration;
     const remoteRooms = await fetchRooms();
-    if (!directoryLiveSnapshotReceived) {
+    if (!directoryLiveSnapshotReceived || Date.now() - lastDirectoryLiveAt >= 20_000) {
       rooms = remoteRooms;
       writeDirectoryCache(rooms);
     }
@@ -346,18 +350,20 @@ const loadSnapshot = async () => {
 };
 
 const periodicSync = async () => {
-  if (bootPhase !== "ready") return;
-  if (mode === "home" || mode === "profile") {
-    connectDirectory();
-    if (directorySocket?.readyState === WebSocket.OPEN) return;
-    if (Date.now() - lastDirectoryHttpSync < 5 * 60_000) return;
-    lastDirectoryHttpSync = Date.now();
-    await Promise.all([loadDirectory(), loadUsers()]);
-  } else {
-    if (socket?.readyState === WebSocket.OPEN) return;
-    await loadSnapshot();
+  if (bootPhase !== "ready" || syncInFlight) return;
+  syncInFlight = true;
+  try {
+    if (mode === "home" || mode === "profile" || mode === "admin") {
+      connectDirectory();
+      await Promise.all([loadDirectory(), loadUsers()]);
+    } else {
+      if (socket?.readyState !== WebSocket.OPEN && socket?.readyState !== WebSocket.CONNECTING) connectRoom();
+      await loadSnapshot();
+    }
+  } finally {
+    syncInFlight = false;
+    notify();
   }
-  notify();
 };
 
 const connectRoom = () => {
@@ -366,6 +372,7 @@ const connectRoom = () => {
   closeSocket(false);
   socket = new WebSocket(roomWebSocketUrl(roomId, roomSecret));
   socket.addEventListener("open", () => {
+    roomReconnectAttempts = 0;
     statusTone = "info";
     statusText = "WebSocket 已连接";
     notify();
@@ -376,7 +383,9 @@ const connectRoom = () => {
     if (mode === "room") {
       statusTone = "error";
       statusText = "连接休眠或断开，正在重连";
-      reconnectTimer = window.setTimeout(connectRoom, 1200);
+      const delay = Math.min(60_000, 3_000 * 2 ** Math.min(roomReconnectAttempts, 5));
+      roomReconnectAttempts += 1;
+      reconnectTimer = window.setTimeout(connectRoom, delay);
       notify();
     }
   });
@@ -395,12 +404,13 @@ const closeSocket = (clearTimer = true) => {
 };
 
 const connectDirectory = () => {
-  if (mode !== "home" && mode !== "profile" && mode !== "admin") return;
+  if (mode !== "home" && mode !== "admin") return;
   if (directorySocket?.readyState === WebSocket.OPEN || directorySocket?.readyState === WebSocket.CONNECTING) return;
   if (!allowServerRequest()) return;
   closeDirectory(false);
   directorySocket = new WebSocket(directoryWebSocketUrl());
   directorySocket.addEventListener("open", () => {
+    directoryReconnectAttempts = 0;
     statusTone = "info";
     statusText = "大厅实时连接已建立";
     notify();
@@ -408,10 +418,12 @@ const connectDirectory = () => {
   directorySocket.addEventListener("message", (event) => void handleDirectoryMessage(event.data));
   directorySocket.addEventListener("close", () => {
     directorySocket = null;
-    if (mode === "home" || mode === "profile") {
+    if (mode === "home" || mode === "admin") {
       statusTone = "error";
       statusText = "大厅实时连接断开，使用低频 HTTP 兜底";
-      directoryReconnectTimer = window.setTimeout(connectDirectory, 5000);
+      const delay = Math.min(120_000, 10_000 * 2 ** Math.min(directoryReconnectAttempts, 4));
+      directoryReconnectAttempts += 1;
+      directoryReconnectTimer = window.setTimeout(connectDirectory, delay);
       notify();
     }
   });
@@ -435,6 +447,7 @@ const handleDirectoryMessage = async (raw: string) => {
     rooms = message.rooms;
     writeDirectoryCache(rooms);
     directoryLiveSnapshotReceived = true;
+    lastDirectoryLiveAt = Date.now();
     statusTone = "info";
     statusText = "大厅在线";
   }
@@ -545,7 +558,10 @@ const emit = async (event: DuelEvent) => {
 const pushToastsForEvent = (event: DuelEvent, previousPhase: DuelState["phase"], previousSystemCount: number) => {
   if (mode !== "room" && event.roomId !== "global") return;
   if (event.type === "game.started") {
-    notifyImportant(`start:${roomId}:${state.startedAt ?? event.issuedAt}:${matchTitle()}`, "比赛开始", matchTitle(), "success");
+    const elapsed = Date.now() - (state.startedAt ?? event.issuedAt);
+    if (elapsed >= 0 && elapsed < 5_000) {
+      notifyImportant(`start:${roomId}:${state.startedAt ?? event.issuedAt}:${matchTitle()}`, "比赛开始", matchTitle(), "success");
+    }
   }
   if (previousPhase !== "finished" && state.phase === "finished") {
     const text = state.closed?.reason ?? (state.winner === "draw" ? "双方平局" : `${teamName(state.winner)} 获胜`);
@@ -1427,11 +1443,12 @@ const ratingRows = (): RatingRow[] => {
 const AdminPage = () => {
   if (!isAdmin()) return <main class="center-screen"><Shield size={42} /><h1>无管理员权限</h1></main>;
   const rows = ratingRows();
+  const managedRooms = rooms.filter((room) => (room.status === "lobby" || room.status === "arena") && !isClosedListing(room));
   return (
     <main class="admin-page">
       <header class="admin-page-head">
         <div><Shield size={22} /><span><h1>管理中心</h1><p>当前管理员：{identity.luoguName}</p></span></div>
-        <div class="admin-stats"><strong>{rows.length}</strong><span>玩家</span><strong>{rooms.length}</strong><span>房间</span></div>
+        <div class="admin-stats"><strong>{rows.length}</strong><span>玩家</span><strong>{managedRooms.length}</strong><span>活跃房间</span></div>
         <button class="ghost" onClick={() => void Promise.all([loadDirectory(), loadUsers()])}><RefreshCw size={15} />刷新</button>
       </header>
 
@@ -1464,19 +1481,18 @@ const AdminPage = () => {
       </section>
 
       <section class="panel admin-section">
-        <div class="admin-section-head"><div><h2>房间管理</h2><p>显示目录中的全部房间，可强制关闭未结束房间。</p></div></div>
+        <div class="admin-section-head"><div><h2>房间管理</h2><p>仅显示准备中或进行中的房间。</p></div></div>
         <div class="admin-room-list">
-          {rooms.length ? rooms.map((room) => {
+          {managedRooms.length ? managedRooms.map((room) => {
             const busy = adminBusy.has(`room:${room.roomId}`);
-            const closed = isClosedListing(room) || room.status === "finished";
             return (
               <article class="admin-room" key={room.roomId}>
                 <code>{room.roomId}</code>
                 <span><strong>{room.host}</strong><small>{roomStatusLabel(room)} · {playerCount(room)} 人 · {room.problemCount} 题</small></span>
-                <button class="danger" disabled={busy || closed} onClick={() => void runForceCloseRoom(room)}>{busy ? <RefreshCw class="spin" size={14} /> : <Trash2 size={14} />}{closed ? "已关闭" : "强制关闭"}</button>
+                <button class="danger" disabled={busy} onClick={() => void runForceCloseRoom(room)}>{busy ? <RefreshCw class="spin" size={14} /> : <Trash2 size={14} />}强制关闭</button>
               </article>
             );
-          }) : <p class="muted">暂无房间。</p>}
+          }) : <p class="muted">暂无准备中或进行中的房间。</p>}
         </div>
       </section>
     </main>
@@ -1874,11 +1890,11 @@ const BanOverlay = () => {
 const AuthError = () => (
   <Shell title="VJudge Duel" subtitle="login">
     <main class="center-screen">
-      <Bot size={42} />
+      <KeyRound class="login-mark" size={40} strokeWidth={1.8} />
       <h1>请登录</h1>
       <p>{authErrorText}</p>
       <form class="paste-login" onSubmit={(event) => void submitVJudgeLogin(event)}>
-        <strong>VJudge 登录</strong>
+        <strong class="login-title"><KeyRound size={17} />VJudge 登录</strong>
         <ol class="login-guide">
           <li>输入你的 VJudge 用户名。</li>
           <li>登录 VJudge 后，点击右上角自己的用户名，选择“更新资料”。</li>
@@ -1952,10 +1968,19 @@ const ProfileLoading = () => (
 const DifficultyControl = ({ label, value, set }: { label: string; value: DifficultyLevel; set: (value: DifficultyLevel) => void }) => (
   <label class="difficulty-control">
     <span>{label}</span>
-    <DifficultyBadge level={value} />
-    <select disabled={creatingRoom || hasCustomProblems()} value={value} onChange={(event) => set(Number(event.currentTarget.value) as DifficultyLevel)}>
+    <select
+      class="difficulty-select"
+      data-difficulty={value}
+      disabled={creatingRoom || hasCustomProblems()}
+      style={{ "--difficulty-color": difficultyMeta.find((item) => item.value === value)?.color ?? "#6b7280" } as JSX.CSSProperties}
+      value={value}
+      onChange={(event) => {
+        set(Number(event.currentTarget.value) as DifficultyLevel);
+        notify();
+      }}
+    >
       {difficultyMeta.map((item) => (
-        <option value={item.value} key={item.value}>{item.label}</option>
+        <option style={{ color: item.value === 8 && document.documentElement.dataset.theme === "dark" ? "#f1e296" : item.color }} value={item.value} key={item.value}>{item.label}</option>
       ))}
     </select>
   </label>
@@ -1963,7 +1988,7 @@ const DifficultyControl = ({ label, value, set }: { label: string; value: Diffic
 
 const DifficultyBadge = ({ level }: { level: number }) => {
   const meta = difficultyMeta.find((item) => item.value === level);
-  return <span class="difficulty-badge" style={{ "--difficulty-color": meta?.color ?? "#6b7280" } as JSX.CSSProperties}>{meta?.short ?? level}</span>;
+  return <span class="difficulty-badge" data-difficulty={level} style={{ "--difficulty-color": meta?.color ?? "#6b7280" } as JSX.CSSProperties}>{meta?.short ?? level}</span>;
 };
 
 const History = () => {

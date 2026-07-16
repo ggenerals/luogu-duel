@@ -11,8 +11,8 @@ const cacheAge = 30 * 24 * 60 * 60 * 1000;
 const platforms: ProblemPlatform[] = ["luogu", "codeforces", "atcoder"];
 const memoryBanks = new Map<ProblemPlatform, BankItem[]>();
 const sources: Record<ProblemPlatform, string> = {
-  luogu: "https://cdn.luogu.com.cn/problemset-open/latest.ndjson.gz",
-  codeforces: "https://codeforces.com/api/problemset.problems",
+  luogu: "/api/problem-bank/luogu",
+  codeforces: "/api/problem-bank/codeforces",
   atcoder: "/api/problem-bank/atcoder"
 };
 const labels: Record<ProblemPlatform, string> = {
@@ -90,22 +90,22 @@ export const pickProblems = async (
 
   const banks = await Promise.all(platforms.map((platform) => loadBank(platform, progress)));
   const quotas = distribute(count, requested);
-  const minimum = Math.min(low, high);
-  const maximum = Math.max(low, high);
+  const minimum = Math.min(low, high) as DifficultyLevel;
+  const maximum = Math.max(low, high) as DifficultyLevel;
   const all: BankItem[] = [];
 
   for (let index = 0; index < platforms.length; index += 1) {
     const platform = platforms[index];
     if (requested[platform] === 0) continue;
     const bank = banks[index].filter((item) => item.difficulty >= minimum && item.difficulty <= maximum);
-    all.push(...seededSample(bank, Math.min(quotas[platform], bank.length), `${seed}:${platform}`));
+    all.push(...balancedDifficultySample(bank, Math.min(quotas[platform], bank.length), minimum, maximum, `${seed}:${platform}`));
   }
 
   if (all.length < count) {
     const used = new Set(all.map((item) => `${item.platform}:${item.pid}`));
     const fallback = banks.flatMap((bank, index) => requested[platforms[index]] > 0 ? bank : [])
       .filter((item) => item.difficulty >= minimum && item.difficulty <= maximum && !used.has(`${item.platform}:${item.pid}`));
-    all.push(...seededSample(fallback, count - all.length, `${seed}:fill`));
+    all.push(...balancedDifficultySample(fallback, count - all.length, minimum, maximum, `${seed}:fill`));
   }
 
   if (all.length < count) throw new Error(`所选 OJ 和难度范围内只有 ${all.length} 道可用题目`);
@@ -224,6 +224,37 @@ const writeCache = (platform: ProblemPlatform, items: BankItem[]): void => {
   } catch {
     // The 26 MB Luogu source may exceed a browser's storage quota; memory caching still works.
   }
+};
+const balancedDifficultySample = <T extends { difficulty: DifficultyLevel }>(
+  items: T[],
+  count: number,
+  low: DifficultyLevel,
+  high: DifficultyLevel,
+  seed: string
+): T[] => {
+  if (count <= 0 || !items.length) return [];
+  const groups = new Map<DifficultyLevel, T[]>();
+  for (let level = low; level <= high; level += 1) {
+    const candidates = items.filter((item) => item.difficulty === level);
+    if (candidates.length) groups.set(level as DifficultyLevel, seededSample(candidates, candidates.length, `${seed}:difficulty:${level}`));
+  }
+  const levels = seededSample([...groups.keys()], groups.size, `${seed}:difficulty-order`);
+  const offsets = new Map(levels.map((level) => [level, 0]));
+  const selected: T[] = [];
+  while (selected.length < count) {
+    let added = false;
+    for (const level of levels) {
+      if (selected.length >= count) break;
+      const offset = offsets.get(level) ?? 0;
+      const candidate = groups.get(level)?.[offset];
+      if (!candidate) continue;
+      selected.push(candidate);
+      offsets.set(level, offset + 1);
+      added = true;
+    }
+    if (!added) break;
+  }
+  return selected;
 };
 const seededSample = <T>(items: T[], count: number, seed: string): T[] => {
   const rng = seeded(seed);
