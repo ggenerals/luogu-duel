@@ -7,6 +7,8 @@ import type { DuelEvent, SignedEnvelope } from "./types";
 type Env = {
   DUEL_ROOM: DurableObjectNamespace<DuelRoom>;
   ASSETS: Fetcher;
+  API_RATE_LIMITER: RateLimit;
+  JUDGE_RATE_LIMITER: RateLimit;
   MAINTENANCE?: string;
 };
 
@@ -38,10 +40,9 @@ type UserRecord = {
   updatedAt: number;
 };
 
-type ClientMessage = { type: "event"; envelope: SignedEnvelope };
+type ClientMessage = { type: "event"; envelope: SignedEnvelope } | { type: "ping"; at?: number };
 type SocketKind = "room" | "directory";
 
-const bannedAvatarUrl = "https://cdn.luogu.com.cn/images/banned.png";
 const adminNames = new Set(["general0826", "slmxf", "liyifan202201", "gcend", "gcsg01"]);
 
 export class DuelRoom extends DurableObject<Env> {
@@ -130,7 +131,7 @@ export class DuelRoom extends DurableObject<Env> {
       return Response.json({ envelopes: this.listEvents() });
     }
     if (url.pathname.endsWith("/event") && request.method === "POST") {
-      const body = (await request.json()) as Partial<ClientMessage>;
+      const body = (await request.json()) as { envelope?: SignedEnvelope };
       if (!body.envelope) return jsonError("missing envelope", 400);
       try {
         const saved = await this.acceptEnvelope(body.envelope);
@@ -146,8 +147,12 @@ export class DuelRoom extends DurableObject<Env> {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== "string") return;
     try {
-      const data = JSON.parse(message) as Partial<ClientMessage>;
+      const data = JSON.parse(message) as { type?: ClientMessage["type"]; at?: number; envelope?: SignedEnvelope };
       const attachment = ws.deserializeAttachment() as { kind?: SocketKind } | undefined;
+      if (data.type === "ping") {
+        ws.send(JSON.stringify({ type: "pong", at: Date.now() }));
+        return;
+      }
       if (attachment?.kind === "directory") return;
       if (data.type !== "event" || !data.envelope) return;
       const saved = await this.acceptEnvelope(data.envelope);
@@ -218,6 +223,7 @@ export class DuelRoom extends DurableObject<Env> {
           : "";
     const previousPhase = this.cachedState.phase;
     const previousDirectoryFingerprint = directoryFingerprint(this.cachedState);
+    const previousLastEnvelope = this.eventsCache!.at(-1);
 
     this.ctx.storage.sql.exec(
       "INSERT INTO events (id, room_id, issued_at, lamport, envelope) VALUES (?, ?, ?, ?, ?)",
@@ -232,7 +238,9 @@ export class DuelRoom extends DurableObject<Env> {
     this.eventIds.add(event.id);
     this.writeSnapshot("events", this.eventsCache!);
     this.firstEvent ??= event;
-    this.cachedState = applyEvent(this.cachedState.roomId === event.roomId ? this.cachedState : createInitialState(event.roomId), event);
+    this.cachedState = !previousLastEnvelope || compareEnvelopes(previousLastEnvelope, envelope) <= 0
+      ? applyEvent(this.cachedState.roomId === event.roomId ? this.cachedState : createInitialState(event.roomId), event)
+      : applyEvents(event.roomId, this.eventsCache!.map((item) => item.event));
     if (claimName && !isPlayingSeat(this.cachedState.players[event.actorId]?.team)) {
       await this.releaseActivePlayer(claimName, event.roomId);
     }
@@ -340,12 +348,17 @@ export class DuelRoom extends DurableObject<Env> {
     const directory = this.env.DUEL_ROOM.getByName("__directory");
     const firstEvent = this.firstEvent ?? latestEvent;
     const firstPlayer = Object.values(state.players)[0];
+    const declaredHost = firstEvent.type === "room.configured"
+      ? firstEvent.hostName
+      : latestEvent.type === "room.configured"
+        ? latestEvent.hostName
+        : undefined;
     const redPlayers = Object.values(state.players).filter((player) => player.team === "red").map((player) => player.luoguName);
     const bluePlayers = Object.values(state.players).filter((player) => player.team === "blue").map((player) => player.luoguName);
     const listing: RoomListing = {
       roomId,
       secret: "",
-      host: state.players[state.hostId ?? ""]?.luoguName ?? firstPlayer?.luoguName ?? "unknown",
+      host: state.players[state.hostId ?? ""]?.luoguName ?? firstPlayer?.luoguName ?? declaredHost ?? "待同步",
       createdAt: firstEvent.issuedAt,
       problemCount: state.problems.length,
       status: state.closed || state.phase === "finished" ? "finished" : state.phase === "arena" ? "arena" : "lobby",
@@ -375,6 +388,11 @@ export class DuelRoom extends DurableObject<Env> {
       await this.ctx.storage.put("directory-object", true);
       const body = (await request.json()) as { listing?: RoomListing };
       if (!body.listing?.roomId) return jsonError("missing listing", 400);
+      this.hydrateDirectory();
+      const previous = this.listingsCache!.get(body.listing.roomId);
+      if ((body.listing.host === "unknown" || body.listing.host === "待同步") && previous?.host && previous.host !== "unknown" && previous.host !== "待同步") {
+        body.listing.host = previous.host;
+      }
       this.ctx.storage.sql.exec(
         "INSERT OR REPLACE INTO listings (room_id, listing, updated_at) VALUES (?, ?, ?)",
         body.listing.roomId,
@@ -383,7 +401,6 @@ export class DuelRoom extends DurableObject<Env> {
       );
       this.registerListingUsers(body.listing);
       this.applyFinishedListingResult(body.listing);
-      this.hydrateDirectory();
       this.listingsCache!.set(body.listing.roomId, body.listing);
       await this.pruneDirectory();
       this.writeSnapshot("directory", [...this.listingsCache!.values()]);
@@ -456,11 +473,6 @@ export class DuelRoom extends DurableObject<Env> {
       const requestedRating = typeof body.rating === "number" && Number.isFinite(body.rating) ? Math.round(body.rating) : undefined;
       if (requestedRating !== undefined && !adminNames.has(normalizeName(request.headers.get("x-admin-name") || ""))) {
         return jsonError("admin required", 403);
-      }
-      if (isBannedAvatar(body.avatar)) {
-        this.removeUser(name);
-        this.broadcastDirectory();
-        return jsonError("user is banned", 410);
       }
       this.hydrateBannedUsers();
       if (this.bannedUsersCache!.has(normalizeName(name))) return jsonError("user is banned", 410);
@@ -583,10 +595,6 @@ export class DuelRoom extends DurableObject<Env> {
 
   private writeUser(user: UserRecord): UserRecord {
     const key = normalizeName(user.name);
-    if (isBannedAvatar(user.avatar)) {
-      this.removeUser(user.name);
-      return user;
-    }
     this.hydrateBannedUsers();
     if (this.bannedUsersCache!.has(key)) return user;
     this.ctx.storage.sql.exec(
@@ -622,6 +630,9 @@ export class DuelRoom extends DurableObject<Env> {
     this.hydrateDirectory();
     const maxAge = Date.now() - 30 * 24 * 60 * 60 * 1000;
     return [...this.listingsCache!.values()]
+      .map((room) => room.host === "unknown" || room.host === "待同步"
+        ? { ...room, host: room.redPlayers?.[0] ?? room.bluePlayers?.[0] ?? "待同步" }
+        : room)
       .map((room) => room.status === "lobby" && Date.now() - room.createdAt >= 10 * 60_000
         ? { ...room, status: "finished" as const, endedAt: room.createdAt + 10 * 60_000, closedReason: "房间创建 10 分钟仍未开始，已自动关闭" }
         : room)
@@ -633,6 +644,7 @@ export class DuelRoom extends DurableObject<Env> {
   private listUsers(): UserRecord[] {
     this.hydrateUsers();
     return [...this.usersCache!.values()]
+      .filter((user) => !isPlaceholderName(user.name))
       .sort((a, b) => b.rating - a.rating || b.wins - a.wins || a.name.localeCompare(b.name))
       .slice(0, 1000);
   }
@@ -667,10 +679,6 @@ export class DuelRoom extends DurableObject<Env> {
     for (const row of rows) {
       const user = JSON.parse(row.user_json) as UserRecord;
       const key = normalizeName(user.name);
-      if (isBannedAvatar(user.avatar)) {
-        this.removeUser(user.name);
-        continue;
-      }
       if (!this.bannedUsersCache!.has(key)) this.usersCache.set(key, user);
     }
     this.writeSnapshot("users", [...this.usersCache.values()]);
@@ -755,6 +763,10 @@ export class DuelRoom extends DurableObject<Env> {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/")) {
+      const blocked = await protectApiRequest(request, url, env);
+      if (blocked) return blocked;
+    }
     if (env.MAINTENANCE === "1" && !url.pathname.startsWith("/api/admin/clear-all")) {
       return new Response(maintenanceHtml(), {
         status: 503,
@@ -766,7 +778,7 @@ export default {
     if (problemBankMatch && request.method === "GET") {
       return proxyProblemBank(request, problemBankMatch[1] as ProblemBankSource, ctx);
     }
-    if (url.pathname === "/api/vjudge/status" && request.method === "GET") return fetchVJudgeStatus(url);
+    if (url.pathname === "/api/vjudge/status" && request.method === "GET") return fetchVJudgeStatus(url, request, env);
     if (url.pathname === "/api/rooms" && request.method === "GET") {
       return directoryJsonResponse(request, env, "https://duel.internal/directory");
     }
@@ -855,30 +867,59 @@ const proxyProblemBank = async (request: Request, source: ProblemBankSource, ctx
   }
 };
 
-const fetchVJudgeStatus = async (requestUrl: URL): Promise<Response> => {
+const fetchVJudgeStatus = async (requestUrl: URL, request: Request, env: Env): Promise<Response> => {
   const oj = requestUrl.searchParams.get("oj") || "";
   const problem = (requestUrl.searchParams.get("problem") || "").trim();
+  const since = Number(requestUrl.searchParams.get("since") || 0);
+  const requester = (requestUrl.searchParams.get("requester") || "").trim();
   const allowedOjs = new Set(["AtCoder", "CodeForces", "洛谷"]);
-  if (!allowedOjs.has(oj) || !/^[A-Za-z0-9_.-]{1,80}$/.test(problem)) return jsonError("invalid VJudge status query", 400);
+  if (!allowedOjs.has(oj) || !/^[A-Za-z0-9_.-]{1,80}$/.test(problem) || !/^[A-Za-z0-9_.-]{1,40}$/.test(requester) || !Number.isFinite(since) || since < 0) return jsonError("invalid VJudge status query", 400);
+  const clientKey = `${request.headers.get("cf-connecting-ip") || "local"}:${requester.toLowerCase()}`;
+  const judgeLimit = await env.JUDGE_RATE_LIMITER.limit({ key: clientKey });
+  if (!judgeLimit.success) {
+    return Response.json(
+      { error: "判题冷却中，请 60 秒后重试" },
+      { status: 429, headers: { "cache-control": "no-store", "retry-after": "60" } }
+    );
+  }
 
-  const upstreamUrl = new URL("https://vjudge.net/status/data");
-  upstreamUrl.searchParams.set("length", "20");
-  upstreamUrl.searchParams.set("OJId", oj);
-  upstreamUrl.searchParams.set("probNum", problem);
   try {
-    const upstream = await fetch(upstreamUrl, {
-      headers: { accept: "application/json", referer: "https://vjudge.net/status" },
-      signal: AbortSignal.timeout(12_000)
-    });
-    if (!upstream.ok) return jsonError(`VJudge status upstream returned ${upstream.status}`, 502);
-    const payload = (await upstream.json()) as { data?: Array<Record<string, unknown>> };
-    const data = (payload.data ?? []).slice(0, 20).flatMap((record) => {
+    const records: Array<Record<string, unknown>> = [];
+    const pageSize = 100;
+    let start = 0;
+    for (let page = 0; page < 40; page += 1) {
+      const upstreamUrl = new URL("https://vjudge.net/status/data");
+      upstreamUrl.searchParams.set("start", String(start));
+      upstreamUrl.searchParams.set("length", String(pageSize));
+      upstreamUrl.searchParams.set("OJId", oj);
+      upstreamUrl.searchParams.set("probNum", problem);
+      const upstream = await fetch(upstreamUrl, {
+        headers: { accept: "application/json", referer: "https://vjudge.net/status", "cache-control": "no-cache" },
+        cf: { cacheTtl: 0 },
+        signal: AbortSignal.timeout(12_000)
+      });
+      if (!upstream.ok) return jsonError(`VJudge status upstream returned ${upstream.status}`, 502);
+      const payload = (await upstream.json()) as { data?: Array<Record<string, unknown>>; recordsFiltered?: number; recordsTotal?: number };
+      const pageRecords = payload.data ?? [];
+      if (!pageRecords.length) break;
+      records.push(...pageRecords);
+      const pageTimes = pageRecords.map((record) => Number(record.time)).filter(Number.isFinite);
+      if (since && pageTimes.some((time) => time < since)) break;
+      start += pageRecords.length;
+      const total = Number(payload.recordsFiltered ?? payload.recordsTotal);
+      if ((Number.isFinite(total) && start >= total) || (!Number.isFinite(total) && pageRecords.length < pageSize)) break;
+    }
+    const seen = new Set<string>();
+    const data = records.flatMap((record) => {
       const userId = typeof record.userId === "number" || typeof record.userId === "string" ? record.userId : undefined;
       const userName = typeof record.userName === "string" ? record.userName : "";
       const status = typeof record.status === "string" ? record.status : "";
       const time = typeof record.time === "number" ? record.time : Number(record.time);
       const runId = typeof record.runId === "number" || typeof record.runId === "string" ? record.runId : "";
-      return userId !== undefined && status && Number.isFinite(time) ? [{ userId, userName, status, time, runId }] : [];
+      const key = `${runId || userId}:${time}`;
+      if (userId === undefined || !status || !Number.isFinite(time) || time < since || seen.has(key)) return [];
+      seen.add(key);
+      return [{ userId, userName, status, time, runId }];
     });
     return Response.json({ data }, { headers: { "cache-control": "no-store" } });
   } catch (error) {
@@ -914,22 +955,23 @@ const directoryJsonResponse = async (request: Request, env: Env, internalUrl: st
 };
 
 const verifyVJudgeLogin = async (request: Request, env: Env): Promise<Response> => {
-  const body = (await request.json().catch(() => null)) as { username?: unknown; challenge?: unknown } | null;
+  const body = (await request.json().catch(() => null)) as { username?: unknown } | null;
   const username = typeof body?.username === "string" ? body.username.trim() : "";
-  const challenge = typeof body?.challenge === "string" ? body.challenge.trim() : "";
   if (!/^[A-Za-z0-9_.-]{1,40}$/.test(username)) return jsonError("请输入有效的 VJudge 用户名", 400);
-  if (!/^\d{6}$/.test(challenge)) return jsonError("验证码必须为六位数字", 400);
 
   try {
-    const response = await fetch(`https://vjudge.net/user/${encodeURIComponent(username)}`, {
-      headers: { accept: "text/html" },
+    const profileUrl = new URL(`https://vjudge.net/user/${encodeURIComponent(username)}`);
+    profileUrl.searchParams.set("_", String(Date.now()));
+    const response = await fetch(profileUrl, {
+      headers: { accept: "text/html", "cache-control": "no-cache", pragma: "no-cache" },
+      cf: { cacheTtl: 0 },
       signal: AbortSignal.timeout(10_000)
     });
     if (response.status === 404) return jsonError("未找到该 VJudge 用户", 404);
     if (!response.ok) throw new Error(`VJudge 返回 ${response.status}`);
     const html = await response.text();
-    const school = extractProfileField(html, "user.profile.school");
-    if (!school.includes(challenge)) return jsonError("学校字段中未找到当前六位验证码", 403);
+    const lastSeen = extractProfileField(html, "user.profile.last_seen");
+    if (!isRecentVJudgeActivity(lastSeen)) return jsonError("未检测到最近 10 秒内的 VJudge 登录", 403);
     const avatar = extractVJudgeAvatar(html);
     const saved = await env.DUEL_ROOM.getByName("__directory").fetch(
       new Request(`https://duel.internal/users/${encodeURIComponent(username)}`, {
@@ -943,6 +985,13 @@ const verifyVJudgeLogin = async (request: Request, env: Env): Promise<Response> 
   } catch (error) {
     return jsonError(error instanceof Error ? error.message : "VJudge 验证失败", 502);
   }
+};
+
+const isRecentVJudgeActivity = (value: string): boolean => {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "just now") return true;
+  const seconds = normalized.match(/^(\d+)\s*(?:sec|secs|second|seconds)\s+ago$/)?.[1];
+  return seconds !== undefined && Number(seconds) <= 10;
 };
 
 const extractProfileField = (html: string, i18nKey: string): string => {
@@ -972,174 +1021,6 @@ const decodeHtml = (value: string): string => value
   .replace(/&lt;/g, "<")
   .replace(/&gt;/g, ">");
 
-/*
-const authCallback = async (request: Request, env: Env): Promise<Response> => {
-  const url = new URL(request.url);
-  const cookies = readCookies(request);
-  const code = url.searchParams.get("code") || "";
-  const state = url.searchParams.get("state") || "";
-  const expectedState = cookies.get("luogu_duel_oauth_state") || "";
-  let returnTo = safeReturnTo(cookies.get("luogu_duel_oauth_return") || "/");
-  const headers = new Headers({
-    "cache-control": "no-store"
-  });
-  clearOAuthCookies(headers);
-
-  try {
-    if (!code || !state || !expectedState || state !== expectedState) {
-      throw new Error("OAuth state mismatch");
-    }
-    const luoguName = await exchangeCodeForLuoguName(
-      {
-        code,
-        redirect_uri: `${url.origin}/api/auth/callback`
-      },
-      env
-    );
-    returnTo = withAuthParam(returnTo, "auth_session", JSON.stringify({ luoguName, signedInAt: Date.now() }));
-    headers.append("set-cookie", cookie("luogu_duel_cp_session", JSON.stringify({ luoguName, signedInAt: Date.now() }), 30 * 24 * 60 * 60));
-    headers.append("set-cookie", clearCookie("luogu_duel_oauth_error"));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    returnTo = withAuthParam(returnTo, "auth_error", message);
-    headers.append("set-cookie", cookie("luogu_duel_oauth_error", message, 300));
-  }
-
-  headers.set("location", returnTo);
-  return new Response(null, { status: 302, headers });
-};
-
-const authLogin = (request: Request, env: Env): Response => {
-  const url = new URL(request.url);
-  const state = crypto.randomUUID().replaceAll("-", "");
-  const returnTo = safeReturnTo(url.searchParams.get("returnTo") || "/");
-  const authorize = new URL("/oauth/authorize", oauthBase);
-  authorize.searchParams.set("response_type", "code");
-  authorize.searchParams.set("client_id", env.CP_CLIENT_ID);
-  authorize.searchParams.set("redirect_uri", `${url.origin}/api/auth/callback`);
-  authorize.searchParams.set("scope", oauthScope);
-  authorize.searchParams.set("state", state);
-  const headers = new Headers({
-    location: authorize.toString(),
-    "cache-control": "no-store"
-  });
-  headers.append("set-cookie", cookie("luogu_duel_oauth_state", state, 300));
-  headers.append("set-cookie", cookie("luogu_duel_oauth_return", returnTo, 300));
-  headers.append("set-cookie", clearCookie("luogu_duel_oauth_error"));
-  return new Response(null, { status: 302, headers });
-};
-
-const exchangeOAuthCode = async (request: Request, env: Env): Promise<Response> => {
-  const body = (await request.json()) as { code?: string; code_verifier?: string; redirect_uri?: string };
-  if (!body.code || !body.code_verifier || !body.redirect_uri) return jsonError("missing oauth fields", 400);
-
-  try {
-    const luoguName = await exchangeCodeForLuoguName(body, env);
-    return Response.json({ luoguName });
-  } catch (error) {
-    return jsonError(error instanceof Error ? error.message : String(error), 502);
-  }
-};
-
-const exchangeCodeForLuoguName = async (
-  body: { code?: string; code_verifier?: string; redirect_uri?: string },
-  env: Env
-): Promise<string> => {
-  const token = await exchangeToken(body, env);
-  if (!token.access_token) throw new Error("missing access token");
-
-  const userInfo = await fetchUserInfo(token.access_token);
-  if (!userInfo) throw new Error("oauth userinfo failed");
-  const typedUserInfo = userInfo as {
-    username?: string;
-    display_name?: string;
-    linked_accounts?: Array<{ platform?: string; username?: string; name?: string }>;
-    luogu?: { username?: string; name?: string };
-  };
-  const luoguName = extractLuoguName(typedUserInfo);
-  if (!luoguName) throw new Error("no luogu account linked");
-  return luoguName;
-};
-
-const extractLuoguName = (userInfo: {
-  username?: string;
-  display_name?: string;
-  linked_accounts?: Array<Record<string, unknown>>;
-  luogu?: Record<string, unknown>;
-}): string => {
-  const linked = userInfo.linked_accounts?.find((account) => {
-    const platform = String(account.platform ?? account.provider ?? account.type ?? "").toLowerCase();
-    return platform.includes("luogu") || platform.includes("洛谷");
-  });
-  return (
-    stringField(linked, "username") ||
-    stringField(linked, "platformUsername") ||
-    stringField(linked, "name") ||
-    stringField(linked, "handle") ||
-    stringField(linked, "display_name") ||
-    stringField(userInfo.luogu, "username") ||
-    stringField(userInfo.luogu, "name") ||
-    stringField(userInfo.luogu, "handle") ||
-    stringField(userInfo.luogu, "display_name") ||
-    stringField(userInfo as Record<string, unknown>, "luogu_username") ||
-    stringField(userInfo as Record<string, unknown>, "luoguName")
-  );
-};
-
-const fetchLuoguRecords = async (url: URL, env: Env): Promise<Response> => {
-  const pid = (url.searchParams.get("pid") || "").trim().toUpperCase();
-  const target = new URL("https://www.luogu.com.cn/record/list");
-  target.searchParams.set("pid", pid);
-  target.searchParams.set("_contentOnly", "1");
-  const response = await fetchThroughLuoguProxy(target, "application/json");
-  return new Response(await response.text(), {
-    status: response.status,
-    headers: {
-      "content-type": response.headers.get("content-type") || "application/json; charset=utf-8",
-      "cache-control": "no-store"
-    }
-  });
-};
-
-const fetchLuoguUserSearch = async (url: URL, env: Env): Promise<Response> => {
-  const keyword = (url.searchParams.get("keyword") || "").trim();
-  if (!keyword || keyword.length > 40) return jsonError("invalid keyword", 400);
-  const target = new URL("https://www.luogu.com.cn/api/user/search");
-  target.searchParams.set("keyword", keyword);
-  const response = await fetchThroughLuoguProxy(target, "application/json");
-  return new Response(await response.text(), {
-    status: response.status,
-    headers: {
-      "content-type": response.headers.get("content-type") || "application/json; charset=utf-8",
-      "cache-control": "public, max-age=300"
-    }
-  });
-};
-
-const fetchLuoguProblemBank = async (): Promise<Response> => {
-  const response = await fetchThroughLuoguProxy(new URL("https://cdn.luogu.com.cn/problemset-open/latest.ndjson.gz"), "application/gzip");
-  return new Response(response.body, {
-    status: response.status,
-    headers: {
-      "content-type": response.headers.get("content-type") || "application/gzip",
-      "cache-control": "public, max-age=0, must-revalidate, s-maxage=86400"
-    }
-  });
-};
-
-const fetchThroughLuoguProxy = async (target: URL, accept: string): Promise<Response> => {
-  const proxy = new URL(luoguProxyBase);
-  proxy.searchParams.set("url", target.toString());
-  try {
-    const response = await fetch(proxy, { headers: { accept }, signal: AbortSignal.timeout(12_000) });
-    if (response.ok) return response;
-  } catch {
-    // The Worker runs outside mainland China, but keep a direct fallback for a transient HF outage.
-  }
-  return fetch(target, { headers: { accept }, signal: AbortSignal.timeout(12_000) });
-};
-*/
-
 const stringField = (source: Record<string, unknown> | undefined, key: string): string => {
   const value = source?.[key];
   return typeof value === "string" && value.trim() ? value.trim() : "";
@@ -1147,12 +1028,33 @@ const stringField = (source: Record<string, unknown> | undefined, key: string): 
 
 const normalizeName = (name: string): string => name.trim().toLowerCase();
 
+const isPlaceholderName = (name: string): boolean => {
+  const normalized = normalizeName(name);
+  return !normalized || normalized === "unknown" || normalized === "待同步";
+};
+
+const protectApiRequest = async (request: Request, url: URL, env: Env): Promise<Response | null> => {
+  if (!new Set(["GET", "POST", "DELETE"]).has(request.method)) return jsonError("method not allowed", 405);
+  const contentLength = Number(request.headers.get("content-length") || 0);
+  if (Number.isFinite(contentLength) && contentLength > 256 * 1024) return jsonError("request body too large", 413);
+  if (request.method !== "GET") {
+    const origin = request.headers.get("origin");
+    if (origin && origin !== url.origin) return jsonError("cross-site request rejected", 403);
+  }
+  const clientKey = request.headers.get("cf-connecting-ip") || "local";
+  const outcome = await env.API_RATE_LIMITER.limit({ key: clientKey });
+  return outcome.success ? null : Response.json(
+    { error: "too many requests" },
+    { status: 429, headers: { "cache-control": "no-store", "retry-after": "60" } }
+  );
+};
+
 const dedupeNames = (names: string[]): string[] => {
   const seen = new Set<string>();
   return names.flatMap((name) => {
     const trimmed = name.trim();
     const key = normalizeName(trimmed);
-    if (!trimmed || seen.has(key)) return [];
+    if (isPlaceholderName(trimmed) || seen.has(key)) return [];
     seen.add(key);
     return [trimmed];
   });
@@ -1180,7 +1082,6 @@ const cacheHeaders = (_browserMaxAge: number, edgeMaxAge = _browserMaxAge): Head
   "cache-control": `public, max-age=0, must-revalidate, s-maxage=${edgeMaxAge}, stale-while-revalidate=${edgeMaxAge * 4}`
 });
 
-const isBannedAvatar = (avatar: unknown): boolean => avatar === bannedAvatarUrl;
 const isPlayingSeat = (seat: unknown): boolean => seat === "red" || seat === "blue";
 const systemCloseEnvelope = async (roomId: string, lamport: number, issuedAt: number): Promise<SignedEnvelope> => {
   const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);

@@ -34,6 +34,7 @@ export type ServerMessage =
   | { type: "sync"; envelopes: SignedEnvelope[] }
   | { type: "directory"; rooms: RoomListing[] }
   | { type: "users"; users: UserRecord[] }
+  | { type: "pong"; at: number }
   | { type: "error"; message: string };
 
 const requestTimeoutMs = 6500;
@@ -74,7 +75,7 @@ export const fetchRooms = async (): Promise<RoomListing[]> => {
 export const fetchUsers = async (): Promise<UserRecord[]> => {
   requireServerRequest();
   const response = await fetch("/api/users", {
-    cache: "no-store",
+    cache: "default",
     signal: AbortSignal.timeout(requestTimeoutMs)
   });
   if (!response.ok) throw new Error(`users request failed: ${response.status}`);

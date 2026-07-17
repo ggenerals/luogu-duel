@@ -6,14 +6,11 @@ export type VJudgeSession = {
   signedInAt: number;
 };
 
-export const createVJudgeChallenge = (): string =>
-  String(crypto.getRandomValues(new Uint32Array(1))[0] % 900_000 + 100_000);
-
-export const verifyVJudgeLogin = async (username: string, challenge: string): Promise<VJudgeSession> => {
+export const verifyVJudgeLogin = async (username: string): Promise<VJudgeSession> => {
   const response = await fetch("/api/auth/vjudge/verify", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username, challenge }),
+    body: JSON.stringify({ username }),
     signal: AbortSignal.timeout(12_000)
   });
   const payload = (await response.json().catch(() => ({}))) as { error?: string; session?: VJudgeSession };

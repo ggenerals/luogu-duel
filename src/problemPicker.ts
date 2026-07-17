@@ -65,7 +65,7 @@ export const parseCustomProblems = (input: string): Problem[] => {
     const key = `${platform}:${pid.toLowerCase()}`;
     if (seen.has(key)) return [];
     seen.add(key);
-    return [{ pid, platform, title: pid, score: 100 + Math.floor(index / 3) * 50 }];
+    return [{ pid, platform, title: pid, score: 100 + index * 50 }];
   });
 };
 
@@ -109,7 +109,28 @@ export const pickProblems = async (
   }
 
   if (all.length < count) throw new Error(`所选 OJ 和难度范围内只有 ${all.length} 道可用题目`);
-  return seededSample(all, count, `${seed}:order`).map((item, index) => ({ ...item, score: 100 + Math.floor(index / 3) * 50 }));
+  return seededSample(all, count, `${seed}:order`).map((item, index) => ({ ...item, score: 100 + index * 50 }));
+};
+
+export const pickReplacementProblem = async (
+  current: Problem,
+  usedProblems: Problem[],
+  seed: string,
+  progress: Progress = () => undefined
+): Promise<Problem> => {
+  const platform = current.platform ?? "luogu";
+  const bank = await loadBank(platform, progress);
+  const source = typeof current.difficulty === "number"
+    ? current
+    : bank.find((item) => item.pid.toLowerCase() === current.pid.toLowerCase());
+  if (!source?.difficulty) throw new Error(`题库中没有 ${current.pid} 的难度数据`);
+  if (source.difficulty <= 1) throw new Error(`${current.pid} 已经是最低难度`);
+  const targetDifficulty = (source.difficulty - 1) as DifficultyLevel;
+  const used = new Set(usedProblems.map((item) => `${item.platform ?? "luogu"}:${item.pid}`.toLowerCase()));
+  const candidates = bank.filter((item) => item.difficulty === targetDifficulty && !used.has(`${item.platform}:${item.pid}`.toLowerCase()));
+  const replacement = seededSample(candidates, 1, `${seed}:${current.pid}:${targetDifficulty}`)[0];
+  if (!replacement) throw new Error(`${platformLabel(platform)} 没有可用的低一级题目`);
+  return { ...replacement, score: current.score };
 };
 
 export const cachedProblemCount = (): number =>

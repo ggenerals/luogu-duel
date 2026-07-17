@@ -8,13 +8,15 @@ type StatusRow = {
   runId: number | string;
 };
 
-export const fetchVJudgeRecords = async (problem: Problem, users: string[], startedAt: number): Promise<FeedRecord[]> => {
+export const fetchVJudgeRecords = async (problem: Problem, users: string[], startedAt: number, requester: string): Promise<FeedRecord[]> => {
   const url = new URL("/api/vjudge/status", location.origin);
   url.searchParams.set("oj", vjudgeOj(problem));
   url.searchParams.set("problem", problem.pid);
+  url.searchParams.set("since", String(startedAt));
+  url.searchParams.set("requester", requester);
   const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(15_000) });
-  if (!response.ok) throw new Error(`VJudge status request failed: ${response.status}`);
-  const payload = (await response.json()) as { data?: StatusRow[] };
+  const payload = (await response.json().catch(() => ({}))) as { data?: StatusRow[]; error?: string };
+  if (!response.ok) throw new Error(payload.error || `VJudge status request failed: ${response.status}`);
   const names = new Map(users.map((name) => [name.trim().toLowerCase(), name]));
   return (payload.data ?? []).flatMap((row) => {
     const matchedName = names.get(row.userName.trim().toLowerCase());
@@ -27,7 +29,7 @@ export const fetchVJudgeRecords = async (problem: Problem, users: string[], star
       status: normalizeVJudgeStatus(row.status),
       recordId: String(row.runId || `${row.userId}:${row.time}`)
     }];
-  });
+  }).sort((a, b) => Number(a.status !== "OK") - Number(b.status !== "OK") || a.at - b.at || a.recordId.localeCompare(b.recordId));
 };
 
 const vjudgeOj = (problem: Problem): string =>

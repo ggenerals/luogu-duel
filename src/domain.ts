@@ -409,7 +409,7 @@ const kickPlayer = (state: DuelState, actorId: string, targetId: string, targetN
     return;
   }
   const record: ModerationRecord = {
-    reason: `${reason.trim() || "管理员封禁"}（请找管理员 [sLMxf](https://www.luogu.com.cn/chat?uid=752953) 解封）`,
+    reason: `${reason.trim() || "管理员封禁"}（请找管理员 sLMxf 解封）`,
     by: actor.luoguName,
     at
   };
@@ -529,8 +529,13 @@ const settleVote = (state: DuelState, vote: Vote, at: number) => {
 };
 
 const pushFeed = (state: DuelState, record: FeedRecord) => {
-  if (state.feed.some((item) => item.recordId === record.recordId && item.pid === record.pid)) return;
-  state.feed.push(record);
+  const existing = state.feed.findIndex((item) => item.recordId === record.recordId && item.pid === record.pid);
+  if (existing >= 0) {
+    if (state.feed[existing].status === record.status && state.feed[existing].at === record.at) return;
+    state.feed[existing] = record;
+  } else {
+    state.feed.push(record);
+  }
   state.feed.sort(
     (a, b) =>
       b.at - a.at ||
@@ -624,7 +629,7 @@ const isRestricted = (state: DuelState, id: string): boolean => {
 const isMutedPlayer = (state: DuelState, player: Player): boolean =>
   Boolean(state.muted[player.id] || state.muted[`name:${normalizeName(player.luoguName)}`]);
 
-const scoreForIndex = (index: number): number => 100 + Math.floor(index / 3) * 50;
+const scoreForIndex = (index: number): number => 100 + index * 50;
 
 const numericPid = (pid: string): number => {
   const match = pid.match(/\d+/);

@@ -698,6 +698,11 @@ button.is-loading { cursor: wait; }
   overflow-wrap: anywhere;
 }
 
+.sponsor-trigger {
+  margin-top: 10px;
+  color: var(--green);
+}
+
 .ban-announcement {
   display: grid;
   gap: 5px;
@@ -924,7 +929,7 @@ button.is-loading { cursor: wait; }
 }
 
 .duel-row .room-line em.result-draw {
-  color: var(--warning-text);
+  color: #00f5a0;
 }
 
 .duel-row .room-line em.result-closed {
@@ -948,14 +953,9 @@ button.is-loading { cursor: wait; }
   color: var(--blue);
 }
 
-.duel-row em.finished {
-  color: var(--warning-text);
-}
-
-:root[data-theme="light"] .duel-row em.finished,
-:root[data-theme="light"] .room-card em.finished {
-  -webkit-text-stroke: .25px #5f4a18;
-  paint-order: stroke fill;
+.duel-row em.finished,
+.room-card em.finished {
+  color: #efbf04;
 }
 
 .duel-row em.closed {
@@ -983,7 +983,7 @@ button.is-loading { cursor: wait; }
 }
 
 .teams {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -1509,12 +1509,6 @@ img.chat-avatar {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.45;
-}
-
-.paste-login code {
-  color: var(--green);
-  font: 900 28px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  text-align: center;
 }
 
 .login-guide { display: grid; gap: 5px; margin: 0; padding-left: 22px; color: var(--muted); font-size: 12px; line-height: 1.5; }

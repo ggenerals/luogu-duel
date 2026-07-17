@@ -59,8 +59,8 @@ import {
   winThreshold
 } from "./domain";
 import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope, type LocalIdentity } from "./identity";
-import { cachedProblemCount, defaultRatios, difficultyMeta, parseCustomProblems, pickProblems, platformLabel, type DifficultyLevel, type PlatformRatios, type ProblemPlatform } from "./problemPicker";
-import { createVJudgeChallenge, loadVJudgeSession, logoutVJudgeSession, verifyVJudgeLogin, type VJudgeSession } from "./oauth";
+import { cachedProblemCount, defaultRatios, difficultyMeta, parseCustomProblems, pickProblems, pickReplacementProblem, platformLabel, type DifficultyLevel, type PlatformRatios, type ProblemPlatform } from "./problemPicker";
+import { loadVJudgeSession, logoutVJudgeSession, verifyVJudgeLogin, type VJudgeSession } from "./oauth";
 import { allowServerRequest, directoryWebSocketUrl, fetchRooms, fetchSnapshot, fetchUserRecord, fetchUsers, publishEnvelope, roomWebSocketUrl, saveUserRecord, setServerRequestWarningHandler, updateUserRating, type RoomListing, type ServerMessage, type UserRecord } from "./realtimeStore";
 import { fetchVJudgeRecords } from "./vjudge";
 import type { ChatMessage, DuelEvent, DuelState, Player, Problem, Seat, SignedEnvelope, VoteKind } from "./types";
@@ -100,19 +100,26 @@ let roomReconnectAttempts = 0;
 let directoryReconnectAttempts = 0;
 let directoryLiveSnapshotReceived = false;
 let lastDirectoryLiveAt = 0;
+let lastUsersLiveAt = 0;
+let lastProfileFallbackSync = 0;
 let finishReturnTimer: number | undefined;
 let clockTimer: number | undefined;
 let syncTimer: number | undefined;
+let heartbeatTimer: number | undefined;
+let initialFallbackTimer: number | undefined;
 let syncInFlight = false;
+let roomLastPongAt = 0;
+let directoryLastPongAt = 0;
+let lastRoomLiveStateAt = 0;
 let statusText = "booting...";
 let statusTone: "info" | "error" = "info";
 let authErrorText = "";
 let vjudgeUsername = "";
-let vjudgeChallenge = createVJudgeChallenge();
 let creatingRoom = false;
 let loginSubmitting = false;
 const adminBusy = new Set<string>();
 const judgingProblems = new Set<string>();
+const replacingProblems = new Set<string>();
 let downloadProgress: Record<ProblemPlatform, { percent: number; status: string }> = {
   luogu: { percent: 0, status: "等待下载" }, codeforces: { percent: 0, status: "等待下载" }, atcoder: { percent: 0, status: "等待下载" }
 };
@@ -125,7 +132,6 @@ const lightBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/nd1187o
 const avatarCacheKey = "luogu-duel.avatar-cache.v1";
 const userCacheKey = "luogu-duel.user-cache.v1";
 const registrationCacheKey = "luogu-duel.registration-cache.v1";
-const bannedAvatarUrl = "https://cdn.luogu.com.cn/images/banned.png";
 const userCacheTtl = 24 * 60 * 60 * 1000;
 const themeModeKey = "luogu-duel.theme-mode.v1";
 const avatarCache: Record<string, string> = readAvatarCache();
@@ -162,12 +168,13 @@ type ToastMessage = {
   tone: "info" | "success" | "warning";
 };
 
-const dataVersion = "v3";
+const dataVersion = "v4";
 const roomSeatKey = () => `luogu-duel.${dataVersion}.seat.${roomId}`;
 const activeRoomKey = `luogu-duel.active-room.${dataVersion}`;
 const historyKey = `luogu-duel.history.${dataVersion}`;
-const directoryCacheKey = "vjudge-duel.directory-cache.v1";
+const directoryCacheKey = "vjudge-duel.directory-cache.v2";
 const eventCacheKey = (id: string) => `vjudge-duel.events.${dataVersion}.${id}`;
+const judgeCooldownKey = () => `vjudge-duel.judge-cooldown.v1.${normalizeName(identity?.luoguName ?? "anonymous")}`;
 
 const notify = (forceStickChat = false) => {
   const stickChat = forceStickChat || shouldStickChats();
@@ -201,8 +208,21 @@ const boot = async () => {
     if (themeMode === "system") applyTheme();
     notify();
   });
-  clockTimer ??= window.setInterval(() => notify(), 20_000);
-  syncTimer ??= window.setInterval(() => void periodicSync(), 20_000);
+  clockTimer ??= window.setInterval(() => {
+    if (mode === "room" && state.phase === "arena") notify();
+  }, 1_000);
+  syncTimer ??= window.setInterval(() => void periodicSync(), 60_000);
+  heartbeatTimer ??= window.setInterval(() => {
+    const now = Date.now();
+    if (socket?.readyState === WebSocket.OPEN) {
+      if (roomLastPongAt && now - roomLastPongAt > 90_000) socket.close();
+      else socket.send(JSON.stringify({ type: "ping", at: now }));
+    }
+    if (directorySocket?.readyState === WebSocket.OPEN) {
+      if (directoryLastPongAt && now - directoryLastPongAt > 90_000) directorySocket.close();
+      else directorySocket.send(JSON.stringify({ type: "ping", at: now }));
+    }
+  }, 30_000);
   window.addEventListener("hashchange", () => void enterFromHash());
   window.addEventListener("online", () => {
     connectRoom();
@@ -222,7 +242,6 @@ const boot = async () => {
   identity = await renameIdentity(identity, vjudgeSession.username);
   bootPhase = "ready";
   await registerCurrentUser();
-  await refreshGlobalModeration();
   await enterFromHash();
   finishBootScreen();
 };
@@ -247,25 +266,33 @@ const enterFromHash = async () => {
   roomSecret = params.get("secret") || (roomId === "global" ? "public-lobby" : "public-room");
   mode = adminRequested && isAdmin() ? "admin" : roomId === "global" ? "home" : "room";
   closeSocket();
+  if (initialFallbackTimer) window.clearTimeout(initialFallbackTimer);
+  initialFallbackTimer = undefined;
+  lastRoomLiveStateAt = 0;
   clearFinishTimer();
   draft.chat = "";
   draft.closeReason = isAdmin() ? "管理员强制关闭房间" : "房主关闭房间";
 
   if (mode === "home" || mode === "admin") {
-    connectDirectory();
     directoryLiveSnapshotReceived = false;
-    const cachedEvents = readEventCache("global");
     envelopes = [];
     state = createInitialState("global");
-    await mergeEnvelopes(cachedEvents);
     globalModeration = state;
-    rooms = readDirectoryCache();
-    users = Object.values(userCache).map((entry) => entry.user);
+    rooms = [];
+    users = [];
+    connectDirectory();
+    connectRoom();
     statusTone = "info";
     statusText = "正在连接大厅";
     notify();
-    await Promise.all([loadDirectory(), loadUsers()]);
-    notify();
+    initialFallbackTimer = window.setTimeout(() => {
+      if (mode !== "home" && mode !== "admin") return;
+      void (async () => {
+        if (!directoryLiveSnapshotReceived) await Promise.all([loadDirectory(), loadUsers()]);
+        else if (!lastRoomLiveStateAt) await refreshGlobalModeration();
+        notify();
+      })();
+    }, 2_000);
     return;
   }
 
@@ -273,11 +300,18 @@ const enterFromHash = async () => {
   closeDirectory();
   const cachedEvents = readEventCache(roomId);
   envelopes = [];
-  await mergeEnvelopes(cachedEvents);
   notify();
-  await loadSnapshot();
-  await ensureJoined();
   connectRoom();
+  const expectedRoomId = roomId;
+  initialFallbackTimer = window.setTimeout(() => {
+    if (mode !== "room" || roomId !== expectedRoomId || lastRoomLiveStateAt) return;
+    void (async () => {
+      const loaded = await loadSnapshot();
+      if (!loaded && !envelopes.length) await mergeEnvelopes(cachedEvents);
+      await ensureJoined();
+      notify();
+    })();
+  }, 2_000);
   rememberActiveRoomIfNeeded();
   notify();
 };
@@ -302,8 +336,9 @@ const loadDirectory = async () => {
 
 const loadUsers = async () => {
   try {
-    users = await fetchUsers();
-    for (const user of users) userCache[normalizeName(user.name)] = { user, cachedAt: Date.now() };
+    const remoteUsers = await fetchUsers();
+    if (!lastUsersLiveAt || Date.now() - lastUsersLiveAt >= 60_000) users = remoteUsers;
+    for (const user of remoteUsers) userCache[normalizeName(user.name)] = { user, cachedAt: Date.now() };
     writeUserCache();
   } catch {
     users = Object.values(userCache)
@@ -336,16 +371,20 @@ function readThemeMode(): "system" | "light" | "dark" {
   return "system";
 }
 
-const loadSnapshot = async () => {
+const loadSnapshot = async (): Promise<boolean> => {
   try {
     await refreshGlobalModeration();
+    const requestedAt = Date.now();
     const remote = await fetchSnapshot(roomId, roomSecret);
-    await mergeEnvelopes(remote);
+    if (lastRoomLiveStateAt > requestedAt) return true;
+    await applyAuthoritativeSnapshot(remote);
     statusTone = "info";
     statusText = "快照已同步";
+    return true;
   } catch (error) {
     statusTone = "error";
     statusText = friendlyError(error, "房间快照同步失败");
+    return false;
   }
 };
 
@@ -353,12 +392,22 @@ const periodicSync = async () => {
   if (bootPhase !== "ready" || syncInFlight) return;
   syncInFlight = true;
   try {
-    if (mode === "home" || mode === "profile" || mode === "admin") {
+    if (mode === "home" || mode === "admin") {
+      const directoryOpen = directorySocket?.readyState === WebSocket.OPEN;
+      const roomOpen = socket?.readyState === WebSocket.OPEN;
       connectDirectory();
+      connectRoom();
+      if (!directoryOpen) await Promise.all([loadDirectory(), loadUsers()]);
+      else if (!roomOpen) await refreshGlobalModeration();
+    } else if (mode === "room") {
+      const roomOpen = socket?.readyState === WebSocket.OPEN;
+      if (!roomOpen) {
+        connectRoom();
+        await loadSnapshot();
+      }
+    } else if (Date.now() - lastProfileFallbackSync >= 5 * 60_000) {
+      lastProfileFallbackSync = Date.now();
       await Promise.all([loadDirectory(), loadUsers()]);
-    } else {
-      if (socket?.readyState !== WebSocket.OPEN && socket?.readyState !== WebSocket.CONNECTING) connectRoom();
-      await loadSnapshot();
     }
   } finally {
     syncInFlight = false;
@@ -366,13 +415,17 @@ const periodicSync = async () => {
   }
 };
 
+const shouldConnectRoomSocket = (): boolean => mode === "room" || ((mode === "home" || mode === "admin") && roomId === "global");
+
 const connectRoom = () => {
-  if (mode !== "room") return;
+  if (!shouldConnectRoomSocket()) return;
+  if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
   if (!allowServerRequest()) return;
   closeSocket(false);
   socket = new WebSocket(roomWebSocketUrl(roomId, roomSecret));
   socket.addEventListener("open", () => {
     roomReconnectAttempts = 0;
+    roomLastPongAt = Date.now();
     statusTone = "info";
     statusText = "WebSocket 已连接";
     notify();
@@ -380,7 +433,7 @@ const connectRoom = () => {
   socket.addEventListener("message", (event) => void handleServerMessage(event.data));
   socket.addEventListener("close", () => {
     socket = null;
-    if (mode === "room") {
+    if (shouldConnectRoomSocket()) {
       statusTone = "error";
       statusText = "连接休眠或断开，正在重连";
       const delay = Math.min(60_000, 3_000 * 2 ** Math.min(roomReconnectAttempts, 5));
@@ -411,6 +464,7 @@ const connectDirectory = () => {
   directorySocket = new WebSocket(directoryWebSocketUrl());
   directorySocket.addEventListener("open", () => {
     directoryReconnectAttempts = 0;
+    directoryLastPongAt = Date.now();
     statusTone = "info";
     statusText = "大厅实时连接已建立";
     notify();
@@ -443,6 +497,10 @@ const closeDirectory = (clearTimer = true) => {
 
 const handleDirectoryMessage = async (raw: string) => {
   const message = JSON.parse(raw) as ServerMessage;
+  if (message.type === "pong") {
+    directoryLastPongAt = Date.now();
+    return;
+  }
   if (message.type === "directory") {
     rooms = message.rooms;
     writeDirectoryCache(rooms);
@@ -453,6 +511,7 @@ const handleDirectoryMessage = async (raw: string) => {
   }
   if (message.type === "users") {
     users = message.users;
+    lastUsersLiveAt = Date.now();
     for (const user of users) userCache[normalizeName(user.name)] = { user, cachedAt: Date.now() };
     writeUserCache();
     usersLoaded = true;
@@ -466,18 +525,24 @@ const handleDirectoryMessage = async (raw: string) => {
 
 const handleServerMessage = async (raw: string) => {
   const message = JSON.parse(raw) as ServerMessage;
+  if (message.type === "pong") {
+    roomLastPongAt = Date.now();
+    return;
+  }
   if (message.type === "hello" || message.type === "sync") {
-    await mergeEnvelopes(message.envelopes);
+    await applyAuthoritativeSnapshot(message.envelopes);
+    lastRoomLiveStateAt = Date.now();
     await ensureJoined();
   }
-  if (message.type === "event") await receiveEnvelope(message.envelope);
+  if (message.type === "event") {
+    await receiveEnvelope(message.envelope);
+    lastRoomLiveStateAt = Date.now();
+  }
   if (message.type === "error") {
     statusTone = "error";
     statusText = message.message;
-    if (message.message.includes("另一场未结束比赛") || message.message.includes("操作过于频繁")) {
-      if (message.message.includes("另一场未结束比赛")) joinDeniedRooms.add(roomId);
-      await replaceRoomSnapshot();
-    }
+    if (message.message.includes("另一场未结束比赛")) joinDeniedRooms.add(roomId);
+    await replaceRoomSnapshot().catch(() => undefined);
   }
   notify();
 };
@@ -486,11 +551,25 @@ const mergeEnvelopes = async (incoming: SignedEnvelope[]) => {
   for (const envelope of incoming) await receiveEnvelope(envelope, false);
 };
 
+const applyAuthoritativeSnapshot = async (incoming: SignedEnvelope[]) => {
+  const verified: SignedEnvelope[] = [];
+  for (const envelope of incoming) {
+    if (envelope.event.roomId === roomId && await verifyEnvelope(envelope)) verified.push(envelope);
+  }
+  const unique = new Map(verified.map((envelope) => [envelope.event.id, envelope]));
+  envelopes = [...unique.values()].sort(compareEnvelopes);
+  state = applyEvents(roomId, envelopes.map((item) => item.event));
+  writeEventCache(roomId, envelopes);
+  if (roomId === "global") globalModeration = state;
+  saveHistory();
+  scheduleFinishReturn();
+  maybeAutoStart();
+  rememberActiveRoomIfNeeded();
+};
+
 const replaceRoomSnapshot = async () => {
   const remote = await fetchSnapshot(roomId, roomSecret, false);
-  envelopes = [];
-  state = createInitialState(roomId);
-  await mergeEnvelopes(remote);
+  await applyAuthoritativeSnapshot(remote);
   if (state.closed) localStorage.removeItem(eventCacheKey(roomId));
   else writeEventCache(roomId, envelopes);
   saveHistory();
@@ -546,12 +625,10 @@ const emit = async (event: DuelEvent) => {
   try {
     await publishEnvelope(roomId, roomSecret, envelope);
   } catch (error) {
-    const message = friendlyError(error, "事件已保存在本地，发送失败");
+    const message = friendlyError(error, "发送失败，正在恢复服务器状态");
     if (!sentBySocket) setStatus(message, "error");
-    if (message.includes("另一场未结束比赛") || message.includes("操作过于频繁")) {
-      if (message.includes("另一场未结束比赛")) joinDeniedRooms.add(roomId);
-      await replaceRoomSnapshot();
-    }
+    if (message.includes("另一场未结束比赛")) joinDeniedRooms.add(roomId);
+    await replaceRoomSnapshot().catch(() => undefined);
   }
 };
 
@@ -639,28 +716,21 @@ const emitDirect = async (event: Extract<DuelEvent, { type: "room.closed" | "pla
 
 const refreshGlobalModeration = async () => {
   try {
+    const requestedAt = Date.now();
     const remote = await fetchSnapshot("global", "public-lobby");
     if (mode === "home" && roomId === "global") {
+      if (lastRoomLiveStateAt > requestedAt) return;
       await mergeHomeGlobalSnapshot(remote);
       return;
     }
     globalModeration = applyEvents("global", remote.map((item) => item.event));
   } catch {
-    globalModeration = mode === "home" && roomId === "global" ? state : createInitialState("global");
+    if (mode === "home" && roomId === "global") globalModeration = state;
   }
 };
 
 const mergeHomeGlobalSnapshot = async (incoming: SignedEnvelope[]) => {
-  for (const envelope of incoming) {
-    if (envelope.event.roomId !== "global") continue;
-    if (envelopes.some((item) => item.event.id === envelope.event.id)) continue;
-    if (await verifyEnvelope(envelope)) envelopes.push(envelope);
-  }
-  envelopes = envelopes.filter((item) => item.event.roomId === "global");
-  envelopes.sort(compareEnvelopes);
-  state = applyEvents("global", envelopes.map((item) => item.event));
-  globalModeration = state;
-  saveHistory();
+  await applyAuthoritativeSnapshot(incoming);
 };
 
 const ensureGlobalAdminJoined = async () => {
@@ -777,7 +847,7 @@ const submitCreateRoom = async (event: Event) => {
 
   history.pushState(null, "", `#room=${nextRoom}&secret=${nextSecret}`);
   await enterFromHash();
-  await emit({ ...baseEvent("room.configured"), problems, rated: customProblems.length ? false : !draft.unrated });
+  await emit({ ...baseEvent("room.configured"), problems, rated: customProblems.length ? false : !draft.unrated, hostName: identity.luoguName });
   } finally {
     creatingRoom = false;
     notify();
@@ -931,20 +1001,35 @@ const openVote = async (kind: VoteKind, targetPid?: string, replacement?: Proble
 };
 
 const replaceProblem = async (targetPid: string) => {
-  void targetPid;
-  setStatus("换题功能将在判题系统完成后开放", "error");
+  const current = state.problems.find((problem) => problem.pid === targetPid);
+  if (!current || replacingProblems.has(targetPid) || state.phase !== "arena") return;
+  replacingProblems.add(targetPid);
+  notify();
+  try {
+    setStatus(`正在为 ${targetPid} 查找低一级题目`);
+    const replacement = await pickReplacementProblem(current, state.problems, `${roomId}:${state.lamport}:${identity.id}`);
+    await openVote("replace-problem", targetPid, replacement);
+    setStatus(`${targetPid} → ${replacement.pid}，等待投票`);
+  } catch (error) {
+    setStatus(friendlyError(error, "换题失败"), "error");
+  } finally {
+    replacingProblems.delete(targetPid);
+    notify();
+  }
 };
 
 const judgeProblem = async (problem: Problem) => {
   const key = `${problem.platform ?? "luogu"}:${problem.pid}`;
-  if (judgingProblems.has(key) || state.phase !== "arena" || !state.startedAt) return;
+  if (judgingProblems.has(key) || judgeCooldownRemaining() > 0 || state.phase !== "arena" || !state.startedAt) return;
   judgingProblems.add(key);
   notify();
   try {
     const players = Object.values(state.players).filter((player) => isTeam(player.team) && !moderationRecordForPlayer(player));
-    const records = await fetchVJudgeRecords(problem, players.map((player) => player.luoguName), state.startedAt);
+    startJudgeCooldown();
+    const records = await fetchVJudgeRecords(problem, players.map((player) => player.luoguName), state.startedAt, identity.luoguName);
     for (const record of records) {
-      if (!state.feed.some((item) => item.recordId === record.recordId && item.pid === record.pid)) {
+      const existing = state.feed.find((item) => item.recordId === record.recordId && item.pid === record.pid);
+      if (!existing || existing.status !== record.status || existing.at !== record.at) {
         await emit({ ...baseEvent("judge.recordSeen"), record });
       }
     }
@@ -1041,12 +1126,15 @@ const Home = () => (
         <Terminal size={18} />
         <div>
           <h1>创建 VJudge Duel</h1>
-          <p>与你的朋友产生一场亲切的对决！</p>
+          <p>与朋友创建一场友好的对决。</p>
         </div>
       </div>
       <div class="home-announcement">
         <h3>公告</h3>
-        <p>我们创建了一个 QQ 群：1059528564，可以反馈修改建议或进行学术讨论<br/>并且由于此页面采用轻服务器设计<br/>所以许多功能快速访问有bug</p>
+        <p>QQ 群：1059528564</p>
+        <p>由于洛谷对现在的爬取 bot 的限制越加严厉，我们已将相关流量转移至 VJudge</p>
+        <p>请勿使用本程序进行任何恶意行为，如有发现，你将被 VD 管理员强制封号</p>
+        <button type="button" class="sponsor-trigger" onClick={() => void showSponsorCode()}>赞助</button>
         <BanAnnouncement />
       </div>
       <form class="create-form" onSubmit={(event) => void submitCreateRoom(event)}>
@@ -1059,7 +1147,7 @@ const Home = () => (
           <DifficultyControl label="最高难度" value={draft.difficultyHigh} set={(value) => (draft.difficultyHigh = value)} />
         </div>
         <label class="wide custom-problems-field">
-          <span>自定义题目 <small>洛谷：B/P/T/U 开头；AtCoder：AT_abc128_a；Codeforces：CF2061B。使用后自动 UNR</small></span>
+          <span>自定义题目 <small>洛谷：P/B/T/U 开头；AtCoder：请用 AT_ 开头；Codeforces：请用 CF 开头。使用后该比赛不计入评分</small></span>
           <textarea disabled={creatingRoom} value={draft.customProblems} placeholder="每行一个题目；留空则按题库随机抽取" onInput={(event) => {
             draft.customProblems = event.currentTarget.value;
             const count = parseCustomProblems(draft.customProblems).length;
@@ -1105,7 +1193,6 @@ const Home = () => (
         <Users size={18} />
         <div>
           <h2>公开房间</h2>
-          <p>最新 20 场对决，准备中优先。</p>
         </div>
         <button class="ghost icon-only" onClick={() => void loadDirectory()}>
           <RefreshCw size={16} />
@@ -1435,7 +1522,9 @@ const ratingRows = (): RatingRow[] => {
   for (const user of users) ensure(user.name);
   if (identity?.luoguName) ensure(identity.luoguName);
   for (const room of sortedRooms()) {
-    for (const name of [room.host, ...(room.redPlayers ?? []), ...(room.bluePlayers ?? [])]) ensure(name);
+    for (const name of [room.host, ...(room.redPlayers ?? []), ...(room.bluePlayers ?? [])]) {
+      if (name && normalizeName(name) !== "unknown" && name !== "待同步") ensure(name);
+    }
   }
   return [...map.values()].sort((a, b) => b.rating - a.rating || b.wins - a.wins || a.name.localeCompare(b.name));
 };
@@ -1454,7 +1543,7 @@ const AdminPage = () => {
 
       <section class="panel admin-section">
         <div class="admin-section-head">
-          <div><h2>玩家管理</h2><p>封禁原因会应用到下方执行的封禁操作。</p></div>
+          <div><h2>玩家管理</h2><p>封禁原因用于封禁操作。</p></div>
           <input value={draft.adminReason} placeholder="封禁原因（可选）" onInput={(event) => (draft.adminReason = event.currentTarget.value)} />
         </div>
         <div class="admin-player-list">
@@ -1481,7 +1570,7 @@ const AdminPage = () => {
       </section>
 
       <section class="panel admin-section">
-        <div class="admin-section-head"><div><h2>房间管理</h2><p>仅显示准备中或进行中的房间。</p></div></div>
+        <div class="admin-section-head"><div><h2>房间管理</h2></div></div>
         <div class="admin-room-list">
           {managedRooms.length ? managedRooms.map((room) => {
             const busy = adminBusy.has(`room:${room.roomId}`);
@@ -1576,7 +1665,7 @@ const playerCount = (room: RoomListing): number => {
 
 const Roster = () => (
   <div class="teams">
-    {(["red", "blue", "spectator"] as Seat[]).map((seat) => (
+    {(["red", "blue"] as const).map((seat) => (
       <div class={`team-card ${seat}`} key={seat}>
         <h3>{teamName(seat)}</h3>
         {Object.values(state.players).filter((player) => player.team === seat).length ? (
@@ -1628,15 +1717,15 @@ const Problems = () => (
           )}
           <span>{problem.score} pts</span>
         </div>
-        {problem.difficulty ? <DifficultyBadge level={problem.difficulty} /> : <em>random</em>}
+        {problem.difficulty ? <DifficultyBadge level={problem.difficulty} /> : <em>自定义</em>}
         <strong>{problem.solvedBy?.luoguName ?? (state.phase === "lobby" ? "hidden" : "unclaimed")}</strong>
         {state.phase === "arena" && isTeam(currentSeat()) && !blockedByBan() ? (
           <div class="problem-actions">
-            <button disabled={judgingProblems.has(`${problem.platform ?? "luogu"}:${problem.pid}`)} onClick={() => void judgeProblem(problem)}>
+            <button disabled={judgingProblems.has(`${problem.platform ?? "luogu"}:${problem.pid}`) || judgeCooldownRemaining() > 0} onClick={() => void judgeProblem(problem)}>
               {judgingProblems.has(`${problem.platform ?? "luogu"}:${problem.pid}`) ? <RefreshCw class="spin" size={13} /> : null}
-              {judgingProblems.has(`${problem.platform ?? "luogu"}:${problem.pid}`) ? "同步中" : "判题"}
+              {judgingProblems.has(`${problem.platform ?? "luogu"}:${problem.pid}`) ? "同步中" : judgeCooldownRemaining() > 0 ? `${judgeCooldownRemaining()}s` : "判题"}
             </button>
-            <button onClick={() => void replaceProblem(problem.pid)}>换题</button>
+            <button disabled={replacingProblems.has(problem.pid)} onClick={() => void replaceProblem(problem.pid)}>{replacingProblems.has(problem.pid) ? <RefreshCw class="spin" size={13} /> : null}{replacingProblems.has(problem.pid) ? "查找中" : "换题"}</button>
             <button onClick={() => void openVote("delete-problem", problem.pid)}>删题</button>
           </div>
         ) : null}
@@ -1897,13 +1986,11 @@ const AuthError = () => (
         <strong class="login-title"><KeyRound size={17} />VJudge 登录</strong>
         <ol class="login-guide">
           <li>输入你的 VJudge 用户名。</li>
-          <li>登录 VJudge 后，点击右上角自己的用户名，选择“更新资料”。</li>
-          <li>在“学校”字段原有内容后加入下面的六位数字并保存。</li>
-          <li>回到这里点击“验证登录”。</li>
+          <li>打开 VJudge 首页并登录。</li>
+          <li>在 10 秒内返回并点击“验证登录”。</li>
         </ol>
         <input disabled={loginSubmitting} value={vjudgeUsername} placeholder="VJudge 用户名" onInput={(event) => (vjudgeUsername = event.currentTarget.value)} />
-        <code>{vjudgeChallenge}</code>
-        <a href={vjudgeUsername.trim() ? `https://vjudge.net/user/${encodeURIComponent(vjudgeUsername.trim())}` : "https://vjudge.net/user"} target="_blank" rel="noreferrer">打开 VJudge 个人主页</a>
+        <a href="https://vjudge.net/" target="_blank" rel="noreferrer">打开 VJudge 首页</a>
         <button class={loginSubmitting ? "is-loading" : ""} disabled={loginSubmitting} type="submit">
           {loginSubmitting ? <RefreshCw class="spin" size={16} /> : null}{loginSubmitting ? "正在读取 VJudge 资料…" : "验证登录"}
         </button>
@@ -1929,7 +2016,7 @@ const submitVJudgeLogin = async (event: Event) => {
   loginSubmitting = true;
   notify();
   try {
-    vjudgeSession = await verifyVJudgeLogin(vjudgeUsername, vjudgeChallenge);
+    vjudgeSession = await verifyVJudgeLogin(vjudgeUsername);
     identity = await renameIdentity(identity, vjudgeSession.username);
     authErrorText = "";
     bootPhase = "ready";
@@ -1938,7 +2025,6 @@ const submitVJudgeLogin = async (event: Event) => {
     await enterFromHash();
   } catch (error) {
     authErrorText = error instanceof Error ? error.message : "VJudge 登录失败";
-    vjudgeChallenge = createVJudgeChallenge();
   } finally {
     loginSubmitting = false;
   }
@@ -1949,13 +2035,13 @@ const Loading = () => (
   <main class="center-screen">
     <Bot size={42} />
     <h1>Connecting</h1>
-    <p>正在装载身份与房间网络。</p>
+    <p>正在连接。</p>
   </main>
 );
 
 const BootScreen = ({ leaving }: { leaving: boolean }) => (
   <main class={`boot-screen${leaving ? " leaving" : ""}`}>
-    <div class="boot-loading">Loading</div>
+    <div class="boot-loading">Loading...</div>
   </main>
 );
 
@@ -2009,6 +2095,34 @@ const joinRoom = (room: RoomListing) => {
 
 const hasCustomProblems = (): boolean => draft.customProblems.trim().length > 0;
 
+const showSponsorCode = async () => {
+  await Swal.fire({
+    title: "赞助",
+    imageUrl: "https://cdn.luogu.com.cn/upload/image_hosting/7uzglkak.png",
+    imageAlt: "赞助码",
+    imageWidth: 280,
+    confirmButtonText: "关闭",
+    customClass: { popup: "duel-swal", confirmButton: "duel-swal-confirm" }
+  });
+};
+
+const judgeCooldownRemaining = (): number => {
+  try {
+    const until = Number(localStorage.getItem(judgeCooldownKey()) || 0);
+    return Math.max(0, Math.ceil((until - Date.now()) / 1000));
+  } catch {
+    return 0;
+  }
+};
+
+const startJudgeCooldown = () => {
+  try {
+    localStorage.setItem(judgeCooldownKey(), String(Date.now() + 60_000));
+  } catch {
+    // Server-side rate limiting remains authoritative.
+  }
+};
+
 const vjudgeProblemUrl = (problem: Problem): string => {
   const source = problem.platform === "codeforces" ? "Codeforces" : problem.platform === "atcoder" ? "AtCoder" : "洛谷";
   return `https://vjudge.net/problem/${encodeURIComponent(source)}-${encodeURIComponent(problem.pid)}`;
@@ -2045,8 +2159,8 @@ function readAvatarCache(): Record<string, string> {
     if (!raw) return {};
     const parsed = JSON.parse(raw) as Record<string, string | { url?: string }>;
     return Object.fromEntries(Object.entries(parsed).flatMap(([key, value]) => {
-      if (typeof value === "string" && value && value !== bannedAvatarUrl) return [[key, value]];
-      if (typeof value === "object" && typeof value?.url === "string" && value.url && value.url !== bannedAvatarUrl) return [[key, value.url]];
+      if (typeof value === "string" && value) return [[key, value]];
+      if (typeof value === "object" && typeof value?.url === "string" && value.url) return [[key, value.url]];
       return [];
     }));
   } catch {
@@ -2069,7 +2183,7 @@ function readUserCache(): Record<string, { user: UserRecord; cachedAt: number }>
     if (!raw) return {};
     const parsed = JSON.parse(raw) as Record<string, { user?: UserRecord; cachedAt?: number }>;
     return Object.fromEntries(Object.entries(parsed).flatMap(([key, value]) =>
-      value.user && typeof value.cachedAt === "number" && value.user.avatar !== bannedAvatarUrl
+      value.user && typeof value.cachedAt === "number"
         ? [[key, value as { user: UserRecord; cachedAt: number }]]
         : []
     ));
@@ -2085,11 +2199,6 @@ const writeUserCache = () => {
   }
 };
 const writeCachedUser = (user: UserRecord) => {
-  if (user.avatar === bannedAvatarUrl) {
-    delete userCache[normalizeName(user.name)];
-    writeUserCache();
-    return;
-  }
   userCache[normalizeName(user.name)] = { user, cachedAt: Date.now() };
   writeUserCache();
 };
@@ -2248,7 +2357,7 @@ const matchTitle = (): string => {
 };
 const teamSummary = (): string => {
   const count = (seat: Seat) => Object.values(state.players).filter((player) => player.team === seat).length;
-  return `红 ${count("red")} / 蓝 ${count("blue")} / 观赛 ${count("spectator")}`;
+  return `红 ${count("red")} / 蓝 ${count("blue")}`;
 };
 
 const rememberActiveRoomIfNeeded = () => {
