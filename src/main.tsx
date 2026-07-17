@@ -1035,6 +1035,9 @@ const judgeProblem = async (problem: Problem) => {
     }
     setStatus(records.length ? `${problem.pid} 已同步 ${records.length} 条提交` : `${problem.pid} 暂无开赛后的提交`);
   } catch (error) {
+    if(error instanceof Error && error.message === "403") {
+      setStatus("请刷新通过人机验证再尝试点击判题", "error");
+    }
     setStatus(friendlyError(error, "VJudge 判题同步失败"), "error");
   } finally {
     judgingProblems.delete(key);
@@ -1147,7 +1150,7 @@ const Home = () => (
           <DifficultyControl label="最高难度" value={draft.difficultyHigh} set={(value) => (draft.difficultyHigh = value)} />
         </div>
         <label class="wide custom-problems-field">
-          <span>自定义题目 <small>洛谷：P/B/T/U 开头；AtCoder：请用 AT_ 开头；Codeforces：请用 CF 开头。使用后该比赛不计入评分</small></span>
+          <span>自定义题目 <small>按照洛谷 RMJ 的命名格式。使用后该比赛不计入评分</small></span>
           <textarea disabled={creatingRoom} value={draft.customProblems} placeholder="每行一个题目；留空则按题库随机抽取" onInput={(event) => {
             draft.customProblems = event.currentTarget.value;
             const count = parseCustomProblems(draft.customProblems).length;
@@ -2117,7 +2120,7 @@ const judgeCooldownRemaining = (): number => {
 
 const startJudgeCooldown = () => {
   try {
-    localStorage.setItem(judgeCooldownKey(), String(Date.now() + 60_000));
+    localStorage.setItem(judgeCooldownKey(), String(Date.now() + 30_000));
   } catch {
     // Server-side rate limiting remains authoritative.
   }

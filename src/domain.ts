@@ -409,7 +409,7 @@ const kickPlayer = (state: DuelState, actorId: string, targetId: string, targetN
     return;
   }
   const record: ModerationRecord = {
-    reason: `${reason.trim() || "管理员封禁"}（请找管理员 sLMxf 解封）`,
+    reason: `${reason.trim() || "管理员封禁"}`,
     by: actor.luoguName,
     at
   };

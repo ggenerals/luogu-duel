@@ -878,7 +878,7 @@ const fetchVJudgeStatus = async (requestUrl: URL, request: Request, env: Env): P
   const judgeLimit = await env.JUDGE_RATE_LIMITER.limit({ key: clientKey });
   if (!judgeLimit.success) {
     return Response.json(
-      { error: "判题冷却中，请 60 秒后重试" },
+      { error: "判题冷却中，请 30 秒后重试" },
       { status: 429, headers: { "cache-control": "no-store", "retry-after": "60" } }
     );
   }
@@ -967,11 +967,11 @@ const verifyVJudgeLogin = async (request: Request, env: Env): Promise<Response> 
       cf: { cacheTtl: 0 },
       signal: AbortSignal.timeout(10_000)
     });
-    if (response.status === 404) return jsonError("未找到该 VJudge 用户", 404);
+    if (response.status === 404) return jsonError("未识别到人脸", 404);
     if (!response.ok) throw new Error(`VJudge 返回 ${response.status}`);
     const html = await response.text();
     const lastSeen = extractProfileField(html, "user.profile.last_seen");
-    if (!isRecentVJudgeActivity(lastSeen)) return jsonError("未检测到最近 10 秒内的 VJudge 登录", 403);
+    if (!isRecentVJudgeActivity(lastSeen)) return jsonError("未检测到最近 10 秒内的 VJudge 登录，登录信息为"+`"${lastSeen}"`, 403);
     const avatar = extractVJudgeAvatar(html);
     const saved = await env.DUEL_ROOM.getByName("__directory").fetch(
       new Request(`https://duel.internal/users/${encodeURIComponent(username)}`, {
@@ -1095,7 +1095,7 @@ const systemCloseEnvelope = async (roomId: string, lamport: number, issuedAt: nu
     lamport,
     issuedAt,
     actorName: "gcend",
-    reason: "房间创建 10 分钟仍未开始，已自动关闭"
+    reason: "已自动关闭"
   };
   const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, textBytes(stableStringify(event)));
   return { publicKey, event, signature: btoa(String.fromCharCode(...new Uint8Array(signature))) };
@@ -1145,6 +1145,6 @@ body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b101
 main{max-width:560px;padding:28px;border:1px solid #263241;border-radius:8px;background:#111820;box-shadow:0 20px 70px #0008}
 h1{margin:0 0 8px;font-size:24px}p{margin:0;color:#a8b3c1}
 </style>
-<main><h1>Luogu Duel 正在维护</h1><p>本次更新正在清空旧房间与刷新用户数据，稍后自动恢复访问。</p></main>`;
+<main><h1>VJ DUEL 日报！</h1><p>请不要多次刷新，当前正在维护</p></main>`;
 
 const jsonError = (message: string, status: number): Response => Response.json({ error: message }, { status });
