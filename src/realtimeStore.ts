@@ -11,6 +11,8 @@ export type RoomListing = {
   endedAt?: number;
   winner?: "red" | "blue" | "draw";
   rated?: boolean;
+  averageDifficulty?: number;
+  minimumDifficulty?: number;
   closedReason?: string;
   redPlayers?: string[];
   bluePlayers?: string[];
@@ -22,6 +24,7 @@ export type UserRecord = {
   wins: number;
   losses: number;
   games: number;
+  ratingHistory?: Array<{ at: number; rating: number }>;
   avatar?: string;
   color?: string;
   profileHtml?: string;

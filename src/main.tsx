@@ -1,6 +1,8 @@
 ﻿import "./style.css";
 import Swal from "sweetalert2";
 import "sweetalert2/dist/sweetalert2.min.css";
+import type VditorType from "vditor";
+import "vditor/dist/index.css";
 import type { ComponentChildren, JSX } from "preact";
 import { render } from "preact";
 import {
@@ -96,8 +98,12 @@ let socket: WebSocket | null = null;
 let directorySocket: WebSocket | null = null;
 let reconnectTimer: number | undefined;
 let directoryReconnectTimer: number | undefined;
+let reconnectNoticeTimer: number | undefined;
+let directoryReconnectNoticeTimer: number | undefined;
 let roomReconnectAttempts = 0;
 let directoryReconnectAttempts = 0;
+let roomSocketGeneration = 0;
+let directorySocketGeneration = 0;
 let directoryLiveSnapshotReceived = false;
 let lastDirectoryLiveAt = 0;
 let lastUsersLiveAt = 0;
@@ -114,6 +120,8 @@ let lastRoomLiveStateAt = 0;
 let statusText = "booting...";
 let statusTone: "info" | "error" = "info";
 let authErrorText = "";
+let announcementTitle = "VJudge Duel 公告";
+let announcementContent = "正在读取公告…";
 let vjudgeUsername = "";
 let creatingRoom = false;
 let loginSubmitting = false;
@@ -127,8 +135,8 @@ let toasts: ToastMessage[] = [];
 const notifiedKeys = new Set<string>();
 const joinDeniedRooms = new Set<string>();
 const systemLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/tq5l4861.png";
-const darkBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/nd1187ou.png";
-const lightBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/nd1187ou.png";
+const darkBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/giufbahf.png";
+const lightBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/tq5l4861.png";
 const avatarCacheKey = "luogu-duel.avatar-cache.v1";
 const userCacheKey = "luogu-duel.user-cache.v1";
 const registrationCacheKey = "luogu-duel.registration-cache.v1";
@@ -138,6 +146,12 @@ const avatarCache: Record<string, string> = readAvatarCache();
 const userCache: Record<string, { user: UserRecord; cachedAt: number }> = readUserCache();
 const avatarLoading = new Set<string>();
 const avatarMissing = new Set<string>();
+let profileVditor: VditorType | null = null;
+let chatVditor: VditorType | null = null;
+let chatVditorTarget: HTMLDivElement | null = null;
+let chatVditorGeneration = 0;
+let vditorModulePromise: Promise<typeof import("vditor")> | null = null;
+const vditorPreviewSources = new WeakMap<HTMLElement, string>();
 let themeMode = readThemeMode();
 const themeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
@@ -145,7 +159,9 @@ const draft = {
   userMenuOpen: false,
   themeMenuOpen: false,
   roomTab: "duel" as "duel" | "ranking",
+  profileTab: "home" as "home" | "matches" | "achievements",
   profileEditing: false,
+  profileDraft: "",
   chat: "",
   roomCount: 9,
   customProblems: "",
@@ -156,9 +172,11 @@ const draft = {
   pickerStatus: "",
   closeReason: "房主关闭房间",
   adminTarget: "",
+  adminSearch: "",
   adminReason: "",
   adminRatings: {} as Record<string, string>,
-  teamsOpen: false
+  teamsOpen: false,
+  spectatorsOpen: false
 };
 
 type ToastMessage = {
@@ -174,7 +192,16 @@ const activeRoomKey = `luogu-duel.active-room.${dataVersion}`;
 const historyKey = `luogu-duel.history.${dataVersion}`;
 const directoryCacheKey = "vjudge-duel.directory-cache.v2";
 const eventCacheKey = (id: string) => `vjudge-duel.events.${dataVersion}.${id}`;
+const announcementCacheKey = "vjudge-duel.announcement.v1";
 const judgeCooldownKey = () => `vjudge-duel.judge-cooldown.v1.${normalizeName(identity?.luoguName ?? "anonymous")}`;
+const temporaryBanKey = "vjudge-duel.security.ban-until.v1";
+const temporaryBanReasonKey = "vjudge-duel.security.ban-reason.v1";
+const temporaryMuteKey = "vjudge-duel.security.mute-until.v1";
+let temporaryBanUntil = readStoredNumber(temporaryBanKey);
+let temporaryBanReason = readStoredText(temporaryBanReasonKey) || "操作过于频繁";
+let temporaryMuteUntil = readStoredNumber(temporaryMuteKey);
+
+recordBurst("refresh", 4_000, 3, () => applyTemporaryBan(20_000, "4 秒内刷新次数过多"));
 
 const notify = (forceStickChat = false) => {
   const stickChat = forceStickChat || shouldStickChats();
@@ -204,29 +231,43 @@ const finishBootScreen = () => {
 const boot = async () => {
   identity = await loadIdentity();
   applyTheme();
+  void loadAnnouncement();
   themeQuery.addEventListener("change", () => {
     if (themeMode === "system") applyTheme();
     notify();
   });
   clockTimer ??= window.setInterval(() => {
-    if (mode === "room" && state.phase === "arena") notify();
+    if ((mode === "room" && state.phase === "arena") || temporaryBanUntil > Date.now() || temporaryMuteUntil > Date.now()) notify();
   }, 1_000);
   syncTimer ??= window.setInterval(() => void periodicSync(), 60_000);
   heartbeatTimer ??= window.setInterval(() => {
+    if (document.visibilityState !== "visible") return;
     const now = Date.now();
     if (socket?.readyState === WebSocket.OPEN) {
-      if (roomLastPongAt && now - roomLastPongAt > 90_000) socket.close();
-      else socket.send(JSON.stringify({ type: "ping", at: now }));
+      if (roomLastPongAt && now - roomLastPongAt > 120_000) socket.close();
+      else socket.send("ping");
     }
     if (directorySocket?.readyState === WebSocket.OPEN) {
-      if (directoryLastPongAt && now - directoryLastPongAt > 90_000) directorySocket.close();
-      else directorySocket.send(JSON.stringify({ type: "ping", at: now }));
+      if (directoryLastPongAt && now - directoryLastPongAt > 120_000) directorySocket.close();
+      else directorySocket.send("ping");
     }
-  }, 30_000);
+  }, 45_000);
   window.addEventListener("hashchange", () => void enterFromHash());
   window.addEventListener("online", () => {
     connectRoom();
     connectDirectory();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    const now = Date.now();
+    if (socket?.readyState === WebSocket.OPEN) {
+      roomLastPongAt = now;
+      socket.send("ping");
+    }
+    if (directorySocket?.readyState === WebSocket.OPEN) {
+      directoryLastPongAt = now;
+      directorySocket.send("ping");
+    }
   });
 
   vjudgeSession = loadVJudgeSession();
@@ -271,6 +312,8 @@ const enterFromHash = async () => {
   lastRoomLiveStateAt = 0;
   clearFinishTimer();
   draft.chat = "";
+  chatVditor?.setValue("", true);
+  draft.spectatorsOpen = false;
   draft.closeReason = isAdmin() ? "管理员强制关闭房间" : "房主关闭房间";
 
   if (mode === "home" || mode === "admin") {
@@ -357,6 +400,8 @@ const setThemeMode = (next: "system" | "light" | "dark") => {
     // ignore
   }
   applyTheme();
+  profileVditor?.setTheme(currentVditorTheme() === "dark" ? "dark" : "classic");
+  chatVditor?.setTheme(currentVditorTheme() === "dark" ? "dark" : "classic");
   draft.themeMenuOpen = false;
   notify();
 };
@@ -421,37 +466,59 @@ const connectRoom = () => {
   if (!shouldConnectRoomSocket()) return;
   if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
   if (!allowServerRequest()) return;
+  if (reconnectTimer) window.clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
   closeSocket(false);
-  socket = new WebSocket(roomWebSocketUrl(roomId, roomSecret));
-  socket.addEventListener("open", () => {
+  const generation = ++roomSocketGeneration;
+  const nextSocket = new WebSocket(roomWebSocketUrl(roomId, roomSecret));
+  socket = nextSocket;
+  nextSocket.addEventListener("open", () => {
+    if (generation !== roomSocketGeneration) return;
     roomReconnectAttempts = 0;
     roomLastPongAt = Date.now();
+    if (reconnectNoticeTimer) window.clearTimeout(reconnectNoticeTimer);
+    reconnectNoticeTimer = undefined;
     statusTone = "info";
-    statusText = "WebSocket 已连接";
+    statusText = roomId === "global" ? "大厅在线" : "房间实时在线";
     notify();
   });
-  socket.addEventListener("message", (event) => void handleServerMessage(event.data));
-  socket.addEventListener("close", () => {
-    socket = null;
+  nextSocket.addEventListener("message", (event) => {
+    if (generation !== roomSocketGeneration) return;
+    roomLastPongAt = Date.now();
+    if (event.data === "pong") return;
+    void handleServerMessage(event.data);
+  });
+  nextSocket.addEventListener("close", () => {
+    if (generation !== roomSocketGeneration) return;
+    if (socket === nextSocket) socket = null;
     if (shouldConnectRoomSocket()) {
-      statusTone = "error";
-      statusText = "连接休眠或断开，正在重连";
-      const delay = Math.min(60_000, 3_000 * 2 ** Math.min(roomReconnectAttempts, 5));
+      const delay = Math.min(30_000, 500 * 2 ** Math.min(roomReconnectAttempts, 6));
       roomReconnectAttempts += 1;
       reconnectTimer = window.setTimeout(connectRoom, delay);
-      notify();
+      if (!reconnectNoticeTimer) {
+        reconnectNoticeTimer = window.setTimeout(() => {
+          reconnectNoticeTimer = undefined;
+          if (generation !== roomSocketGeneration || socket?.readyState === WebSocket.OPEN) return;
+          statusTone = "info";
+          statusText = "连接中断，正在恢复";
+          notify();
+        }, 4_000);
+      }
     }
   });
-  socket.addEventListener("error", () => {
-    statusTone = "error";
-    statusText = "WebSocket 错误，HTTP 兜底仍可用";
-    notify();
+  nextSocket.addEventListener("error", () => {
+    if (generation !== roomSocketGeneration) return;
+    // close 事件统一负责重连，避免 error + close 连续刷新状态。
   });
 };
+const notifyDraft = () => render(<App />, app);
 
 const closeSocket = (clearTimer = true) => {
+  roomSocketGeneration += 1;
   if (clearTimer && reconnectTimer) window.clearTimeout(reconnectTimer);
+  if (reconnectNoticeTimer) window.clearTimeout(reconnectNoticeTimer);
   reconnectTimer = undefined;
+  reconnectNoticeTimer = undefined;
   if (socket) socket.close();
   socket = null;
 };
@@ -460,37 +527,58 @@ const connectDirectory = () => {
   if (mode !== "home" && mode !== "admin") return;
   if (directorySocket?.readyState === WebSocket.OPEN || directorySocket?.readyState === WebSocket.CONNECTING) return;
   if (!allowServerRequest()) return;
+  if (directoryReconnectTimer) window.clearTimeout(directoryReconnectTimer);
+  directoryReconnectTimer = undefined;
   closeDirectory(false);
-  directorySocket = new WebSocket(directoryWebSocketUrl());
-  directorySocket.addEventListener("open", () => {
+  const generation = ++directorySocketGeneration;
+  const nextSocket = new WebSocket(directoryWebSocketUrl());
+  directorySocket = nextSocket;
+  nextSocket.addEventListener("open", () => {
+    if (generation !== directorySocketGeneration) return;
     directoryReconnectAttempts = 0;
     directoryLastPongAt = Date.now();
+    if (directoryReconnectNoticeTimer) window.clearTimeout(directoryReconnectNoticeTimer);
+    directoryReconnectNoticeTimer = undefined;
     statusTone = "info";
     statusText = "大厅实时连接已建立";
     notify();
   });
-  directorySocket.addEventListener("message", (event) => void handleDirectoryMessage(event.data));
-  directorySocket.addEventListener("close", () => {
-    directorySocket = null;
+  nextSocket.addEventListener("message", (event) => {
+    if (generation !== directorySocketGeneration) return;
+    directoryLastPongAt = Date.now();
+    if (event.data === "pong") return;
+    void handleDirectoryMessage(event.data);
+  });
+  nextSocket.addEventListener("close", () => {
+    if (generation !== directorySocketGeneration) return;
+    if (directorySocket === nextSocket) directorySocket = null;
     if (mode === "home" || mode === "admin") {
-      statusTone = "error";
-      statusText = "大厅实时连接断开，使用低频 HTTP 兜底";
-      const delay = Math.min(120_000, 10_000 * 2 ** Math.min(directoryReconnectAttempts, 4));
+      const delay = Math.min(60_000, 1_000 * 2 ** Math.min(directoryReconnectAttempts, 6));
       directoryReconnectAttempts += 1;
       directoryReconnectTimer = window.setTimeout(connectDirectory, delay);
-      notify();
+      if (!directoryReconnectNoticeTimer) {
+        directoryReconnectNoticeTimer = window.setTimeout(() => {
+          directoryReconnectNoticeTimer = undefined;
+          if (generation !== directorySocketGeneration || directorySocket?.readyState === WebSocket.OPEN) return;
+          statusTone = "info";
+          statusText = "大厅连接中断，正在恢复";
+          notify();
+        }, 5_000);
+      }
     }
   });
-  directorySocket.addEventListener("error", () => {
-    statusTone = "error";
-    statusText = "大厅实时连接错误，使用低频 HTTP 兜底";
-    notify();
+  nextSocket.addEventListener("error", () => {
+    if (generation !== directorySocketGeneration) return;
+    // close 事件统一负责重连，避免重复提示。
   });
 };
 
 const closeDirectory = (clearTimer = true) => {
+  directorySocketGeneration += 1;
   if (clearTimer && directoryReconnectTimer) window.clearTimeout(directoryReconnectTimer);
+  if (directoryReconnectNoticeTimer) window.clearTimeout(directoryReconnectNoticeTimer);
   directoryReconnectTimer = undefined;
+  directoryReconnectNoticeTimer = undefined;
   if (directorySocket) directorySocket.close();
   directorySocket = null;
 };
@@ -543,6 +631,11 @@ const handleServerMessage = async (raw: string) => {
     statusText = message.message;
     if (message.message.includes("另一场未结束比赛")) joinDeniedRooms.add(roomId);
     await replaceRoomSnapshot().catch(() => undefined);
+    if (message.message.includes("每天最多创建 1 场")) {
+      localStorage.removeItem(eventCacheKey(roomId));
+      location.hash = "";
+      return;
+    }
   }
   notify();
 };
@@ -576,7 +669,12 @@ const replaceRoomSnapshot = async () => {
 };
 
 const ensureJoined = async () => {
-  if (mode !== "room" || state.phase !== "lobby" || state.players[identity.id] || bannedRecord() || joinDeniedRooms.has(roomId)) return;
+  if (mode !== "room" || state.phase === "finished" || state.players[identity.id] || bannedRecord() || joinDeniedRooms.has(roomId)) return;
+  if (state.phase === "arena") {
+    await emit({ ...baseEvent("player.joined"), luoguName: identity.luoguName, team: "spectator" });
+    rememberSeat("spectator");
+    return;
+  }
   const active = readActiveRoom();
   if (active?.roomId && active.roomId !== roomId) {
     setStatus("你正在另一场未结束比赛中，本房以观赛方式打开", "error");
@@ -707,7 +805,13 @@ const pushToast = (title: string, text: string, tone: ToastMessage["tone"] = "in
 
 const emitChat = async (text: string, visibility: "all" | "team") => {
   if (mode === "home") await ensureHomeJoined();
-  await emit({ ...baseEvent("chat.sent"), text, visibility });
+  if (mode === "room" && !state.players[identity.id]) await ensureJoined();
+  const player = state.players[identity.id];
+  if (mode === "room" && !player) {
+    setStatus("尚未加入房间，请稍后重试", "error");
+    return;
+  }
+  await emit({ ...baseEvent("chat.sent"), text, visibility: player?.team === "spectator" ? "all" : visibility });
 };
 
 const emitDirect = async (event: Extract<DuelEvent, { type: "room.closed" | "player.kicked" | "player.unkicked" | "player.muted" | "player.unmuted" }>) => {
@@ -794,8 +898,139 @@ const baseEvent = <T extends DuelEvent["type"]>(type: T) => ({
   issuedAt: Date.now()
 });
 
-const submitCreateRoom = async (event: Event) => {
-  event.preventDefault();
+type RoomDialogValues = {
+  count: number;
+  difficultyLow: DifficultyLevel;
+  difficultyHigh: DifficultyLevel;
+  ratios: PlatformRatios;
+  customProblems: string;
+  unrated: boolean;
+};
+
+const openCreateRoomDialog = async () => {
+  if (creatingRoom) return;
+  const difficultyOptions = difficultyMeta.map((item) => `<option value="${item.value}">${item.label}</option>`).join("");
+  const result = await Swal.fire<RoomDialogValues>({
+    title: "生成房间",
+    html: `
+      <div class="room-builder-dialog">
+        <label><span>题目数量</span><input id="room-builder-count" type="number" min="1" max="21"></label>
+        <div class="room-builder-difficulties">
+          <label><span>最低难度</span><select id="room-builder-low">${difficultyOptions}</select></label>
+          <label><span>最高难度</span><select id="room-builder-high">${difficultyOptions}</select></label>
+        </div>
+        <div class="room-builder-oj">
+          <strong>题目来源 <small>默认 2 : 1 : 1</small></strong>
+          ${(["luogu", "codeforces", "atcoder"] as ProblemPlatform[]).map((platform) => `
+            <div class="room-builder-oj-row">
+              <input id="room-builder-${platform}-enabled" type="checkbox">
+              <label for="room-builder-${platform}-enabled">${platformLabel(platform)}</label>
+              <input id="room-builder-${platform}-weight" type="number" min="1" max="20" aria-label="${platformLabel(platform)} 权重">
+            </div>
+          `).join("")}
+        </div>
+        <label><span>自定义题目 <small>填写后强制 UNR</small></span><textarea id="room-builder-custom" rows="4" placeholder="每行一个题目；留空则随机抽题"></textarea></label>
+        <label class="room-builder-unrated"><input id="room-builder-unrated" type="checkbox"><span>UNR 休闲模式</span></label>
+        <small class="room-builder-cache">本地题库缓存 ${cachedProblemCount()} 条</small>
+      </div>
+    `,
+    showCancelButton: true,
+    confirmButtonText: "开始生成",
+    cancelButtonText: "取消",
+    focusConfirm: false,
+    customClass: { popup: "duel-swal room-builder-swal", confirmButton: "duel-swal-confirm", cancelButton: "duel-swal-cancel" },
+    didOpen: (popup) => {
+      const count = popup.querySelector<HTMLInputElement>("#room-builder-count")!;
+      const low = popup.querySelector("#room-builder-low");
+      const high = popup.querySelector("#room-builder-high");
+      const custom = popup.querySelector<HTMLTextAreaElement>("#room-builder-custom")!;
+      const unrated = popup.querySelector<HTMLInputElement>("#room-builder-unrated")!;
+      if (!(low instanceof HTMLSelectElement) || !(high instanceof HTMLSelectElement)) return;
+      count.value = String(draft.roomCount);
+      low.value = String(draft.difficultyLow);
+      high.value = String(draft.difficultyHigh);
+      custom.value = draft.customProblems;
+      unrated.checked = draft.unrated;
+      const ratioInputs = (["luogu", "codeforces", "atcoder"] as ProblemPlatform[]).map((platform) => {
+        const enabled = popup.querySelector<HTMLInputElement>(`#room-builder-${platform}-enabled`)!;
+        const weight = popup.querySelector<HTMLInputElement>(`#room-builder-${platform}-weight`)!;
+        enabled.checked = draft.ratios[platform] > 0;
+        weight.value = String(draft.ratios[platform] || defaultRatios[platform]);
+        enabled.addEventListener("input", () => { weight.disabled = !enabled.checked || Boolean(custom.value.trim()); });
+        return { enabled, weight };
+      });
+      const paintDifficulty = (select: HTMLSelectElement) => {
+        select.style.color = difficultyMeta.find((item) => item.value === Number(select.value))?.color ?? "var(--text)";
+      };
+      const syncCustom = () => {
+        const usingCustom = Boolean(custom.value.trim());
+        const customCount = parseCustomProblems(custom.value).length;
+        if (customCount) count.value = String(customCount);
+        count.disabled = usingCustom;
+        low.disabled = usingCustom;
+        high.disabled = usingCustom;
+        ratioInputs.forEach(({ enabled, weight }) => {
+          enabled.disabled = usingCustom;
+          weight.disabled = usingCustom || !enabled.checked;
+        });
+        unrated.checked = usingCustom || draft.unrated;
+        unrated.disabled = usingCustom;
+      };
+      low.addEventListener("input", () => paintDifficulty(low));
+      high.addEventListener("input", () => paintDifficulty(high));
+      custom.addEventListener("input", syncCustom);
+      paintDifficulty(low);
+      paintDifficulty(high);
+      syncCustom();
+    },
+    preConfirm: () => {
+      const popup = Swal.getPopup()!;
+      const customProblems = popup.querySelector<HTMLTextAreaElement>("#room-builder-custom")!.value;
+      const custom = parseCustomProblems(customProblems);
+      if (customProblems.trim() && !custom.length) {
+        Swal.showValidationMessage("没有识别到有效的自定义题目");
+        return false;
+      }
+      const low = popup.querySelector("#room-builder-low");
+      const high = popup.querySelector("#room-builder-high");
+      if (!(low instanceof HTMLSelectElement) || !(high instanceof HTMLSelectElement)) return false;
+      const difficultyLow = Number(low.value) as DifficultyLevel;
+      const difficultyHigh = Number(high.value) as DifficultyLevel;
+      if (!custom.length && difficultyLow > difficultyHigh) {
+        Swal.showValidationMessage("最低难度不能高于最高难度");
+        return false;
+      }
+      const ratios = Object.fromEntries((["luogu", "codeforces", "atcoder"] as ProblemPlatform[]).map((platform) => {
+        const enabled = popup.querySelector<HTMLInputElement>(`#room-builder-${platform}-enabled`)!.checked;
+        const weight = Number(popup.querySelector<HTMLInputElement>(`#room-builder-${platform}-weight`)!.value);
+        return [platform, enabled ? clamp(weight, 1, 20) : 0];
+      })) as PlatformRatios;
+      if (!custom.length && Object.values(ratios).every((value) => value === 0)) {
+        Swal.showValidationMessage("至少选择一个题目来源");
+        return false;
+      }
+      return {
+        count: custom.length || clamp(Number(popup.querySelector<HTMLInputElement>("#room-builder-count")!.value), 1, 21),
+        difficultyLow,
+        difficultyHigh,
+        ratios,
+        customProblems,
+        unrated: custom.length > 0 || popup.querySelector<HTMLInputElement>("#room-builder-unrated")!.checked
+      };
+    }
+  });
+  if (!result.isConfirmed || !result.value) return;
+  draft.roomCount = result.value.count;
+  draft.difficultyLow = result.value.difficultyLow;
+  draft.difficultyHigh = result.value.difficultyHigh;
+  draft.ratios = result.value.ratios;
+  draft.customProblems = result.value.customProblems;
+  draft.unrated = result.value.unrated;
+  await submitCreateRoom();
+};
+
+const submitCreateRoom = async (event?: Event) => {
+  event?.preventDefault();
   if (creatingRoom) return;
   creatingRoom = true;
   notify();
@@ -847,7 +1082,13 @@ const submitCreateRoom = async (event: Event) => {
 
   history.pushState(null, "", `#room=${nextRoom}&secret=${nextSecret}`);
   await enterFromHash();
-  await emit({ ...baseEvent("room.configured"), problems, rated: customProblems.length ? false : !draft.unrated, hostName: identity.luoguName });
+  await emit({
+    ...baseEvent("room.configured"),
+    problems,
+    rated: customProblems.length ? false : !draft.unrated,
+    hostName: identity.luoguName,
+    minimumDifficulty: customProblems.length ? undefined : draft.difficultyLow
+  });
   } finally {
     creatingRoom = false;
     notify();
@@ -861,8 +1102,8 @@ const problemBankProgressHtml = (): string => (["luogu", "codeforces", "atcoder"
   })
   .join("");
 
-const submitChat = async (event: Event) => {
-  event.preventDefault();
+const submitChat = async (event?: Event) => {
+  event?.preventDefault();
   const raw = draft.chat.trim();
   if (!raw || blockedByBan()) return;
   if (isMutedCurrent()) {
@@ -872,8 +1113,14 @@ const submitChat = async (event: Event) => {
   const teamMessage = raw.startsWith("/") && mode === "room";
   const text = teamMessage ? raw.slice(1).trim() : raw;
   if (!text) return;
+  if (recordBurst("chat", 5_000, 3, () => applyTemporaryMute(20_000))) {
+    setStatus("发送过于频繁，已临时禁言 20 秒", "error");
+    notify();
+    return;
+  }
   await emitChat(text, teamMessage ? "team" : "all");
   draft.chat = "";
+  chatVditor?.setValue("", true);
   notify(true);
 };
 
@@ -970,6 +1217,12 @@ const leaveOrCloseCurrentMatchForNewRoom = async (): Promise<boolean> => {
 
 const setSeat = async (seat: Seat) => {
   if (blockedByBan() || state.phase !== "lobby") return;
+  if (currentSeat() === seat) return;
+  if (state.hostId === identity.id && seat === "spectator") {
+    setStatus("房主不能进入观战席", "error");
+    return;
+  }
+  if (recordBurst("team", 3_000, 3, () => applyTemporaryBan(10_000, "3 秒内切换队伍次数过多"))) return;
   rememberSeat(seat);
   await emit({ ...baseEvent("player.teamChanged"), team: seat });
 };
@@ -1046,6 +1299,7 @@ const judgeProblem = async (problem: Problem) => {
 };
 
 const App = () => {
+  if (temporaryBanUntil > Date.now()) return <TemporaryBlockOverlay />;
   if (bootPhase === "loading") {
     return <BootScreen leaving={false} />;
   }
@@ -1080,6 +1334,7 @@ const Shell = ({ title, subtitle, children }: { title: string; subtitle: string;
     <header class="topbar">
       <button class="brand" onClick={() => {
         if (mode === "profile") location.href = "/";
+        else if (mode === "room" && currentSeat() === "spectator") void leaveRoom();
         else location.hash = "";
       }}>
         {lightBrandLogoUrl || darkBrandLogoUrl ? <img src={document.documentElement.dataset.theme === "light" ? lightBrandLogoUrl : darkBrandLogoUrl} alt="" /> : null}
@@ -1133,62 +1388,20 @@ const Home = () => (
         </div>
       </div>
       <div class="home-announcement">
-        <h3>公告</h3>
-        <p>QQ 群：1059528564</p>
-        <p>由于洛谷对现在的爬取 bot 的限制越加严厉，我们已将相关流量转移至 VJudge</p>
-        <p>请勿使用本程序进行任何恶意行为，如有发现，你将被 VD 管理员强制封号</p>
-        <button type="button" class="sponsor-trigger" onClick={() => void showSponsorCode()}>赞助</button>
+        <h3>{announcementTitle}</h3>
+        <RichText text={announcementContent} className="announcement-content" />
+        <div class="announcement-actions">
+          <button type="button" class="sponsor-trigger" onClick={() => void showSponsorCode()}>赞助</button>
+          <button type="button" class="rules-ticket" onClick={() => window.open('https://www.luogu.me/article/fgiidurs', '_blank')}>
+            规则与工单
+          </button>
+        </div>
         <BanAnnouncement />
       </div>
-      <form class="create-form" onSubmit={(event) => void submitCreateRoom(event)}>
-        <label>
-          <span>题目数量{hasCustomProblems() ? "（按自定义题目）" : ""}</span>
-          <input disabled={creatingRoom || hasCustomProblems()} type="number" min={1} max={21} value={draft.roomCount} onInput={(event) => (draft.roomCount = Number(event.currentTarget.value))} />
-        </label>
-        <div class="difficulty-row wide">
-          <DifficultyControl label="最低难度" value={draft.difficultyLow} set={(value) => (draft.difficultyLow = value)} />
-          <DifficultyControl label="最高难度" value={draft.difficultyHigh} set={(value) => (draft.difficultyHigh = value)} />
-        </div>
-        <label class="wide custom-problems-field">
-          <span>自定义题目 <small>按照洛谷 RMJ 的命名格式。使用后该比赛不计入评分</small></span>
-          <textarea disabled={creatingRoom} value={draft.customProblems} placeholder="每行一个题目；留空则按题库随机抽取" onInput={(event) => {
-            draft.customProblems = event.currentTarget.value;
-            const count = parseCustomProblems(draft.customProblems).length;
-            if (count) draft.roomCount = count;
-            notify();
-          }} />
-        </label>
-        <div class="oj-ratio-panel wide">
-          <div class="oj-ratio-title"><strong>题目来源</strong><span>权重为 0 时不选择，默认 2 : 1 : 1</span></div>
-          <div class="oj-ratio-list">
-            {(["luogu", "codeforces", "atcoder"] as ProblemPlatform[]).map((platform) => (
-              <div class={`oj-ratio-row ${draft.ratios[platform] > 0 ? "enabled" : ""}`} key={platform}>
-                <button disabled={creatingRoom || hasCustomProblems()} type="button" class="oj-toggle" aria-pressed={draft.ratios[platform] > 0} onClick={() => {
-                  draft.ratios[platform] = draft.ratios[platform] > 0 ? 0 : defaultRatios[platform];
-                  notify();
-                }}>
-                  <span class="oj-check">{draft.ratios[platform] > 0 ? "✓" : ""}</span>
-                  {platformLabel(platform)}
-                </button>
-                <span>权重</span>
-                <input aria-label={`${platformLabel(platform)} 权重`} disabled={creatingRoom || hasCustomProblems() || draft.ratios[platform] === 0} type="number" min={0} max={20} value={draft.ratios[platform]} onInput={(event) => {
-                  draft.ratios[platform] = clamp(Number(event.currentTarget.value), 1, 20);
-                  notify();
-                }} />
-              </div>
-            ))}
-          </div>
-        </div>
-        <label class="mode-toggle wide">
-          <input disabled={creatingRoom || hasCustomProblems()} type="checkbox" checked={draft.unrated || hasCustomProblems()} onInput={(event) => (draft.unrated = event.currentTarget.checked)} />
-          <span>UNR 休闲模式（不参与评分）</span>
-        </label>
-        <button class={`primary wide ${creatingRoom ? "is-loading" : ""}`} disabled={creatingRoom}>
-          {creatingRoom ? <RefreshCw class="spin" size={17} /> : <Play size={17} />}
-          {creatingRoom ? "正在加载三个题库…" : "生成房间"}
-        </button>
-      </form>
-      <p class="muted">题库缓存：{cachedProblemCount()} 条 {draft.pickerStatus ? ` / ${draft.pickerStatus}` : ""}</p>
+      <button class={`primary open-room-builder ${creatingRoom ? "is-loading" : ""}`} disabled={creatingRoom} onClick={() => void openCreateRoomDialog()}>
+        {creatingRoom ? <RefreshCw class="spin" size={18} /> : <Play size={18} />}
+        {creatingRoom ? "正在生成房间…" : "生成房间"}
+      </button>
     </section>
 
     <section class="panel home-room-panel">
@@ -1320,7 +1533,7 @@ const RoomControls = () => {
               退出
             </button>
             {(["red", "blue", "spectator"] as Seat[]).map((seat) => (
-              <button key={seat} class={currentSeat() === seat ? "active" : ""} disabled={blockedByBan()} onClick={() => void setSeat(seat)}>
+              <button key={seat} class={currentSeat() === seat ? "active" : ""} disabled={blockedByBan() || (seat === "spectator" && state.hostId === identity.id)} onClick={() => void setSeat(seat)}>
                 {seat === "spectator" ? <Eye size={15} /> : <CircleDot size={15} />}
                 {teamName(seat)}
               </button>
@@ -1388,7 +1601,8 @@ const ScoreBar = () => {
       <div class="blue-fill" style={{ width: `${bluePct}%` }}>
         <span>{blue}</span>
       </div>
-      <i class="win-marker" style={{ left: `${thresholdPct}%` }} aria-label={`胜利线 ${winThreshold(state)}`} />
+      <i class="win-marker red-marker" style={{ left: `${thresholdPct}%` }} aria-label={`红方胜利线 ${winThreshold(state)}`} />
+      <i class="win-marker blue-marker" style={{ left: `${100 - thresholdPct}%` }} aria-label={`蓝方胜利线 ${winThreshold(state)}`} />
     </div>
   );
 };
@@ -1535,6 +1749,8 @@ const ratingRows = (): RatingRow[] => {
 const AdminPage = () => {
   if (!isAdmin()) return <main class="center-screen"><Shield size={42} /><h1>无管理员权限</h1></main>;
   const rows = ratingRows();
+  const search = normalizeName(draft.adminSearch);
+  const visibleRows = search ? rows.filter((row) => normalizeName(row.name).includes(search)) : rows;
   const managedRooms = rooms.filter((room) => (room.status === "lobby" || room.status === "arena") && !isClosedListing(room));
   return (
     <main class="admin-page">
@@ -1546,11 +1762,14 @@ const AdminPage = () => {
 
       <section class="panel admin-section">
         <div class="admin-section-head">
-          <div><h2>玩家管理</h2><p>封禁原因用于封禁操作。</p></div>
-          <input value={draft.adminReason} placeholder="封禁原因（可选）" onInput={(event) => (draft.adminReason = event.currentTarget.value)} />
+          <div><h2>玩家管理</h2><p>{visibleRows.length} / {rows.length} 名玩家</p></div>
+          <div class="admin-player-filters">
+            <input type="search" value={draft.adminSearch} placeholder="搜索用户名" onInput={(event) => { draft.adminSearch = event.currentTarget.value; notifyDraft(); }} />
+            <input value={draft.adminReason} placeholder="封禁原因（可选）" onInput={(event) => (draft.adminReason = event.currentTarget.value)} />
+          </div>
         </div>
         <div class="admin-player-list">
-          {rows.map((row) => {
+          {visibleRows.map((row) => {
             const key = normalizeName(row.name);
             const banned = Boolean(globalModeration.banned[key]);
             const muted = Boolean(globalModeration.muted[`name:${key}`]);
@@ -1569,6 +1788,7 @@ const AdminPage = () => {
               </article>
             );
           })}
+          {!visibleRows.length ? <p class="muted admin-empty">没有匹配的玩家。</p> : null}
         </div>
       </section>
 
@@ -1666,22 +1886,38 @@ const playerCount = (room: RoomListing): number => {
   return new Set(names.filter(Boolean).map((name) => normalizeName(name))).size;
 };
 
-const Roster = () => (
-  <div class="teams">
-    {(["red", "blue"] as const).map((seat) => (
-      <div class={`team-card ${seat}`} key={seat}>
-        <h3>{teamName(seat)}</h3>
-        {Object.values(state.players).filter((player) => player.team === seat).length ? (
-          Object.values(state.players)
-            .filter((player) => player.team === seat)
-            .map((player) => <PlayerRow player={player} key={player.id} />)
-        ) : (
-          <p class="muted">等待玩家</p>
-        )}
+const Roster = () => {
+  const spectators = Object.values(state.players).filter((player) => player.team === "spectator");
+  return (
+    <div class="teams">
+      {(["red", "blue"] as const).map((seat) => (
+        <div class={`team-card ${seat}`} key={seat}>
+          <h3>{teamName(seat)}</h3>
+          {Object.values(state.players).filter((player) => player.team === seat).length ? (
+            Object.values(state.players)
+              .filter((player) => player.team === seat)
+              .map((player) => <PlayerRow player={player} key={player.id} />)
+          ) : (
+            <p class="muted">等待玩家</p>
+          )}
+        </div>
+      ))}
+      <div class="team-card spectator-card">
+        <button class="spectator-toggle" onClick={() => { draft.spectatorsOpen = !draft.spectatorsOpen; notify(); }}>
+          <Eye size={14} />
+          <strong>观赛席</strong>
+          <span>{spectators.length}</span>
+          {draft.spectatorsOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </button>
+        {draft.spectatorsOpen ? (
+          <div class="spectator-list">
+            {spectators.length ? spectators.map((player) => <PlayerRow player={player} key={player.id} />) : <p class="muted">暂无观赛人员</p>}
+          </div>
+        ) : null}
       </div>
-    ))}
-  </div>
-);
+    </div>
+  );
+};
 
 const PlayerRow = ({ player }: { player: Player }) => {
   const banned = moderationRecordForPlayer(player);
@@ -1741,6 +1977,7 @@ const Chat = () => {
   const items = chatStreamItems();
   const muted = isMutedCurrent();
   const readOnly = mode === "room" && state.phase === "finished";
+  queueMicrotask(syncChatVditorState);
   return (
     <div class="chat">
       <PanelTitle icon={<MessageSquare size={16} />} title="CHAT" detail={mode === "room" ? "/ prefix = team" : "global"} />
@@ -1748,19 +1985,7 @@ const Chat = () => {
         {items.map((item) => <ChatLine item={item} key={item.id} />)}
       </div>
       <form class="chat-form" onSubmit={(event) => void submitChat(event)}>
-        <textarea
-          value={draft.chat}
-          rows={1}
-          disabled={blockedByBan() || muted || readOnly}
-          placeholder={readOnly ? "比赛已封档，只读" : muted ? "你已被禁言" : mode === "room" ? "消息，/开头发队内" : "大厅自由聊天"}
-          onInput={(event) => (draft.chat = event.currentTarget.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              event.currentTarget.form?.requestSubmit();
-            }
-          }}
-        />
+        <div class="chat-vditor" ref={chatVditorRef} />
         <button disabled={blockedByBan() || muted || readOnly}>
           <Send size={15} />
           {readOnly ? "只读" : muted ? "禁言" : "发送"}
@@ -1798,7 +2023,7 @@ const ChatLine = ({ item }: { item: ChatStreamItem }) => {
       <p class="chat-line system">
         <span class="chat-avatar">#</span>
         <span>SYS</span>
-        <span class="chat-text">{item.text}</span>
+        <RichText text={item.text} className="chat-text" />
       </p>
     );
   }
@@ -1808,7 +2033,7 @@ const ChatLine = ({ item }: { item: ChatStreamItem }) => {
       <p class={record.status === "OK" ? "chat-line judge ok" : "chat-line judge fail"}>
         <span class="chat-avatar">{record.status === "OK" ? "✓" : "!"}</span>
         <span>{formatClock(record.at)} / {record.pid}</span>
-        <span class="chat-text">{record.luoguName} {record.status}</span>
+        <RichText text={`${record.luoguName} ${record.status}`} className="chat-text" />
       </p>
     );
   }
@@ -1817,8 +2042,8 @@ const ChatLine = ({ item }: { item: ChatStreamItem }) => {
   return (
     <p class={`chat-line bubble ${mine ? "mine" : "theirs"} ${chat.visibility === "team" ? "private" : ""}`}>
       <UserAvatar name={chat.luoguName} className="chat-avatar" />
-      <button class="chat-name" style={{ color: nameColor(chat.luoguName) }} onClick={() => openProfile(chat.luoguName)}>{chat.visibility === "team" ? "TEAM" : "ALL"} / {chat.luoguName}</button>
-      <span class="chat-text">{chat.text}</span>
+      <button class="chat-name" style={{ color: nameColor(chat.luoguName) }} onClick={() => openProfile(chat.luoguName)}>{chat.visibility === "team" ? "TEAM / " : ""}{chat.luoguName}</button>
+      <RichText text={chat.text} className="chat-text" />
     </p>
   );
 };
@@ -1849,61 +2074,90 @@ const ProfilePage = () => {
   const row = ratingRowFor(name);
   const mine = normalizeName(name) === normalizeName(identity.luoguName);
   const source = user?.profileHtml || "";
+  const openEditor = () => {
+    draft.profileDraft = source;
+    draft.profileEditing = true;
+    notify();
+    queueMicrotask(() => void mountProfileVditor());
+  };
   return (
     <main class="profile-page">
       <div class="profile-card">
-        <div class="profile-head">
-          <div>
-            <UserAvatar name={name} className="profile-avatar" />
+        <header class="profile-hero">
+          <UserAvatar name={name} className="profile-avatar" />
+          <div class="profile-identity">
+            <p class="eyebrow">PLAYER PROFILE</p>
             <h1 style={{ color: nameColor(name) }}>{name}</h1>
+            <p>{row.games} 场对决 · {row.wins} 胜 · {row.losses} 负</p>
           </div>
-          <div class="profile-html">
-            {draft.profileEditing && mine ? (
-              <textarea
-                class="profile-editor"
-                value={source}
-                placeholder="用纯文本内嵌 HTML 自定义主页"
-                onInput={(event) => updateLocalUser(name, { profileHtml: event.currentTarget.value }, false)}
-              />
-            ) : (
-              <pre class="profile-source" dangerouslySetInnerHTML={{ __html: sanitizeProfileHtml(source || "这个用户还没有写主页。") }} />
-            )}
+          <div class="profile-rating-summary">
+            <span>RATING</span>
+            <strong>{Math.round(row.rating)}</strong>
           </div>
-        </div>
-        {mine ? (
-          <div class="profile-actions">
-            {draft.profileEditing ? (
-              <>
-                <button class="primary" onClick={() => void persistUserProfile(name, userRecordFor(name)?.profileHtml ?? "")}>完成</button>
-                <button class="ghost" onClick={() => {
-                  draft.profileEditing = false;
-                  notify();
-                }}>取消</button>
-              </>
-            ) : (
-              <button class="primary" onClick={() => {
-                draft.profileEditing = true;
-                notify();
-              }}>编辑</button>
-            )}
+        </header>
+
+        <nav class="profile-tabs" aria-label="个人主页栏目">
+          {(["home", "matches", "achievements"] as const).map((tab) => (
+            <button class={draft.profileTab === tab ? "active" : ""} key={tab} onClick={() => { destroyProfileVditor(); draft.profileTab = tab; draft.profileEditing = false; notify(); }}>
+              {tab === "home" ? "主页" : tab === "matches" ? "对局" : "成就"}
+            </button>
+          ))}
+        </nav>
+
+        {draft.profileTab === "home" ? (
+          <div class="profile-home-layout">
+            <section class="profile-home-main">
+              <div class="profile-content-head">
+                <div><h2>个人主页</h2><p>支持 Markdown 与 KaTeX</p></div>
+                {mine ? (
+                  <div class="profile-actions">
+                    {draft.profileEditing ? (
+                      <>
+                        <button class="primary" onClick={() => void persistUserProfile(name, profileVditor?.getValue() ?? draft.profileDraft)}>保存</button>
+                        <button class="ghost" onClick={() => { destroyProfileVditor(); draft.profileEditing = false; draft.profileDraft = ""; notify(); }}>取消</button>
+                      </>
+                    ) : <button class="primary" onClick={openEditor}>编辑主页</button>}
+                  </div>
+                ) : null}
+              </div>
+              {draft.profileEditing && mine ? (
+                <div id="profile-vditor" class="profile-vditor" />
+              ) : (
+                <div class="profile-html">
+                  <RichText text={source || "这个用户还没有填写个人主页。"} className="profile-rich-text" />
+                </div>
+              )}
+            </section>
+            <aside class="profile-sidebar">
+              <RatingCurve name={name} />
+              <div class="profile-stats">
+                <span>比赛数据</span>
+                <strong>{row.wins}/{row.games}</strong>
+                <small>{row.games ? Math.round(row.wins / row.games * 100) : 0}% 胜率</small>
+              </div>
+            </aside>
           </div>
         ) : null}
-        <div class="profile-stats">
-          <strong>Rating {Math.round(row.rating)}</strong>
-          <span>{row.games} 场 / {row.wins} 胜 / {row.losses} 负</span>
-        </div>
-        <div class="profile-section">
-          <h2>最近 20 场</h2>
-          {completedPlayerRooms(name).slice(0, 20).map((room) => <p key={room.roomId}><code>{shortRoomId(room.roomId)}</code><span>{roomLine(room)}</span><em>{roomStatusLabel(room)}</em></p>)}
-        </div>
-        <div class="achievement-grid">
-          {achievementsFor(name, row).map((achievement) => (
-            <article class={`achievement ${achievement.progress >= 100 ? "complete" : ""}`} key={achievement.title}>
-              <achievement.Icon size={26} />
-              <div><h3>{achievement.title}</h3><p>{achievement.text}</p><span>进度 {achievement.progress}%</span></div>
-            </article>
-          ))}
-        </div>
+
+        {draft.profileTab === "matches" ? (
+          <section class="profile-section profile-tab-panel">
+            <h2>最近 20 场</h2>
+            {completedPlayerRooms(name).length
+              ? completedPlayerRooms(name).slice(0, 20).map((room) => <p key={room.roomId}><code>{shortRoomId(room.roomId)}</code><span>{roomLine(room)}</span><em>{roomStatusLabel(room)}</em></p>)
+              : <p class="muted">暂无已结束的对局。</p>}
+          </section>
+        ) : null}
+
+        {draft.profileTab === "achievements" ? (
+          <div class="achievement-grid profile-tab-panel">
+            {achievementsFor(name, row).map((achievement) => (
+              <article class={`achievement ${achievement.progress >= 100 ? "complete" : ""}`} key={achievement.title}>
+                <achievement.Icon size={26} />
+                <div><h3>{achievement.title}</h3><p>{achievement.text}</p><span>进度 {achievement.progress}%</span></div>
+              </article>
+            ))}
+          </div>
+        ) : null}
       </div>
     </main>
   );
@@ -1979,25 +2233,232 @@ const BanOverlay = () => {
   );
 };
 
+const RatingCurve = ({ name }: { name: string }) => {
+  const user = userRecordFor(name);
+  const raw = user?.ratingHistory?.length ? user.ratingHistory.slice(-24) : [{ at: Date.now(), rating: user?.rating ?? 1300 }];
+  const history = raw.length === 1 ? [raw[0], { ...raw[0], at: raw[0].at + 1 }] : raw;
+  const ratings = history.map((point) => point.rating);
+  const minimum = Math.min(...ratings);
+  const maximum = Math.max(...ratings);
+  const range = Math.max(80, maximum - minimum);
+  const floor = minimum - Math.max(30, (range - (maximum - minimum)) / 2);
+  const ceiling = floor + range;
+  const points = history.map((point, index) => {
+    const x = history.length <= 1 ? 0 : index / (history.length - 1) * 360;
+    const y = 92 - (point.rating - floor) / (ceiling - floor) * 76;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const first = history[0].rating;
+  const current = history.at(-1)?.rating ?? first;
+  return (
+    <section class="rating-curve-card" aria-label="Rating 曲线">
+      <div><span>RATING</span><strong>{Math.round(current)}</strong><em class={current >= first ? "up" : "down"}>{current >= first ? "+" : ""}{Math.round(current - first)}</em></div>
+      <svg viewBox="0 0 360 108" preserveAspectRatio="none" role="img">
+        <defs><linearGradient id="rating-area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--green)" stop-opacity=".38"/><stop offset="1" stop-color="var(--green)" stop-opacity="0"/></linearGradient></defs>
+        <polygon points={`0,108 ${points} 360,108`} fill="url(#rating-area)" />
+        <polyline points={points} fill="none" stroke="var(--green)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+    </section>
+  );
+};
+
+const loadAnnouncement = async () => {
+  try {
+    const cached = JSON.parse(localStorage.getItem(announcementCacheKey) || "null") as { title?: string; content?: string; cachedAt?: number } | null;
+    if (cached?.title && cached.content) {
+      announcementTitle = cached.title;
+      announcementContent = cached.content;
+      notify();
+      if (cached.cachedAt && Date.now() - cached.cachedAt < 24 * 60 * 60_000) return;
+    }
+  } catch {
+    // Continue with the network source.
+  }
+  try {
+    const response = await fetch("https://api.luogu.me/article/query/utz3c7b2", {
+      cache: "default",
+      signal: AbortSignal.timeout(8_000)
+    });
+    if (!response.ok) throw new Error(`announcement returned ${response.status}`);
+    const payload = (await response.json()) as { code?: number; data?: { title?: string; content?: string } };
+    if (payload.code !== 200 || !payload.data?.content) throw new Error("invalid announcement payload");
+    announcementTitle = payload.data.title?.trim() || "VJudge Duel 公告";
+    announcementContent = payload.data.content;
+    try {
+      localStorage.setItem(announcementCacheKey, JSON.stringify({ title: announcementTitle, content: announcementContent, cachedAt: Date.now() }));
+    } catch {
+      // Rendering does not depend on storage.
+    }
+    notify();
+  } catch {
+    if (announcementContent === "正在读取公告…") announcementContent = "公告暂时不可用。";
+  }
+};
+
+const TemporaryBlockOverlay = () => (
+  <div class="temporary-block-overlay">
+    <div>
+      <Shield size={48} />
+      <h1>临时封禁</h1>
+      <p>{temporaryBanReason}</p>
+      <strong>{Math.max(1, Math.ceil((temporaryBanUntil - Date.now()) / 1000))}s</strong>
+    </div>
+  </div>
+);
+
+const vditorCdn = "https://cdn.jsdelivr.net/npm/vditor@3.11.2";
+
+const loadVditor = () => {
+  vditorModulePromise ??= import("vditor");
+  return vditorModulePromise;
+};
+
+const currentVditorTheme = (): "dark" | "light" => document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+
+const chatEditorBlocked = () => blockedByBan() || isMutedCurrent() || (mode === "room" && state.phase === "finished");
+
+const syncChatVditorState = () => {
+  if (!chatVditor) return;
+  if (chatEditorBlocked()) chatVditor.disabled();
+  else chatVditor.enable();
+};
+
+const destroyChatVditor = () => {
+  chatVditorGeneration += 1;
+  chatVditor?.destroy();
+  chatVditor = null;
+  chatVditorTarget = null;
+};
+
+const mountChatVditor = async (target: HTMLDivElement) => {
+  if (chatVditor && chatVditorTarget === target) {
+    syncChatVditorState();
+    return;
+  }
+  destroyChatVditor();
+  chatVditorTarget = target;
+  const generation = chatVditorGeneration;
+  const { default: Vditor } = await loadVditor();
+  if (generation !== chatVditorGeneration || !target.isConnected) return;
+  const editor = new Vditor(target, {
+    mode: "wysiwyg",
+    value: draft.chat,
+    lang: "zh_CN",
+    cdn: vditorCdn,
+    theme: currentVditorTheme() === "dark" ? "dark" : "classic",
+    minHeight: 82,
+    cache: { enable: false },
+    counter: { enable: true, max: 500, type: "markdown" },
+    toolbar: ["bold", "italic", "strike", "inline-code", "link", "emoji"],
+    toolbarConfig: { pin: false },
+    preview: {
+      markdown: { sanitize: true, codeBlockPreview: true, mathBlockPreview: true },
+      math: { engine: "KaTeX" }
+    },
+    input: (value) => { draft.chat = value; },
+    ctrlEnter: (value) => {
+      draft.chat = value;
+      void submitChat();
+    },
+    after: () => syncChatVditorState()
+  });
+  chatVditor = editor;
+};
+
+const chatVditorRef = (element: HTMLDivElement | null) => {
+  if (element) {
+    void mountChatVditor(element);
+    return;
+  }
+  queueMicrotask(() => {
+    if (chatVditorTarget && !chatVditorTarget.isConnected) destroyChatVditor();
+  });
+};
+
+const destroyProfileVditor = () => {
+  profileVditor?.destroy();
+  profileVditor = null;
+};
+
+const mountProfileVditor = async () => {
+  const target = document.querySelector<HTMLDivElement>("#profile-vditor");
+  if (!target || !draft.profileEditing) return;
+  destroyProfileVditor();
+  const { default: Vditor } = await loadVditor();
+  if (!target.isConnected || !draft.profileEditing) return;
+  const editor = new Vditor(target, {
+    mode: "wysiwyg",
+    value: draft.profileDraft,
+    lang: "zh_CN",
+    cdn: vditorCdn,
+    theme: currentVditorTheme() === "dark" ? "dark" : "classic",
+    minHeight: 380,
+    cache: { enable: false },
+    counter: { enable: true, max: 20_000, type: "markdown" },
+    toolbar: ["headings", "bold", "italic", "strike", "|", "quote", "list", "ordered-list", "check", "|", "link", "table", "code", "inline-code", "|", "undo", "redo", "fullscreen"],
+    preview: {
+      markdown: { sanitize: true, codeBlockPreview: true, mathBlockPreview: true },
+      math: { engine: "KaTeX" }
+    },
+    input: (value) => { draft.profileDraft = value; },
+    ctrlEnter: (value) => void persistUserProfile(profileUserName || identity.luoguName, value)
+  });
+  profileVditor = editor;
+};
+
+const mountVditorPreview = (element: HTMLDivElement | null, source: string) => {
+  const renderKey = `${currentVditorTheme()}\u0000${source}`;
+  if (!element || vditorPreviewSources.get(element) === renderKey) return;
+  vditorPreviewSources.set(element, renderKey);
+  element.textContent = source;
+  void loadVditor().then(({ default: Vditor }) => Vditor.preview(element, source, {
+    mode: currentVditorTheme(),
+    lang: "zh_CN",
+    cdn: vditorCdn,
+    anchor: 0,
+    markdown: { sanitize: true, codeBlockPreview: true, mathBlockPreview: true },
+    math: { engine: "KaTeX" },
+    after: () => {
+      element.querySelectorAll<HTMLAnchorElement>("a").forEach((anchor) => {
+        anchor.target = "_blank";
+        anchor.rel = "noopener noreferrer";
+      });
+    }
+  })).catch(() => {
+    element.textContent = source;
+  });
+};
+
+const RichText = ({ text, className = "" }: { text: string; className?: string }) => (
+  <div class={`rich-text vditor-reset ${currentVditorTheme() === "dark" ? "vditor-reset--dark" : ""} ${className}`} ref={(element) => mountVditorPreview(element, text)} />
+);
+
 const AuthError = () => (
   <Shell title="VJudge Duel" subtitle="login">
-    <main class="center-screen">
-      <KeyRound class="login-mark" size={40} strokeWidth={1.8} />
-      <h1>请登录</h1>
-      <p>{authErrorText}</p>
-      <form class="paste-login" onSubmit={(event) => void submitVJudgeLogin(event)}>
-        <strong class="login-title"><KeyRound size={17} />VJudge 登录</strong>
-        <ol class="login-guide">
-          <li>输入你的 VJudge 用户名。</li>
-          <li>打开 VJudge 首页并登录。</li>
-          <li>在 10 秒内返回并点击“验证登录”。</li>
-        </ol>
-        <input disabled={loginSubmitting} value={vjudgeUsername} placeholder="VJudge 用户名" onInput={(event) => (vjudgeUsername = event.currentTarget.value)} />
-        <a href="https://vjudge.net/" target="_blank" rel="noreferrer">打开 VJudge 首页</a>
-        <button class={loginSubmitting ? "is-loading" : ""} disabled={loginSubmitting} type="submit">
-          {loginSubmitting ? <RefreshCw class="spin" size={16} /> : null}{loginSubmitting ? "正在读取 VJudge 资料…" : "验证登录"}
-        </button>
-      </form>
+    <main class="center-screen auth-page">
+      <section class="auth-card">
+        <div class="auth-intro">
+          <KeyRound class="login-mark" size={38} strokeWidth={1.8} />
+          <p class="eyebrow">VJUDGE IDENTITY</p>
+          <h1>使用 VJudge 登录</h1>
+          <p>{authErrorText}</p>
+        </div>
+        <form class="paste-login" onSubmit={(event) => void submitVJudgeLogin(event)}>
+          <strong class="login-title">验证账号</strong>
+          <ol class="login-guide">
+            <li>输入你的 VJudge 用户名</li>
+            <li>打开 VJudge 首页并完成登录</li>
+            <li>返回这里，点击验证登录</li>
+          </ol>
+          <input disabled={loginSubmitting} value={vjudgeUsername} placeholder="VJudge 用户名" autoComplete="username" onInput={(event) => (vjudgeUsername = event.currentTarget.value)} />
+          <div class="login-actions">
+            <a href="https://vjudge.net/" target="_blank" rel="noreferrer">打开 VJudge</a>
+            <button class={`primary ${loginSubmitting ? "is-loading" : ""}`} disabled={loginSubmitting} type="submit">
+              {loginSubmitting ? <RefreshCw class="spin" size={16} /> : <KeyRound size={16} />}{loginSubmitting ? "正在验证…" : "验证登录"}
+            </button>
+          </div>
+        </form>
+      </section>
     </main>
   </Shell>
 );
@@ -2054,27 +2515,6 @@ const ProfileLoading = () => (
   </main>
 );
 
-const DifficultyControl = ({ label, value, set }: { label: string; value: DifficultyLevel; set: (value: DifficultyLevel) => void }) => (
-  <label class="difficulty-control">
-    <span>{label}</span>
-    <select
-      class="difficulty-select"
-      data-difficulty={value}
-      disabled={creatingRoom || hasCustomProblems()}
-      style={{ "--difficulty-color": difficultyMeta.find((item) => item.value === value)?.color ?? "#6b7280" } as JSX.CSSProperties}
-      value={value}
-      onChange={(event) => {
-        set(Number(event.currentTarget.value) as DifficultyLevel);
-        notify();
-      }}
-    >
-      {difficultyMeta.map((item) => (
-        <option style={{ color: item.value === 8 && document.documentElement.dataset.theme === "dark" ? "#f1e296" : item.color }} value={item.value} key={item.value}>{item.label}</option>
-      ))}
-    </select>
-  </label>
-);
-
 const DifficultyBadge = ({ level }: { level: number }) => {
   const meta = difficultyMeta.find((item) => item.value === level);
   return <span class="difficulty-badge" data-difficulty={level} style={{ "--difficulty-color": meta?.color ?? "#6b7280" } as JSX.CSSProperties}>{meta?.short ?? level}</span>;
@@ -2095,8 +2535,6 @@ const History = () => {
 const joinRoom = (room: RoomListing) => {
   location.hash = `room=${room.roomId}&secret=${room.secret}`;
 };
-
-const hasCustomProblems = (): boolean => draft.customProblems.trim().length > 0;
 
 const showSponsorCode = async () => {
   await Swal.fire({
@@ -2137,14 +2575,14 @@ const logout = () => {
   location.reload();
 };
 
-const blockedByBan = (): boolean => Boolean(bannedRecord());
+const blockedByBan = (): boolean => temporaryBanUntil > Date.now() || Boolean(bannedRecord());
 const bannedRecord = () =>
   moderationRecordForPlayer(state.players[identity?.id]) ||
   moderationRecordForName(identity?.luoguName ?? "");
 const moderationRecordForName = (name: string) =>
   state.banned[normalizeName(name)] || globalModeration.banned[normalizeName(name)];
 const moderationRecordForPlayer = (player: Player | undefined) => (player ? state.kicked[player.id] || moderationRecordForName(player.luoguName) : undefined);
-const isMutedCurrent = (): boolean => isMutedByIdentity(identity?.id ?? "", identity?.luoguName ?? "");
+const isMutedCurrent = (): boolean => temporaryMuteUntil > Date.now() || isMutedByIdentity(identity?.id ?? "", identity?.luoguName ?? "");
 const isMutedPlayer = (player: Player): boolean => isMutedByIdentity(player.id, player.luoguName);
 const isMutedByIdentity = (id: string, name: string): boolean => {
   const nameKey = `name:${normalizeName(name)}`;
@@ -2253,6 +2691,7 @@ const updateLocalUser = (name: string, patch: Partial<UserRecord>, renderNow = t
     wins: existing?.wins ?? 0,
     losses: existing?.losses ?? 0,
     games: existing?.games ?? 0,
+    ratingHistory: existing?.ratingHistory,
     updatedAt: Date.now(),
     ...patch
   };
@@ -2280,7 +2719,9 @@ const persistUserProfile = async (name: string, profileHtml: string) => {
   updateLocalUser(name, { profileHtml });
   try {
     const user = await saveUserRecord({ name, profileHtml });
+    destroyProfileVditor();
     draft.profileEditing = false;
+    draft.profileDraft = "";
     updateLocalUser(user.name, user);
   } catch (error) {
     setStatus(friendlyError(error, "主页保存失败"), "error");
@@ -2328,12 +2769,6 @@ const achievementsFor = (name: string, row: RatingRow) => {
     { Icon: Medal, title: "常胜", text: "胜率达到 70%，且至少完成 5 场。", progress: row.games >= 5 ? Math.min(100, Math.round((row.wins / row.games / 0.7) * 100)) : Math.min(80, row.games * 16) }
   ];
 };
-const sanitizeProfileHtml = (html: string): string =>
-  html
-    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "")
-    .replace(/\son\w+="[^"]*"/gi, "")
-    .replace(/\son\w+='[^']*'/gi, "")
-    .replace(/javascript:/gi, "");
 const scrollChatsToBottom = () => {
   document.querySelectorAll<HTMLElement>(".chat-log").forEach((element) => {
     element.scrollTop = element.scrollHeight;
@@ -2485,6 +2920,61 @@ const timeAgo = (time: number): string => {
   if (minutes < 60) return `${minutes} 分钟前`;
   return `${Math.floor(minutes / 60)} 小时前`;
 };
+
+function readStoredNumber(key: string): number {
+  try {
+    const value = Number(localStorage.getItem(key) || 0);
+    return Number.isFinite(value) ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function readStoredText(key: string): string {
+  try {
+    return localStorage.getItem(key) || "";
+  } catch {
+    return "";
+  }
+}
+
+function recordBurst(kind: string, windowMs: number, threshold: number, punish: () => void): boolean {
+  const key = `vjudge-duel.security.actions.${kind}.v1`;
+  const now = Date.now();
+  try {
+    const stored = JSON.parse(localStorage.getItem(key) || "[]") as number[];
+    const recent = stored.filter((time) => Number.isFinite(time) && now - time < windowMs).concat(now);
+    if (recent.length >= threshold) {
+      localStorage.removeItem(key);
+      punish();
+      return true;
+    }
+    localStorage.setItem(key, JSON.stringify(recent));
+  } catch {
+    // The in-memory operation is still allowed when browser storage is unavailable.
+  }
+  return false;
+}
+
+function applyTemporaryBan(durationMs: number, reason: string): void {
+  temporaryBanUntil = Date.now() + durationMs;
+  temporaryBanReason = reason;
+  try {
+    localStorage.setItem(temporaryBanKey, String(temporaryBanUntil));
+    localStorage.setItem(temporaryBanReasonKey, reason);
+  } catch {
+    // In-memory enforcement remains active.
+  }
+}
+
+function applyTemporaryMute(durationMs: number): void {
+  temporaryMuteUntil = Date.now() + durationMs;
+  try {
+    localStorage.setItem(temporaryMuteKey, String(temporaryMuteUntil));
+  } catch {
+    // In-memory enforcement remains active.
+  }
+}
 
 notify();
 void boot();

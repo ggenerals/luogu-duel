@@ -108,6 +108,7 @@ export type DuelEvent =
       problems: Problem[];
       rated?: boolean;
       hostName?: string;
+      minimumDifficulty?: number;
     }
   | {
       type: "player.joined";

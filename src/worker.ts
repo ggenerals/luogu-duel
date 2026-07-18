@@ -2,7 +2,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { applyEvent, applyEvents, createInitialState } from "./domain";
-import type { DuelEvent, SignedEnvelope } from "./types";
+import type { DuelEvent, Problem, SignedEnvelope } from "./types";
 
 type Env = {
   DUEL_ROOM: DurableObjectNamespace<DuelRoom>;
@@ -23,6 +23,8 @@ type RoomListing = {
   endedAt?: number;
   winner?: "red" | "blue" | "draw";
   rated?: boolean;
+  averageDifficulty?: number;
+  minimumDifficulty?: number;
   closedReason?: string;
   redPlayers?: string[];
   bluePlayers?: string[];
@@ -34,6 +36,7 @@ type UserRecord = {
   wins: number;
   losses: number;
   games: number;
+  ratingHistory?: Array<{ at: number; rating: number }>;
   avatar?: string;
   color?: string;
   profileHtml?: string;
@@ -60,6 +63,7 @@ export class DuelRoom extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     ctx.blockConcurrencyWhile(async () => {
       this.ctx.storage.sql.exec(`
         CREATE TABLE IF NOT EXISTS events (
@@ -104,6 +108,13 @@ export class DuelRoom extends DurableObject<Env> {
         )
       `);
       this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS low_room_days (
+          day_key TEXT PRIMARY KEY,
+          room_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        )
+      `);
+      this.ctx.storage.sql.exec(`
         CREATE TABLE IF NOT EXISTS snapshots (
           snapshot_key TEXT PRIMARY KEY,
           snapshot_json TEXT NOT NULL,
@@ -120,6 +131,7 @@ export class DuelRoom extends DurableObject<Env> {
     if (url.pathname.endsWith("/directory/ws")) return this.handleDirectoryWebSocket(request);
     if (url.pathname.endsWith("/directory")) return this.handleDirectory(request);
     if (url.pathname.endsWith("/active-player")) return this.handleActivePlayer(request);
+    if (url.pathname.endsWith("/low-room-limit")) return this.handleLowRoomLimit(request);
     if (url.pathname.endsWith("/users")) return this.handleUsers(request);
     if (url.pathname.endsWith("/clear-all")) return this.handleClearAll(request);
     if (url.pathname.endsWith("/clear-room")) return this.handleClearRoom(request);
@@ -147,6 +159,10 @@ export class DuelRoom extends DurableObject<Env> {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== "string") return;
     try {
+      if (message === "ping") {
+        ws.send("pong");
+        return;
+      }
       const data = JSON.parse(message) as { type?: ClientMessage["type"]; at?: number; envelope?: SignedEnvelope };
       const attachment = ws.deserializeAttachment() as { kind?: SocketKind } | undefined;
       if (data.type === "ping") {
@@ -200,6 +216,12 @@ export class DuelRoom extends DurableObject<Env> {
     if (event.roomId !== "global" && this.cachedState.phase === "finished") return false;
 
     const currentPlayer = this.cachedState.players[event.actorId];
+    if (event.type === "player.joined" && event.team === "spectator" && !this.cachedState.hostId && event.roomId !== "global") {
+      throw new Error("房主不能进入观战席");
+    }
+    if (event.type === "player.teamChanged" && event.team === "spectator" && this.cachedState.hostId === event.actorId && event.roomId !== "global") {
+      throw new Error("房主不能进入观战席");
+    }
     const kickedPlayer = event.type === "player.kicked"
       ? this.cachedState.players[event.targetId] ?? Object.values(this.cachedState.players).find((player) => normalizeName(player.luoguName) === normalizeName(event.targetName || ""))
       : undefined;
@@ -224,6 +246,19 @@ export class DuelRoom extends DurableObject<Env> {
     const previousPhase = this.cachedState.phase;
     const previousDirectoryFingerprint = directoryFingerprint(this.cachedState);
     const previousLastEnvelope = this.eventsCache!.at(-1);
+
+    if (event.type === "room.configured" && (isLowDifficultyRoom(event.problems) || Number(event.minimumDifficulty) <= 2)) {
+      const hostName = event.hostName?.trim() || "";
+      if (!hostName) throw new Error("无法确认房主身份");
+      const limiter = this.env.DUEL_ROOM.getByName(`__low-room-limit:${normalizeName(hostName)}`);
+      const response = await limiter.fetch("https://duel.internal/low-room-limit", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ roomId: event.roomId })
+      });
+      if (!response.ok) throw new Error("每天最多创建 1 场包含橙色或更低难度题目的房间");
+      if (this.eventIds.has(event.id)) return false;
+    }
 
     this.ctx.storage.sql.exec(
       "INSERT INTO events (id, room_id, issued_at, lamport, envelope) VALUES (?, ?, ?, ?, ?)",
@@ -355,6 +390,7 @@ export class DuelRoom extends DurableObject<Env> {
         : undefined;
     const redPlayers = Object.values(state.players).filter((player) => player.team === "red").map((player) => player.luoguName);
     const bluePlayers = Object.values(state.players).filter((player) => player.team === "blue").map((player) => player.luoguName);
+    const difficulties = problemDifficulties(state.problems);
     const listing: RoomListing = {
       roomId,
       secret: "",
@@ -366,6 +402,8 @@ export class DuelRoom extends DurableObject<Env> {
       endedAt: state.closed || state.phase === "finished" ? state.endedAt ?? latestEvent.issuedAt : undefined,
       winner: state.winner,
       rated: state.rated,
+      averageDifficulty: difficulties.length ? average(difficulties) : undefined,
+      minimumDifficulty: difficulties.length ? Math.min(...difficulties) : undefined,
       closedReason: state.closed?.reason,
       redPlayers,
       bluePlayers
@@ -491,7 +529,7 @@ export class DuelRoom extends DurableObject<Env> {
 
   private handleClearAll(request: Request): Response {
     if (request.method !== "POST") return jsonError("method not allowed", 405);
-    for (const table of ["events", "listings", "users", "processed_results", "banned_users", "active_players", "snapshots"]) {
+    for (const table of ["events", "listings", "users", "processed_results", "banned_users", "active_players", "low_room_days", "snapshots"]) {
       this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
     }
     this.eventsCache = [];
@@ -563,7 +601,9 @@ export class DuelRoom extends DurableObject<Env> {
     const blueAvg = average(blueRows.map((user) => user.rating));
     const redScore = listing.winner === "red" ? 1 : 0;
     const redExpected = 1 / (1 + 10 ** ((blueAvg - redAvg) / 400));
-    const delta = Math.round(64 * (redScore - redExpected));
+    const averageDifficulty = clampNumber(listing.averageDifficulty ?? 4, 1, 8);
+    const difficultyK = 42 + averageDifficulty * 7;
+    const delta = Math.round(difficultyK * (redScore - redExpected));
     for (const user of redRows) this.writeUser(applyRatingDelta(user, delta, redScore === 1));
     for (const user of blueRows) this.writeUser(applyRatingDelta(user, -delta, redScore === 0));
     this.ctx.storage.sql.exec("INSERT INTO processed_results (room_id, processed_at) VALUES (?, ?)", listing.roomId, Date.now());
@@ -579,16 +619,23 @@ export class DuelRoom extends DurableObject<Env> {
 
   private upsertUser(input: { name: string; avatar?: string; color?: string; profileHtml?: string; rating?: number }): UserRecord {
     const existing = this.readUser(input.name);
+    const nextRating = input.rating ?? existing?.rating ?? 1300;
+    const now = Date.now();
+    const ratingHistory = existing?.ratingHistory?.length
+      ? [...existing.ratingHistory]
+      : [{ at: existing?.updatedAt ?? now, rating: existing?.rating ?? nextRating }];
+    if (existing && input.rating !== undefined && nextRating !== existing.rating) ratingHistory.push({ at: now, rating: nextRating });
     const user: UserRecord = {
       name: existing?.name || input.name.trim(),
-      rating: input.rating ?? existing?.rating ?? 1300,
+      rating: nextRating,
       wins: existing?.wins ?? 0,
       losses: existing?.losses ?? 0,
       games: existing?.games ?? 0,
       avatar: input.avatar ?? existing?.avatar,
       color: input.color ?? existing?.color,
       profileHtml: input.profileHtml ?? existing?.profileHtml,
-      updatedAt: Date.now()
+      ratingHistory: ratingHistory.slice(-100),
+      updatedAt: now
     };
     return this.writeUser(user);
   }
@@ -755,8 +802,35 @@ export class DuelRoom extends DurableObject<Env> {
     const message = JSON.stringify(payload);
     for (const ws of this.ctx.getWebSockets()) {
       const attachment = ws.deserializeAttachment() as { kind?: SocketKind } | undefined;
-      if ((attachment?.kind ?? "room") === kind) ws.send(message);
+      if ((attachment?.kind ?? "room") !== kind) continue;
+      try {
+        ws.send(message);
+      } catch {
+        // 失效连接由运行时回收，不能让单个连接中断整次广播。
+      }
     }
+  }
+
+  private async handleLowRoomLimit(request: Request): Promise<Response> {
+    if (request.method !== "POST") return jsonError("method not allowed", 405);
+    const body = (await request.json()) as { roomId?: string };
+    const roomId = body.roomId?.trim() || "";
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(roomId)) return jsonError("invalid room", 400);
+    const dayKey = chinaDayKey(Date.now());
+    const existing = this.ctx.storage.sql
+      .exec<{ room_id: string }>("SELECT room_id FROM low_room_days WHERE day_key = ? LIMIT 1", dayKey)
+      .toArray()[0];
+    if (existing && existing.room_id !== roomId) {
+      return jsonError("daily low difficulty room limit reached", 429);
+    }
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO low_room_days (day_key, room_id, created_at) VALUES (?, ?, ?)",
+      dayKey,
+      roomId,
+      Date.now()
+    );
+    this.ctx.storage.sql.exec("DELETE FROM low_room_days WHERE day_key < ?", chinaDayKey(Date.now() - 3 * 24 * 60 * 60_000));
+    return Response.json({ ok: true, dayKey });
   }
 }
 
@@ -1066,12 +1140,29 @@ const listingNames = (listing: RoomListing): string[] =>
 const average = (values: number[]): number =>
   values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 1300;
 
+const problemDifficulties = (problems: Problem[]): number[] =>
+  problems
+    .map((problem) => Number(problem.difficulty))
+    .filter((difficulty) => Number.isFinite(difficulty) && difficulty >= 1 && difficulty <= 8);
+
+const isLowDifficultyRoom = (problems: Problem[]): boolean => {
+  const difficulties = problemDifficulties(problems);
+  return difficulties.length > 0 && Math.min(...difficulties) <= 2;
+};
+
+const chinaDayKey = (timestamp: number): string =>
+  new Date(timestamp + 8 * 60 * 60_000).toISOString().slice(0, 10);
+
+const clampNumber = (value: number, minimum: number, maximum: number): number =>
+  Math.max(minimum, Math.min(maximum, Number.isFinite(value) ? value : minimum));
+
 const applyRatingDelta = (user: UserRecord, delta: number, won: boolean): UserRecord => ({
   ...user,
   rating: Math.max(0, user.rating + delta),
   wins: user.wins + (won ? 1 : 0),
   losses: user.losses + (won ? 0 : 1),
   games: user.games + 1,
+  ratingHistory: [...(user.ratingHistory?.length ? user.ratingHistory : [{ at: user.updatedAt, rating: user.rating }]), { at: Date.now(), rating: Math.max(0, user.rating + delta) }].slice(-100),
   updatedAt: Date.now()
 });
 

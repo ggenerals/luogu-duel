@@ -122,7 +122,7 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
       joinPlayer(next, event.actorId, event.luoguName, event.team, event.issuedAt);
       break;
     case "player.teamChanged":
-      if (next.players[event.actorId] && next.phase === "lobby" && !isRestricted(next, event.actorId)) {
+      if (next.players[event.actorId] && next.phase === "lobby" && !isRestricted(next, event.actorId) && !(next.hostId === event.actorId && event.team === "spectator")) {
         const team = next.phase === "lobby" ? event.team : "spectator";
         next.players[event.actorId].team = team;
         next.players[event.actorId].ready = false;
@@ -226,8 +226,13 @@ export const visibleChats = (state: DuelState, viewerId: string): ChatMessage[] 
 export const scoreOf = (state: DuelState, team: Team): number =>
   state.problems.reduce((sum, problem) => sum + (problem.solvedBy?.team === team ? problem.score : 0), 0);
 
-export const winThreshold = (state: DuelState): number =>
-  Math.ceil(state.problems.reduce((sum, problem) => sum + problem.score, 0) / 2);
+export const winThreshold = (state: DuelState): number => {
+  const raw = Math.ceil(state.problems.reduce((sum, problem) => sum + problem.score, 0) / 2);
+  const ending = raw % 100;
+  if (ending === 25) return raw + 25;
+  if (ending === 75) return raw - 25;
+  return raw;
+};
 
 export const requiredVoters = (state: DuelState, vote: Vote): string[] => {
   if (vote.kind === "surrender" && vote.team) {
@@ -288,7 +293,9 @@ const joinPlayer = (state: DuelState, actorId: string, luoguName: string, reques
       delete state.muted[duplicateId];
     }
   }
-  const team = banned || state.phase !== "lobby" ? "spectator" : duplicate?.team ?? requestedSeat;
+  const joiningAsHost = state.roomId !== "global" && !state.hostId;
+  const selectedTeam = duplicate?.team ?? requestedSeat;
+  const team = banned || state.phase !== "lobby" ? "spectator" : joiningAsHost && selectedTeam === "spectator" ? "red" : selectedTeam;
   state.hostId = state.hostId ?? actorId;
   state.players[actorId] = {
     id: actorId,
@@ -326,7 +333,7 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
       joinPlayer(state, event.actorId, command.luoguName, command.team, event.issuedAt);
       return true;
     case "player.teamChanged":
-      if (state.players[event.actorId] && state.phase === "lobby" && !isRestricted(state, event.actorId)) {
+      if (state.players[event.actorId] && state.phase === "lobby" && !isRestricted(state, event.actorId) && !(state.hostId === event.actorId && command.team === "spectator")) {
         state.players[event.actorId].team = command.team;
         state.players[event.actorId].ready = false;
       }
