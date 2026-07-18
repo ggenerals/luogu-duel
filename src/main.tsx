@@ -1134,9 +1134,12 @@ const submitChat = async (event?: Event) => {
   const teamMessage = raw.startsWith("/") && mode === "room";
   const text = teamMessage ? raw.slice(1).trim() : raw;
   if (!text) return;
-  const privateViolation = teamMessage ? privateChatViolation(text) : null;
+  const privateViolation = teamMessage ? null : privateChatViolation(text);
+  console.log(privateViolation);
   if (privateViolation) {
     setStatus(privateViolation, "error");
+    applyTemporaryMute(20_000);
+    notify();
     return;
   }
   if (recordBurst("chat", 5_000, 3, () => applyTemporaryMute(20_000))) {
