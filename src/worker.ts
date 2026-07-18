@@ -46,7 +46,7 @@ type UserRecord = {
 type ClientMessage = { type: "event"; envelope: SignedEnvelope } | { type: "ping"; at?: number };
 type SocketKind = "room" | "directory";
 
-const adminNames = new Set(["general0826", "slmxf", "liyifan202201", "gcend", "gcsg01"]);
+const adminNames = new Set(["general0826", "slmxf", "liyifan202201", "gcend", "gcsg01","imzfx_square"]);
 
 export class DuelRoom extends DurableObject<Env> {
   private eventsCache: SignedEnvelope[] | null = null;

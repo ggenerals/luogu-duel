@@ -400,8 +400,8 @@ const setThemeMode = (next: "system" | "light" | "dark") => {
     // ignore
   }
   applyTheme();
-  profileVditor?.setTheme(currentVditorTheme() === "dark" ? "dark" : "classic");
-  chatVditor?.setTheme(currentVditorTheme() === "dark" ? "dark" : "classic");
+  setVditorTheme(profileVditor);
+  setVditorTheme(chatVditor);
   draft.themeMenuOpen = false;
   notify();
 };
@@ -2108,7 +2108,7 @@ const ProfilePage = () => {
           <div class="profile-home-layout">
             <section class="profile-home-main">
               <div class="profile-content-head">
-                <div><h2>个人主页</h2><p>支持 Markdown 与 KaTeX</p></div>
+                <div><h2>个人主页</h2></div>
                 {mine ? (
                   <div class="profile-actions">
                     {draft.profileEditing ? (
@@ -2315,6 +2315,22 @@ const loadVditor = () => {
 
 const currentVditorTheme = (): "dark" | "light" => document.documentElement.dataset.theme === "dark" ? "dark" : "light";
 
+const vditorPreviewOptions = () => {
+  const theme = currentVditorTheme();
+  return {
+    theme: { current: theme, path: `${vditorCdn}/dist/css/content-theme` },
+    hljs: { style: theme === "dark" ? "github-dark" : "github" },
+    markdown: { sanitize: true, codeBlockPreview: true, mathBlockPreview: true },
+    math: { engine: "KaTeX" as const }
+  };
+};
+
+const setVditorTheme = (editor: VditorType | null) => {
+  if (!editor) return;
+  const theme = currentVditorTheme();
+  editor.setTheme(theme === "dark" ? "dark" : "classic", theme, theme === "dark" ? "github-dark" : "github", `${vditorCdn}/dist/css/content-theme`);
+};
+
 const chatEditorBlocked = () => blockedByBan() || isMutedCurrent() || (mode === "room" && state.phase === "finished");
 
 const syncChatVditorState = () => {
@@ -2351,10 +2367,7 @@ const mountChatVditor = async (target: HTMLDivElement) => {
     counter: { enable: true, max: 500, type: "markdown" },
     toolbar: ["bold", "italic", "strike", "inline-code", "link", "emoji"],
     toolbarConfig: { pin: false },
-    preview: {
-      markdown: { sanitize: true, codeBlockPreview: true, mathBlockPreview: true },
-      math: { engine: "KaTeX" }
-    },
+    preview: vditorPreviewOptions(),
     input: (value) => { draft.chat = value; },
     ctrlEnter: (value) => {
       draft.chat = value;
@@ -2396,10 +2409,7 @@ const mountProfileVditor = async () => {
     cache: { enable: false },
     counter: { enable: true, max: 20_000, type: "markdown" },
     toolbar: ["headings", "bold", "italic", "strike", "|", "quote", "list", "ordered-list", "check", "|", "link", "table", "code", "inline-code", "|", "undo", "redo", "fullscreen"],
-    preview: {
-      markdown: { sanitize: true, codeBlockPreview: true, mathBlockPreview: true },
-      math: { engine: "KaTeX" }
-    },
+    preview: vditorPreviewOptions(),
     input: (value) => { draft.profileDraft = value; },
     ctrlEnter: (value) => void persistUserProfile(profileUserName || identity.luoguName, value)
   });
@@ -2416,8 +2426,7 @@ const mountVditorPreview = (element: HTMLDivElement | null, source: string) => {
     lang: "zh_CN",
     cdn: vditorCdn,
     anchor: 0,
-    markdown: { sanitize: true, codeBlockPreview: true, mathBlockPreview: true },
-    math: { engine: "KaTeX" },
+    ...vditorPreviewOptions(),
     after: () => {
       element.querySelectorAll<HTMLAnchorElement>("a").forEach((anchor) => {
         anchor.target = "_blank";
