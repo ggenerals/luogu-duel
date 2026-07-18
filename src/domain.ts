@@ -65,6 +65,12 @@ export const normalizePid = (pid: string): string => {
 
 export const normalizeName = (name: string): string => name.trim().toLowerCase();
 export const isAdminName = (name: string): boolean => ADMIN_NAMES.has(normalizeName(name));
+export const privateChatViolation = (text: string): string | null => {
+  const normalized = text.toLowerCase();
+  if (/<\s*iframe\b|&lt;\s*iframe\b/i.test(text)) return "私信不能包含 iframe";
+  if (normalized.includes("https://www.luogu.com.cn/api/verify/captcha")) return "私信不能包含该验证码地址";
+  return null;
+};
 export const isTeam = (team: Seat | undefined): team is Team => team === "red" || team === "blue";
 export const teamName = (team: Seat | undefined): string =>
   team === "red" ? "红方" : team === "blue" ? "蓝方" : "观赛";

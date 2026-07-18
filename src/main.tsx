@@ -53,6 +53,7 @@ import {
   isAdminName,
   isTeam,
   normalizeName,
+  privateChatViolation,
   requiredVoters,
   scoreOf,
   sortProblemsByDifficulty,
@@ -744,8 +745,14 @@ const pushToastsForEvent = (event: DuelEvent, previousPhase: DuelState["phase"],
   }
   if (event.type === "chat.sent" && event.visibility === "team" && state.phase === "arena") {
     const chat = state.chats.find((item) => item.id === event.id);
-    if (chat && visibleChats(state, identity.id).some((item) => item.id === chat.id)) {
+    if (chat && visibleChats(state, identity.id).some((item) => item.id === chat.id) && !mentionsUser(chat.text, identity.luoguName)) {
       notifyImportant(`${event.id}:team`, `队内消息 / ${chat.luoguName}`, chat.text, "info");
+    }
+  }
+  if (event.type === "chat.sent" && event.actorId !== identity.id) {
+    const chat = state.chats.find((item) => item.id === event.id);
+    if (chat && visibleChats(state, identity.id).some((item) => item.id === chat.id) && mentionsUser(chat.text, identity.luoguName)) {
+      void notifyImportant(`${event.id}:mention`, `${chat.luoguName} @了你`, chat.text, "info");
     }
   }
   if (event.type !== "game.started" && (state.phase === "arena" || event.type.startsWith("vote.") || event.type === "judge.recordSeen" || event.type === "room.closed")) {
@@ -812,6 +819,20 @@ const emitChat = async (text: string, visibility: "all" | "team") => {
     return;
   }
   await emit({ ...baseEvent("chat.sent"), text, visibility: player?.team === "spectator" ? "all" : visibility });
+};
+
+const mentionsUser = (text: string, name: string): boolean => {
+  const target = normalizeName(name);
+  return [...text.matchAll(/@([A-Za-z0-9_.-]{1,40})/g)].some((match) => normalizeName(match[1]) === target);
+};
+
+const insertMention = (name: string) => {
+  if (!name.trim() || isOwnName(name)) return;
+  const current = (chatVditor?.getValue() ?? draft.chat).trimEnd();
+  const next = `${current}${current ? " " : ""}@${name.trim()} `;
+  draft.chat = next;
+  chatVditor?.setValue(next, true);
+  chatVditorTarget?.querySelector<HTMLElement>("[contenteditable='true']")?.focus();
 };
 
 const emitDirect = async (event: Extract<DuelEvent, { type: "room.closed" | "player.kicked" | "player.unkicked" | "player.muted" | "player.unmuted" }>) => {
@@ -909,7 +930,7 @@ type RoomDialogValues = {
 
 const openCreateRoomDialog = async () => {
   if (creatingRoom) return;
-  const difficultyOptions = difficultyMeta.map((item) => `<option value="${item.value}">${item.label}</option>`).join("");
+  const difficultyOptions = difficultyMeta.map((item) => `<option value="${item.value}" style="color:${item.color}">${item.label}</option>`).join("");
   const result = await Swal.fire<RoomDialogValues>({
     title: "生成房间",
     html: `
@@ -1113,6 +1134,11 @@ const submitChat = async (event?: Event) => {
   const teamMessage = raw.startsWith("/") && mode === "room";
   const text = teamMessage ? raw.slice(1).trim() : raw;
   if (!text) return;
+  const privateViolation = teamMessage ? privateChatViolation(text) : null;
+  if (privateViolation) {
+    setStatus(privateViolation, "error");
+    return;
+  }
   if (recordBurst("chat", 5_000, 3, () => applyTemporaryMute(20_000))) {
     setStatus("发送过于频繁，已临时禁言 20 秒", "error");
     notify();
@@ -1936,6 +1962,7 @@ const PlayerRow = ({ player }: { player: Player }) => {
         {isAdminName(player.luoguName) ? <em><Shield size={12} />ADMIN</em> : null}
         {muted ? <em><Ban size={12} />MUTED</em> : null}
         {banned ? <em><Ban size={12} />BANNED</em> : <em>{player.ready ? "READY" : teamName(player.team).toUpperCase()}</em>}
+        {!isOwnName(player.luoguName) ? <button type="button" class="mention-player" title={`@${player.luoguName}`} onClick={() => insertMention(player.luoguName)}>@</button> : null}
         {canKick ? <button class="kick-player" title="移出准备房" onClick={() => void kickLobbyPlayer(player)}><UserMinus size={13} /></button> : null}
       </div>
     </div>
@@ -2042,7 +2069,7 @@ const ChatLine = ({ item }: { item: ChatStreamItem }) => {
   return (
     <p class={`chat-line bubble ${mine ? "mine" : "theirs"} ${chat.visibility === "team" ? "private" : ""}`}>
       <UserAvatar name={chat.luoguName} className="chat-avatar" />
-      <button class="chat-name" style={{ color: nameColor(chat.luoguName) }} onClick={() => openProfile(chat.luoguName)}>{chat.visibility === "team" ? "TEAM / " : ""}{chat.luoguName}</button>
+      <button type="button" class="chat-name" title={`点击 @${chat.luoguName}`} style={{ color: nameColor(chat.luoguName) }} onClick={() => insertMention(chat.luoguName)}>{chat.visibility === "team" ? "TEAM / " : ""}{chat.luoguName}</button>
       <RichText text={chat.text} className="chat-text" />
     </p>
   );
@@ -2456,14 +2483,14 @@ const AuthError = () => (
           <strong class="login-title">验证账号</strong>
           <ol class="login-guide">
             <li>输入你的 VJudge 用户名</li>
-            <li>打开 VJudge 首页并完成登录</li>
-            <li>返回这里，点击验证登录</li>
+            <li>确保当前浏览器已经登录 VJudge</li>
+            <li>点击验证后会短暂打开 VJudge，并自动完成在线确认</li>
           </ol>
           <input disabled={loginSubmitting} value={vjudgeUsername} placeholder="VJudge 用户名" autoComplete="username" onInput={(event) => (vjudgeUsername = event.currentTarget.value)} />
           <div class="login-actions">
-            <a href="https://vjudge.net/" target="_blank" rel="noreferrer">打开 VJudge</a>
+            <span>检测最近 3 秒的在线状态</span>
             <button class={`primary ${loginSubmitting ? "is-loading" : ""}`} disabled={loginSubmitting} type="submit">
-              {loginSubmitting ? <RefreshCw class="spin" size={16} /> : <KeyRound size={16} />}{loginSubmitting ? "正在验证…" : "验证登录"}
+              {loginSubmitting ? <RefreshCw class="spin" size={16} /> : <KeyRound size={16} />}{loginSubmitting ? "正在打开 VJudge…" : "打开 VJudge 并验证"}
             </button>
           </div>
         </form>
@@ -2483,13 +2510,37 @@ const BanAnnouncement = () => {
   );
 };
 
+const openVJudgeForLogin = async (): Promise<void> => {
+  const popup = window.open("about:blank", "_blank", "popup,width=1080,height=760");
+  if (!popup) throw new Error("浏览器阻止了 VJudge 窗口，请允许本站弹出窗口后重试");
+  const url = "https://vjudge.net/";
+  await fetch(url, { method: "HEAD", cache: "no-store", mode: "no-cors", credentials: "include" }).catch(() => undefined);
+  const startedAt = performance.now();
+  await fetch(url, { method: "HEAD", cache: "default", mode: "no-cors", credentials: "include" }).catch(() => undefined);
+  const closeDelay = (performance.now() - startedAt) * 1.5 + 1000;
+  try {
+    popup.location.replace(`${url}`);
+    console.log(closeDelay);
+    await new Promise((resolve) => window.setTimeout(resolve, closeDelay));
+  } finally {
+    if (!popup.closed) popup.close();
+  }
+};
+
 const submitVJudgeLogin = async (event: Event) => {
   event.preventDefault();
   if (loginSubmitting) return;
+  const username = vjudgeUsername.trim();
+  if (!username) {
+    authErrorText = "请输入 VJudge 用户名";
+    notify();
+    return;
+  }
   loginSubmitting = true;
   notify();
   try {
-    vjudgeSession = await verifyVJudgeLogin(vjudgeUsername);
+    await openVJudgeForLogin();
+    vjudgeSession = await verifyVJudgeLogin(username);
     identity = await renameIdentity(identity, vjudgeSession.username);
     authErrorText = "";
     bootPhase = "ready";

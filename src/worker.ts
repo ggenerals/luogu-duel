@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { DurableObject } from "cloudflare:workers";
-import { applyEvent, applyEvents, createInitialState } from "./domain";
+import { applyEvent, applyEvents, createInitialState, privateChatViolation } from "./domain";
 import type { DuelEvent, Problem, SignedEnvelope } from "./types";
 
 type Env = {
@@ -214,6 +214,10 @@ export class DuelRoom extends DurableObject<Env> {
     // Finished matches are immutable archives. Reject before SQLite persistence
     // so delayed retries cannot produce writes or directory broadcasts.
     if (event.roomId !== "global" && this.cachedState.phase === "finished") return false;
+    if (event.type === "chat.sent" && event.visibility === "team") {
+      const violation = privateChatViolation(event.text);
+      if (violation) throw new Error(violation);
+    }
 
     const currentPlayer = this.cachedState.players[event.actorId];
     if (event.type === "player.joined" && event.team === "spectator" && !this.cachedState.hostId && event.roomId !== "global") {
@@ -1045,7 +1049,7 @@ const verifyVJudgeLogin = async (request: Request, env: Env): Promise<Response> 
     if (!response.ok) throw new Error(`VJudge 返回 ${response.status}`);
     const html = await response.text();
     const lastSeen = extractProfileField(html, "user.profile.last_seen");
-    if (!isRecentVJudgeActivity(lastSeen)) return jsonError("未检测到最近 10 秒内的 VJudge 登录，登录信息为"+`"${lastSeen}"`, 403);
+    if (!isRecentVJudgeActivity(lastSeen)) return jsonError("登录信息为"+`"${lastSeen}"`, 403);
     const avatar = extractVJudgeAvatar(html);
     const saved = await env.DUEL_ROOM.getByName("__directory").fetch(
       new Request(`https://duel.internal/users/${encodeURIComponent(username)}`, {
@@ -1065,7 +1069,7 @@ const isRecentVJudgeActivity = (value: string): boolean => {
   const normalized = value.trim().toLowerCase();
   if (normalized === "just now") return true;
   const seconds = normalized.match(/^(\d+)\s*(?:sec|secs|second|seconds)\s+ago$/)?.[1];
-  return seconds !== undefined && Number(seconds) <= 10;
+  return seconds !== undefined && Number(seconds) <= 2;
 };
 
 const extractProfileField = (html: string, i18nKey: string): string => {
