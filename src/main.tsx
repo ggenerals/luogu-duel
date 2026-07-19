@@ -2293,36 +2293,38 @@ const RatingCurve = ({ name }: { name: string }) => {
 };
 
 const loadAnnouncement = async () => {
+  const raw = "https://github.com/ggenerals/VJudge-Duel-Homepage/raw/refs/heads/main/README.md";
+  const urls = [
+    `https://gh.xmly.dev/${raw}`,
+    `https://gh-proxy.com/${raw}`,
+    `https://j.1lin.dpdns.org/${raw}`,
+    raw
+  ];
+
   try {
-    const cached = JSON.parse(localStorage.getItem(announcementCacheKey) || "null") as { title?: string; content?: string; cachedAt?: number } | null;
-    if (cached?.title && cached.content) {
-      announcementTitle = cached.title;
-      announcementContent = cached.content;
+    const c = JSON.parse(localStorage.getItem(announcementCacheKey) || "null");
+    if (c?.content && Date.now() - (c.cachedAt || 0) < 3600000) {
+      announcementTitle = "VJudge Duel 公告";
+      announcementContent = c.content;
       notify();
-      if (cached.cachedAt && Date.now() - cached.cachedAt < 24 * 60 * 60_000) return;
+      return;
     }
-  } catch {
-    // Continue with the network source.
-  }
-  try {
-    const response = await fetch("https://api.luogu.me/article/query/utz3c7b2", {
-      cache: "default",
-      signal: AbortSignal.timeout(8_000)
-    });
-    if (!response.ok) throw new Error(`announcement returned ${response.status}`);
-    const payload = (await response.json()) as { code?: number; data?: { title?: string; content?: string } };
-    if (payload.code !== 200 || !payload.data?.content) throw new Error("invalid announcement payload");
-    announcementTitle = payload.data.title?.trim() || "VJudge Duel 公告";
-    announcementContent = payload.data.content;
+  } catch {}
+
+  for (const url of urls) {
     try {
-      localStorage.setItem(announcementCacheKey, JSON.stringify({ title: announcementTitle, content: announcementContent, cachedAt: Date.now() }));
-    } catch {
-      // Rendering does not depend on storage.
-    }
-    notify();
-  } catch {
-    if (announcementContent === "正在读取公告…") announcementContent = "公告暂时不可用。";
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue;
+      const text = await res.text();
+      announcementTitle = "VJudge Duel 公告";
+      announcementContent = text;
+      try { localStorage.setItem(announcementCacheKey, JSON.stringify({ content: text, cachedAt: Date.now() })); } catch {}
+      notify();
+      return;
+    } catch {}
   }
+
+  if (announcementContent === "正在读取公告…") announcementContent = "公告暂时不可用。";
 };
 
 const TemporaryBlockOverlay = () => (
@@ -2486,12 +2488,12 @@ const AuthError = () => (
           <strong class="login-title">验证账号</strong>
           <ol class="login-guide">
             <li>输入你的 VJudge 用户名</li>
-            <li>确保当前浏览器已经登录 VJudge</li>
+            <li>确保当前浏览器已经<a href="https://vjudge.net/" target="_blank">登录</a> VJudge</li>
             <li>点击验证后会短暂打开 VJudge，并自动完成在线确认</li>
           </ol>
           <input disabled={loginSubmitting} value={vjudgeUsername} placeholder="VJudge 用户名" autoComplete="username" onInput={(event) => (vjudgeUsername = event.currentTarget.value)} />
           <div class="login-actions">
-            <span>检测最近 3 秒的在线状态</span>
+            <span>点击后可能会弹出弹窗，请不要关闭，系统将会自动完成验证</span>
             <button class={`primary ${loginSubmitting ? "is-loading" : ""}`} disabled={loginSubmitting} type="submit">
               {loginSubmitting ? <RefreshCw class="spin" size={16} /> : <KeyRound size={16} />}{loginSubmitting ? "正在打开 VJudge…" : "打开 VJudge 并验证"}
             </button>
@@ -2515,14 +2517,14 @@ const BanAnnouncement = () => {
 
 const openVJudgeForLogin = async (): Promise<void> => {
   const popup = window.open("about:blank", "_blank", "popup,width=1080,height=760");
-  if (!popup) throw new Error("浏览器阻止了 VJudge 窗口，请允许本站弹出窗口后重试");
   const url = "https://vjudge.net/";
+  if (!popup) throw new Error("浏览器阻止了 VJudge 窗口，请允许本站弹出窗口后重试");
+  popup.location.replace(`${url}`);
   await fetch(url, { method: "HEAD", cache: "no-store", mode: "no-cors", credentials: "include" }).catch(() => undefined);
   const startedAt = performance.now();
   await fetch(url, { method: "HEAD", cache: "default", mode: "no-cors", credentials: "include" }).catch(() => undefined);
-  const closeDelay = (performance.now() - startedAt) * 1.5 + 1000;
+  const closeDelay = (performance.now() - startedAt) * 2 + 3000;
   try {
-    popup.location.replace(`${url}`);
     console.log(closeDelay);
     await new Promise((resolve) => window.setTimeout(resolve, closeDelay));
   } finally {
@@ -2551,7 +2553,7 @@ const submitVJudgeLogin = async (event: Event) => {
     await refreshGlobalModeration();
     await enterFromHash();
   } catch (error) {
-    authErrorText = error instanceof Error ? error.message : "VJudge 登录失败";
+    authErrorText = error instanceof Error ? error.message+"，你可能没有登陆" : "VJudge 登录失败";
   } finally {
     loginSubmitting = false;
   }
