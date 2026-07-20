@@ -1,4 +1,4 @@
-const sessionKey = "vjudge-duel.session.v1";
+const sessionKey = "vjudge-duel.session";
 
 export type VJudgeSession = {
   username: string;

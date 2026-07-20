@@ -230,7 +230,7 @@ const distribute = (count: number, ratios: PlatformRatios): PlatformRatios => {
   return result;
 };
 
-const cacheKey = (platform: ProblemPlatform): string => `vjudge-duel.problem-bank.${platform}.v2`;
+const cacheKey = (platform: ProblemPlatform): string => `vjudge-duel.problem-bank.${platform}`;
 const readCache = (platform: ProblemPlatform): { savedAt: number; items: BankItem[] } | null => {
   try {
     const data = JSON.parse(localStorage.getItem(cacheKey(platform)) || "null") as { savedAt?: number; items?: BankItem[] } | null;

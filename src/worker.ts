@@ -1069,7 +1069,7 @@ const isRecentVJudgeActivity = (value: string): boolean => {
   const normalized = value.trim().toLowerCase();
   if (normalized === "just now") return true;
   const seconds = normalized.match(/^(\d+)\s*(?:sec|secs|second|seconds)\s+ago$/)?.[1];
-  return seconds !== undefined && Number(seconds) <= 10;
+  return seconds !== undefined && Number(seconds) <= 3;
 };
 
 const extractProfileField = (html: string, i18nKey: string): string => {

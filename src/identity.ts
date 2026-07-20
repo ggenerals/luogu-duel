@@ -1,6 +1,6 @@
 import type { DuelEvent, SignedEnvelope } from "./types";
 
-const identityKey = "luogu-duel.identity.v1";
+const identityKey = "luogu-duel.identity";
 
 export type LocalIdentity = {
   id: string;

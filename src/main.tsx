@@ -138,11 +138,11 @@ const joinDeniedRooms = new Set<string>();
 const systemLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/tq5l4861.png";
 const darkBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/giufbahf.png";
 const lightBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/tq5l4861.png";
-const avatarCacheKey = "luogu-duel.avatar-cache.v1";
-const userCacheKey = "luogu-duel.user-cache.v1";
-const registrationCacheKey = "luogu-duel.registration-cache.v1";
+const avatarCacheKey = "luogu-duel.avatar-cache";
+const userCacheKey = "luogu-duel.user-cache";
+const registrationCacheKey = "luogu-duel.registration-cache";
 const userCacheTtl = 24 * 60 * 60 * 1000;
-const themeModeKey = "luogu-duel.theme-mode.v1";
+const themeModeKey = "luogu-duel.theme-mode";
 const avatarCache: Record<string, string> = readAvatarCache();
 const userCache: Record<string, { user: UserRecord; cachedAt: number }> = readUserCache();
 const avatarLoading = new Set<string>();
@@ -191,13 +191,13 @@ const dataVersion = "v4";
 const roomSeatKey = () => `luogu-duel.${dataVersion}.seat.${roomId}`;
 const activeRoomKey = `luogu-duel.active-room.${dataVersion}`;
 const historyKey = `luogu-duel.history.${dataVersion}`;
-const directoryCacheKey = "vjudge-duel.directory-cache.v2";
+const directoryCacheKey = "vjudge-duel.directory-cache";
 const eventCacheKey = (id: string) => `vjudge-duel.events.${dataVersion}.${id}`;
-const announcementCacheKey = "vjudge-duel.announcement.v1";
-const judgeCooldownKey = () => `vjudge-duel.judge-cooldown.v1.${normalizeName(identity?.luoguName ?? "anonymous")}`;
-const temporaryBanKey = "vjudge-duel.security.ban-until.v1";
-const temporaryBanReasonKey = "vjudge-duel.security.ban-reason.v1";
-const temporaryMuteKey = "vjudge-duel.security.mute-until.v1";
+const announcementCacheKey = "vjudge-duel.announcement";
+const judgeCooldownKey = () => `vjudge-duel.judge-cooldown.${normalizeName(identity?.luoguName ?? "anonymous")}`;
+const temporaryBanKey = "vjudge-duel.security.ban-until";
+const temporaryBanReasonKey = "vjudge-duel.security.ban-reason";
+const temporaryMuteKey = "vjudge-duel.security.mute-until";
 let temporaryBanUntil = readStoredNumber(temporaryBanKey);
 let temporaryBanReason = readStoredText(temporaryBanReasonKey) || "操作过于频繁";
 let temporaryMuteUntil = readStoredNumber(temporaryMuteKey);
@@ -2519,14 +2519,32 @@ const openVJudgeForLogin = async (): Promise<void> => {
   const popup = window.open("about:blank", "_blank", "popup,width=1080,height=760");
   const url = "https://vjudge.net/";
   if (!popup) throw new Error("浏览器阻止了 VJudge 窗口，请允许本站弹出窗口后重试");
-  popup.location.replace(`${url}`);
+  popup.location.replace(url);
   await fetch(url, { method: "HEAD", cache: "no-store", mode: "no-cors", credentials: "include" }).catch(() => undefined);
   const startedAt = performance.now();
   await fetch(url, { method: "HEAD", cache: "default", mode: "no-cors", credentials: "include" }).catch(() => undefined);
-  const closeDelay = (performance.now() - startedAt) * 2 + 3000;
+  const timeout = (performance.now() - startedAt) * 2 + 3000;
+
+  const deadline = performance.now() + timeout;
+  const POLL_INTERVAL = 2000;
+
   try {
-    console.log(closeDelay);
-    await new Promise((resolve) => window.setTimeout(resolve, closeDelay));
+    while (performance.now() < deadline) {
+      if (popup.closed) throw new Error("VJudge 窗口已被关闭");
+      try {
+        await verifyVJudgeLogin(vjudgeUsername.trim());
+        return;
+      } catch (err: unknown) {
+        if (err instanceof Error && /404/.test(err.message)) {
+          throw err;
+        }
+      }
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) break;
+      await new Promise((r) => setTimeout(r, Math.min(POLL_INTERVAL, remaining)));
+    }
+
+    throw new Error("VJudge 登录验证超时，请重试");
   } finally {
     if (!popup.closed) popup.close();
   }
@@ -2553,7 +2571,10 @@ const submitVJudgeLogin = async (event: Event) => {
     await refreshGlobalModeration();
     await enterFromHash();
   } catch (error) {
-    authErrorText = error instanceof Error ? error.message+"，你可能没有登陆" : "VJudge 登录失败";
+    authErrorText =
+      error instanceof Error
+        ? error.message + "，你可能没有登录"
+        : "VJudge 登录失败";
   } finally {
     loginSubmitting = false;
   }
@@ -3004,7 +3025,7 @@ function readStoredText(key: string): string {
 }
 
 function recordBurst(kind: string, windowMs: number, threshold: number, punish: () => void): boolean {
-  const key = `vjudge-duel.security.actions.${kind}.v1`;
+  const key = `vjudge-duel.security.actions.${kind}`;
   const now = Date.now();
   try {
     const stored = JSON.parse(localStorage.getItem(key) || "[]") as number[];
