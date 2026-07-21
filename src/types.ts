@@ -76,6 +76,7 @@ export type DuelState = {
   roomId: string;
   phase: Phase;
   rated: boolean;
+  minimumDifficulty?: number;
   hostId?: string;
   startedAt?: number;
   endedAt?: number;

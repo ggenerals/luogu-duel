@@ -6,11 +6,13 @@ export type VJudgeSession = {
   signedInAt: number;
 };
 
-export const verifyVJudgeLogin = async (username: string): Promise<VJudgeSession> => {
+export type VJudgeLoginMethod = "recent" | "school";
+
+export const verifyVJudgeLogin = async (username: string, method: VJudgeLoginMethod = "recent", code?: string): Promise<VJudgeSession> => {
   const response = await fetch("/api/auth/vjudge/verify", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username }),
+    body: JSON.stringify({ username, method, code }),
     signal: AbortSignal.timeout(12_000)
   });
   const payload = (await response.json().catch(() => ({}))) as { error?: string; session?: VJudgeSession };

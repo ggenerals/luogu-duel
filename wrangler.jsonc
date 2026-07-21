@@ -36,7 +36,7 @@
     {
       "name": "JUDGE_RATE_LIMITER",
       "namespace_id": "1002",
-      "simple": { "limit": 1, "period": 10 }
+      "simple": { "limit": 3, "period": 10 }
     }
   ],
   "migrations": [

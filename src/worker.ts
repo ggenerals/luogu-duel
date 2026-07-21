@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { DurableObject } from "cloudflare:workers";
-import { applyEvent, applyEvents, createInitialState, privateChatViolation } from "./domain";
+import { applyEvent, applyEvents, canStart, createInitialState, privateChatViolation } from "./domain";
 import type { DuelEvent, Problem, SignedEnvelope } from "./types";
 
 type Env = {
@@ -220,6 +220,18 @@ export class DuelRoom extends DurableObject<Env> {
     }
 
     const currentPlayer = this.cachedState.players[event.actorId];
+    const sameNamePlayer = event.type === "player.joined"
+      ? Object.values(this.cachedState.players).find((player) => normalizeName(player.luoguName) === normalizeName(event.luoguName))
+      : undefined;
+    if (event.type === "player.joined" && this.cachedState.phase !== "lobby" && isPlayingSeat(event.team) && !isPlayingSeat(sameNamePlayer?.team)) {
+      throw new Error("比赛已经开始，新加入的用户只能观赛");
+    }
+    if (event.type === "player.teamChanged" && this.cachedState.phase !== "lobby") {
+      throw new Error("比赛开始后不能切换队伍");
+    }
+    if (event.type === "room.closed" && this.cachedState.phase === "arena" && !adminNames.has(normalizeName(event.actorName))) {
+      throw new Error("比赛开始后只有管理员可以关闭房间");
+    }
     if (event.type === "player.joined" && event.team === "spectator" && !this.cachedState.hostId && event.roomId !== "global") {
       throw new Error("房主不能进入观战席");
     }
@@ -294,6 +306,14 @@ export class DuelRoom extends DurableObject<Env> {
       } else if (this.cachedState.phase !== "lobby") {
         await this.ctx.storage.deleteAlarm();
       }
+    }
+    if (event.roomId !== "global" && event.type === "player.readyChanged" && canStart(this.cachedState)) {
+      // The last ready event must reach clients before the generated start event.
+      // The outer request path may broadcast it again; clients deduplicate by event ID.
+      this.broadcast({ type: "event", envelope });
+      const startEnvelope = await systemStartEnvelope(event.roomId, this.cachedState.lamport + 1, Date.now());
+      const started = await this.acceptEnvelope(startEnvelope);
+      if (started) this.broadcast({ type: "event", envelope: startEnvelope });
     }
     return true;
   }
@@ -956,8 +976,8 @@ const fetchVJudgeStatus = async (requestUrl: URL, request: Request, env: Env): P
   const judgeLimit = await env.JUDGE_RATE_LIMITER.limit({ key: clientKey });
   if (!judgeLimit.success) {
     return Response.json(
-      { error: "判题冷却中，请 30 秒后重试" },
-      { status: 429, headers: { "cache-control": "no-store", "retry-after": "60" } }
+      { error: "判题请求过于频繁，请稍后重试" },
+      { status: 429, headers: { "cache-control": "no-store", "retry-after": "5" } }
     );
   }
 
@@ -1033,9 +1053,12 @@ const directoryJsonResponse = async (request: Request, env: Env, internalUrl: st
 };
 
 const verifyVJudgeLogin = async (request: Request, env: Env): Promise<Response> => {
-  const body = (await request.json().catch(() => null)) as { username?: unknown } | null;
+  const body = (await request.json().catch(() => null)) as { username?: unknown; method?: unknown; code?: unknown } | null;
   const username = typeof body?.username === "string" ? body.username.trim() : "";
+  const method = body?.method === "school" ? "school" : "recent";
+  const code = typeof body?.code === "string" ? body.code.trim() : "";
   if (!/^[A-Za-z0-9_.-]{1,40}$/.test(username)) return jsonError("请输入有效的 VJudge 用户名", 400);
+  if (method === "school" && !/^\d{6}$/.test(code)) return jsonError("请先生成 6 位学校验证码", 400);
 
   try {
     const profileUrl = new URL(`https://vjudge.net/user/${encodeURIComponent(username)}`);
@@ -1045,11 +1068,16 @@ const verifyVJudgeLogin = async (request: Request, env: Env): Promise<Response> 
       cf: { cacheTtl: 0 },
       signal: AbortSignal.timeout(10_000)
     });
-    if (response.status === 404) return jsonError("未识别到人脸", 404);
+    if (response.status === 404) return jsonError("未找到该 VJudge 用户", 404);
     if (!response.ok) throw new Error(`VJudge 返回 ${response.status}`);
     const html = await response.text();
-    const lastSeen = extractProfileField(html, "user.profile.last_seen");
-    if (!isRecentVJudgeActivity(lastSeen)) return jsonError("登录信息为"+`"${lastSeen}"`, 403);
+    if (method === "school") {
+      const school = extractProfileField(html, "user.profile.school");
+      if (!school.includes(code)) return jsonError(`学校字段中没有找到验证码 ${code}`, 403);
+    } else {
+      const lastSeen = extractProfileField(html, "user.profile.last_seen");
+      if (!isRecentVJudgeActivity(lastSeen)) return jsonError("登录信息为"+`"${lastSeen}"`, 403);
+    }
     const avatar = extractVJudgeAvatar(html);
     const saved = await env.DUEL_ROOM.getByName("__directory").fetch(
       new Request(`https://duel.internal/users/${encodeURIComponent(username)}`, {
@@ -1178,6 +1206,22 @@ const cacheHeaders = (_browserMaxAge: number, edgeMaxAge = _browserMaxAge): Head
 });
 
 const isPlayingSeat = (seat: unknown): boolean => seat === "red" || seat === "blue";
+const systemStartEnvelope = async (roomId: string, lamport: number, issuedAt: number): Promise<SignedEnvelope> => {
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const publicKey = await crypto.subtle.exportKey("jwk", pair.publicKey);
+  const actorId = await keyId(publicKey);
+  const event: DuelEvent = {
+    type: "game.started",
+    roomId,
+    actorId,
+    id: crypto.randomUUID(),
+    lamport,
+    issuedAt
+  };
+  const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, textBytes(stableStringify(event)));
+  return { publicKey, event, signature: btoa(String.fromCharCode(...new Uint8Array(signature))) };
+};
+
 const systemCloseEnvelope = async (roomId: string, lamport: number, issuedAt: number): Promise<SignedEnvelope> => {
   const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
   const publicKey = await crypto.subtle.exportKey("jwk", pair.publicKey);

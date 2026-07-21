@@ -12,6 +12,7 @@ import type {
   Vote,
   VoteKind
 } from "./types";
+import { pinyin } from 'pinyin-pro';
 
 const statusRank: Record<JudgeStatus, number> = {
   OK: 0,
@@ -29,7 +30,7 @@ export const ADMIN_NAMES = new Set(["general0826", "slmxf", "liyifan202201", "gc
 export const SYSTEM_CHAT_PREFIX = "@@luogu-duel-system:";
 
 export type SystemChatCommand =
-  | { kind: "room.configured"; problems: Problem[]; rated?: boolean }
+  | { kind: "room.configured"; problems: Problem[]; rated?: boolean; minimumDifficulty?: number }
   | { kind: "player.joined"; luoguName: string; team: Seat }
   | { kind: "player.teamChanged"; team: Seat }
   | { kind: "player.readyChanged"; ready: boolean }
@@ -69,6 +70,14 @@ export const privateChatViolation = (text: string): string | null => {
   const normalized = text.toLowerCase();
   if (/<\s*iframe\b|&lt;\s*iframe\b/i.test(text)) return "私信不能包含 iframe";
   if (normalized.includes("https://www.luogu.com.cn/api/verify/captcha")) return "私信不能包含该验证码地址";
+  const normalizedPinyin = pinyin(text, { toneType: 'none', type: 'array' })
+    .join('')
+    .toLowerCase();
+  if(normalized.includes("gunmu") || normalized.includes("mugun"))
+    return "你没有输入任何东西，有非法不可见字符。";
+  if(normalized.includes("shabi") || normalized.includes("sb") || normalized.includes("tamade") || normalized.includes("tmd") || normalized.includes("fuck"))
+    return "不合适用于";
+
   return null;
 };
 export const isTeam = (team: Seat | undefined): team is Team => team === "red" || team === "blue";
@@ -99,13 +108,8 @@ export const makeProblemSet = (count: number, seed: string, manualInput: string)
 };
 
 export const sortProblemsByDifficulty = (problems: Problem[]): Problem[] =>
-  [...problems]
-    .sort(
-      (a, b) =>
-        (a.difficulty ?? 99) - (b.difficulty ?? 99) ||
-        numericPid(a.pid) - numericPid(b.pid) ||
-        a.pid.localeCompare(b.pid)
-    )
+  shuffledProblems(problems)
+    .sort((a, b) => (a.difficulty ?? 99) - (b.difficulty ?? 99))
     .map((problem, index) => ({ ...problem, score: scoreForIndex(index) }));
 
 export const applyEvents = (roomId: string, events: DuelEvent[]): DuelState =>
@@ -122,7 +126,7 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
 
   switch (event.type) {
     case "room.configured":
-      configureRoom(next, event.actorId, event.problems, event.issuedAt, event.rated);
+      configureRoom(next, event.actorId, event.problems, event.issuedAt, event.rated, event.minimumDifficulty);
       break;
     case "player.joined":
       joinPlayer(next, event.actorId, event.luoguName, event.team, event.issuedAt);
@@ -222,7 +226,7 @@ export const canAcceptStart = (state: DuelState): boolean => {
 };
 
 export const canCloseRoom = (state: DuelState, actorId: string, actorName: string): boolean =>
-  isAdminName(actorName) || (state.phase !== "finished" && state.hostId === actorId);
+  isAdminName(actorName) || (state.phase === "lobby" && state.hostId === actorId);
 
 export const visibleChats = (state: DuelState, viewerId: string): ChatMessage[] => {
   const viewer = state.players[viewerId];
@@ -274,10 +278,13 @@ export const buildVote = (
   replacement
 });
 
-const configureRoom = (state: DuelState, actorId: string, problems: Problem[], at: number, rated = true) => {
+const configureRoom = (state: DuelState, actorId: string, problems: Problem[], at: number, rated = true, minimumDifficulty?: number) => {
   if (state.problems.length > 0 || problems.length === 0) return;
   state.hostId = state.hostId ?? actorId;
   state.rated = rated;
+  state.minimumDifficulty = Number.isFinite(minimumDifficulty)
+    ? Math.max(1, Math.min(8, Number(minimumDifficulty)))
+    : problemDifficultyFloor(problems);
   state.problems = sortProblemsByDifficulty(problems);
   pushSystem(state, `房间题目已生成，共 ${problems.length} 题`, at);
 };
@@ -300,8 +307,13 @@ const joinPlayer = (state: DuelState, actorId: string, luoguName: string, reques
     }
   }
   const joiningAsHost = state.roomId !== "global" && !state.hostId;
-  const selectedTeam = duplicate?.team ?? requestedSeat;
-  const team = banned || state.phase !== "lobby" ? "spectator" : joiningAsHost && selectedTeam === "spectator" ? "red" : selectedTeam;
+  const previous = state.players[actorId] ?? duplicate;
+  const selectedTeam = previous?.team ?? requestedSeat;
+  const team = banned
+    ? "spectator"
+    : state.phase !== "lobby"
+      ? isTeam(previous?.team) ? previous.team : "spectator"
+      : joiningAsHost && selectedTeam === "spectator" ? "red" : selectedTeam;
   state.hostId = state.hostId ?? actorId;
   state.players[actorId] = {
     id: actorId,
@@ -333,7 +345,7 @@ const applySystemChatCommand = (state: DuelState, event: Extract<DuelEvent, { ty
   if (!command) return false;
   switch (command.kind) {
     case "room.configured":
-      configureRoom(state, event.actorId, command.problems, event.issuedAt, command.rated);
+      configureRoom(state, event.actorId, command.problems, event.issuedAt, command.rated, command.minimumDifficulty);
       return true;
     case "player.joined":
       joinPlayer(state, event.actorId, command.luoguName, command.team, event.issuedAt);
@@ -644,9 +656,23 @@ const isMutedPlayer = (state: DuelState, player: Player): boolean =>
 
 const scoreForIndex = (index: number): number => 100 + index * 50;
 
-const numericPid = (pid: string): number => {
-  const match = pid.match(/\d+/);
-  return match ? Number(match[0]) : Number.MAX_SAFE_INTEGER;
+const problemDifficultyFloor = (problems: Problem[]): number | undefined => {
+  const levels = problems.map((problem) => Number(problem.difficulty)).filter((level) => Number.isFinite(level));
+  return levels.length ? Math.min(...levels) : undefined;
+};
+
+const shuffledProblems = (problems: Problem[]): Problem[] => {
+  const identity = problems
+    .map((problem) => `${problem.platform ?? "luogu"}:${problem.pid}:${problem.difficulty ?? 99}`)
+    .sort()
+    .join("|");
+  const rng = seeded(`problem-order:${identity}`);
+  const shuffled = [...problems];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const target = Math.floor(rng() * (index + 1));
+    [shuffled[index], shuffled[target]] = [shuffled[target], shuffled[index]];
+  }
+  return shuffled;
 };
 
 const seeded = (seed: string): (() => number) => {

@@ -8,10 +8,12 @@ import { render } from "preact";
 import {
   Ban,
   Bot,
+  Building2,
   Check,
   ChevronDown,
   ChevronRight,
   CircleDot,
+  Copy,
   Crown,
   DoorClosed,
   Eye,
@@ -48,7 +50,6 @@ import {
   applyEvents,
   buildVote,
   canCloseRoom,
-  canStart,
   createInitialState,
   isAdminName,
   isTeam,
@@ -63,7 +64,7 @@ import {
 } from "./domain";
 import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope, type LocalIdentity } from "./identity";
 import { cachedProblemCount, defaultRatios, difficultyMeta, parseCustomProblems, pickProblems, pickReplacementProblem, platformLabel, type DifficultyLevel, type PlatformRatios, type ProblemPlatform } from "./problemPicker";
-import { loadVJudgeSession, logoutVJudgeSession, verifyVJudgeLogin, type VJudgeSession } from "./oauth";
+import { loadVJudgeSession, logoutVJudgeSession, verifyVJudgeLogin, type VJudgeLoginMethod, type VJudgeSession } from "./oauth";
 import { allowServerRequest, directoryWebSocketUrl, fetchRooms, fetchSnapshot, fetchUserRecord, fetchUsers, publishEnvelope, roomWebSocketUrl, saveUserRecord, setServerRequestWarningHandler, updateUserRating, type RoomListing, type ServerMessage, type UserRecord } from "./realtimeStore";
 import { fetchVJudgeRecords } from "./vjudge";
 import type { ChatMessage, DuelEvent, DuelState, Player, Problem, Seat, SignedEnvelope, VoteKind } from "./types";
@@ -124,6 +125,8 @@ let authErrorText = "";
 let announcementTitle = "VJudge Duel 公告";
 let announcementContent = "正在读取公告…";
 let vjudgeUsername = "";
+let vjudgeLoginMethod: VJudgeLoginMethod = "recent";
+let schoolVerificationCode = "";
 let creatingRoom = false;
 let loginSubmitting = false;
 const adminBusy = new Set<string>();
@@ -135,7 +138,7 @@ let downloadProgress: Record<ProblemPlatform, { percent: number; status: string 
 let toasts: ToastMessage[] = [];
 const notifiedKeys = new Set<string>();
 const joinDeniedRooms = new Set<string>();
-const systemLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/tq5l4861.png";
+const systemLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/lb8qcsrx.png";
 const darkBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/giufbahf.png";
 const lightBrandLogoUrl = "https://cdn.luogu.com.cn/upload/image_hosting/tq5l4861.png";
 const avatarCacheKey = "luogu-duel.avatar-cache";
@@ -194,6 +197,7 @@ const historyKey = `luogu-duel.history.${dataVersion}`;
 const directoryCacheKey = "vjudge-duel.directory-cache";
 const eventCacheKey = (id: string) => `vjudge-duel.events.${dataVersion}.${id}`;
 const announcementCacheKey = "vjudge-duel.announcement";
+const firstVisitRulesKey = "vjudge-duel.rules-seen.v1";
 const judgeCooldownKey = () => `vjudge-duel.judge-cooldown.${normalizeName(identity?.luoguName ?? "anonymous")}`;
 const temporaryBanKey = "vjudge-duel.security.ban-until";
 const temporaryBanReasonKey = "vjudge-duel.security.ban-reason";
@@ -286,6 +290,7 @@ const boot = async () => {
   await registerCurrentUser();
   await enterFromHash();
   finishBootScreen();
+  scheduleFirstVisitRules();
 };
 
 const enterFromHash = async () => {
@@ -632,6 +637,7 @@ const handleServerMessage = async (raw: string) => {
     statusText = message.message;
     if (message.message.includes("另一场未结束比赛")) joinDeniedRooms.add(roomId);
     await replaceRoomSnapshot().catch(() => undefined);
+    await ensureJoined();
     if (message.message.includes("每天最多创建 1 场")) {
       localStorage.removeItem(eventCacheKey(roomId));
       location.hash = "";
@@ -657,7 +663,6 @@ const applyAuthoritativeSnapshot = async (incoming: SignedEnvelope[]) => {
   if (roomId === "global") globalModeration = state;
   saveHistory();
   scheduleFinishReturn();
-  maybeAutoStart();
   rememberActiveRoomIfNeeded();
 };
 
@@ -703,7 +708,6 @@ const receiveEnvelope = async (envelope: SignedEnvelope, renderNow = true) => {
   if (roomId === "global") globalModeration = state;
   saveHistory();
   scheduleFinishReturn();
-  maybeAutoStart();
   rememberActiveRoomIfNeeded();
   if (renderNow) pushToastsForEvent(envelope.event, previousPhase, previousSystemCount);
   if (renderNow) notify();
@@ -1262,13 +1266,6 @@ const toggleReady = async () => {
   await emit({ ...baseEvent("player.readyChanged"), ready: !player.ready });
 };
 
-const maybeAutoStart = () => {
-  if (!canStart(state)) return;
-  if (state.hostId !== identity.id) return;
-  if (envelopes.some((item) => item.event.type === "game.started")) return;
-  void emit({ ...baseEvent("game.started") });
-};
-
 const openVote = async (kind: VoteKind, targetPid?: string, replacement?: Problem) => {
   const player = state.players[identity.id];
   if (state.phase !== "arena" || !player || !isTeam(player.team) || blockedByBan()) return;
@@ -1289,7 +1286,12 @@ const replaceProblem = async (targetPid: string) => {
   notify();
   try {
     setStatus(`正在为 ${targetPid} 查找低一级题目`);
-    const replacement = await pickReplacementProblem(current, state.problems, `${roomId}:${state.lamport}:${identity.id}`);
+    const replacement = await pickReplacementProblem(
+      current,
+      state.problems,
+      `${roomId}:${state.lamport}:${identity.id}`,
+      state.minimumDifficulty as DifficultyLevel | undefined
+    );
     await openVote("replace-problem", targetPid, replacement);
     setStatus(`${targetPid} → ${replacement.pid}，等待投票`);
   } catch (error) {
@@ -1306,16 +1308,26 @@ const judgeProblem = async (problem: Problem) => {
   judgingProblems.add(key);
   notify();
   try {
-    const players = Object.values(state.players).filter((player) => isTeam(player.team) && !moderationRecordForPlayer(player));
     startJudgeCooldown();
-    const records = await fetchVJudgeRecords(problem, players.map((player) => player.luoguName), state.startedAt, identity.luoguName);
-    for (const record of records) {
-      const existing = state.feed.find((item) => item.recordId === record.recordId && item.pid === record.pid);
-      if (!existing || existing.status !== record.status || existing.at !== record.at) {
-        await emit({ ...baseEvent("judge.recordSeen"), record });
+    let records: DuelState["feed"] = [];
+    let hasPending = false;
+    do {
+      if (mode !== "room" || state.phase !== "arena" || !state.startedAt) break;
+      const players = Object.values(state.players).filter((player) => isTeam(player.team) && !moderationRecordForPlayer(player));
+      records = await fetchVJudgeRecords(problem, players.map((player) => player.luoguName), state.startedAt, identity.luoguName);
+      for (const record of records) {
+        const existing = state.feed.find((item) => item.recordId === record.recordId && item.pid === record.pid);
+        if (!existing || existing.status !== record.status || existing.at !== record.at) {
+          await emit({ ...baseEvent("judge.recordSeen"), record });
+        }
       }
-    }
-    setStatus(records.length ? `${problem.pid} 已同步 ${records.length} 条提交` : `${problem.pid} 暂无开赛后的提交`);
+      hasPending = records.some((record) => record.status === "PD");
+      if (hasPending) {
+        setStatus(`${problem.pid} 仍在判题，5 秒后自动同步`);
+        await new Promise((resolve) => window.setTimeout(resolve, 5_000));
+      }
+    } while (hasPending);
+    if (!hasPending) setStatus(records.length ? `${problem.pid} 已同步 ${records.length} 条提交` : `${problem.pid} 暂无开赛后的提交`);
   } catch (error) {
     if(error instanceof Error && error.message === "403") {
       setStatus("请刷新通过人机验证再尝试点击判题", "error");
@@ -1892,12 +1904,14 @@ const runForceCloseRoom = async (room: RoomListing) => {
 };
 
 const forceCloseRoom = async (room: RoomListing) => {
+  const snapshot = await fetchSnapshot(room.roomId, room.secret);
+  const roomState = applyEvents(room.roomId, snapshot.map((item) => item.event));
   const event: DuelEvent = {
     type: "room.closed",
     roomId: room.roomId,
     actorId: identity.id,
     id: crypto.randomUUID(),
-    lamport: 1,
+    lamport: roomState.lamport + 1,
     issuedAt: Date.now(),
     reason: "管理员删除房间",
     actorName: identity.luoguName
@@ -2063,7 +2077,7 @@ const ChatLine = ({ item }: { item: ChatStreamItem }) => {
       <p class={record.status === "OK" ? "chat-line judge ok" : "chat-line judge fail"}>
         <span class="chat-avatar">{record.status === "OK" ? "✓" : "!"}</span>
         <span>{formatClock(record.at)} / {record.pid}</span>
-        <RichText text={`${record.luoguName} ${record.status}`} className="chat-text" />
+        <RichText text={`${record.luoguName} ${displayJudgeStatus(record.status)}`} className="chat-text" />
       </p>
     );
   }
@@ -2209,7 +2223,7 @@ const FeedTable = () => (
           <td>{formatClock(item.at)}</td>
           <td><code>{problemCode(item.pid)}</code></td>
           <td>{item.luoguName}</td>
-          <td>{item.status}</td>
+          <td>{displayJudgeStatus(item.status)}</td>
         </tr>
       ))}
       {state.feed.length === 0 ? (
@@ -2297,6 +2311,10 @@ const loadAnnouncement = async () => {
   const urls = [
     `https://gh.xmly.dev/${raw}`,
     `https://gh-proxy.com/${raw}`,
+    `https://github.ikgy.top/${raw}`,
+    `https://gh-proxy.org/${raw}`,
+    `https://cdn.gh-proxy.org/${raw}`,
+    `https://g.z321.cc.cd/${raw}`,
     `https://j.1lin.dpdns.org/${raw}`,
     raw
   ];
@@ -2486,18 +2504,45 @@ const AuthError = () => (
         </div>
         <form class="paste-login" onSubmit={(event) => void submitVJudgeLogin(event)}>
           <strong class="login-title">验证账号</strong>
-          <ol class="login-guide">
-            <li>输入你的 VJudge 用户名</li>
-            <li>确保当前浏览器已经<a href="https://vjudge.net/" target="_blank">登录</a> VJudge</li>
-            <li>点击验证后会短暂打开 VJudge，并自动完成在线确认</li>
-          </ol>
-          <input disabled={loginSubmitting} value={vjudgeUsername} placeholder="VJudge 用户名" autoComplete="username" onInput={(event) => (vjudgeUsername = event.currentTarget.value)} />
-          <div class="login-actions">
-            <span>点击后可能会弹出弹窗，请不要关闭，系统将会自动完成验证</span>
-            <button class={`primary ${loginSubmitting ? "is-loading" : ""}`} disabled={loginSubmitting} type="submit">
-              {loginSubmitting ? <RefreshCw class="spin" size={16} /> : <KeyRound size={16} />}{loginSubmitting ? "正在打开 VJudge…" : "打开 VJudge 并验证"}
-            </button>
+          <div class="auth-methods" role="tablist" aria-label="登录验证方式">
+            <button type="button" role="tab" aria-selected={vjudgeLoginMethod === "recent"} class={vjudgeLoginMethod === "recent" ? "active" : ""} disabled={loginSubmitting} onClick={() => setVJudgeLoginMethod("recent")}><KeyRound size={15} />快速验证</button>
+            <button type="button" role="tab" aria-selected={vjudgeLoginMethod === "school"} class={vjudgeLoginMethod === "school" ? "active" : ""} disabled={loginSubmitting} onClick={() => setVJudgeLoginMethod("school")}><Building2 size={15} />学校验证码</button>
           </div>
+          <input disabled={loginSubmitting} value={vjudgeUsername} placeholder="VJudge 用户名" autoComplete="username" onInput={(event) => { vjudgeUsername = event.currentTarget.value; notify(); }} />
+          {vjudgeLoginMethod === "recent" ? (
+            <>
+              <ol class="login-guide">
+                <li>确保当前浏览器已经登录 VJudge</li>
+                <li>点击按钮，由系统自动完成在线确认</li>
+              </ol>
+              <div class="login-actions">
+                <a href="https://vjudge.net/" target="_blank" rel="noreferrer">前往 VJudge 登录</a>
+                <button class={`primary ${loginSubmitting ? "is-loading" : ""}`} disabled={loginSubmitting} type="submit">
+                  {loginSubmitting ? <RefreshCw class="spin" size={16} /> : <KeyRound size={16} />}{loginSubmitting ? "正在快速验证…" : "快速验证"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <ol class="login-guide">
+                <li>点击用户名并选择“更新资料”</li>
+                <li>在“学校”字段末尾加入下面的 6 位数字</li>
+                <li>保存资料后回到这里验证</li>
+              </ol>
+              <div class="school-code-box">
+                <span>学校验证码</span>
+                <output>{schoolVerificationCode || "------"}</output>
+                <button type="button" disabled={loginSubmitting} title="复制验证码" onClick={() => void copySchoolVerificationCode()}><Copy size={15} /></button>
+                <button type="button" disabled={loginSubmitting} onClick={generateSchoolVerificationCode}>{schoolVerificationCode ? "换一个" : "生成"}</button>
+              </div>
+              <div class="login-actions">
+                <a href={`https://vjudge.net/user/${encodeURIComponent(vjudgeUsername.trim())}`} target="_blank" rel="noreferrer">打开个人资料</a>
+                <button class={`primary ${loginSubmitting ? "is-loading" : ""}`} disabled={loginSubmitting || !schoolVerificationCode} type="submit">
+                  {loginSubmitting ? <RefreshCw class="spin" size={16} /> : <Check size={16} />}{loginSubmitting ? "正在读取资料…" : "验证学校字段"}
+                </button>
+              </div>
+            </>
+          )}
         </form>
       </section>
     </main>
@@ -2515,7 +2560,7 @@ const BanAnnouncement = () => {
   );
 };
 
-const openVJudgeForLogin = async (): Promise<void> => {
+const openVJudgeForLogin = async (username: string): Promise<VJudgeSession> => {
   const popup = window.open("about:blank", "_blank", "popup,width=1080,height=760");
   const url = "https://vjudge.net/";
   if (!popup) throw new Error("浏览器阻止了 VJudge 窗口，请允许本站弹出窗口后重试");
@@ -2523,7 +2568,7 @@ const openVJudgeForLogin = async (): Promise<void> => {
   await fetch(url, { method: "HEAD", cache: "no-store", mode: "no-cors", credentials: "include" }).catch(() => undefined);
   const startedAt = performance.now();
   await fetch(url, { method: "HEAD", cache: "default", mode: "no-cors", credentials: "include" }).catch(() => undefined);
-  const timeout = (performance.now() - startedAt) * 2 + 3000;
+  const timeout = (performance.now() - startedAt) * 2 + 10000;
 
   const deadline = performance.now() + timeout;
   const POLL_INTERVAL = 2000;
@@ -2532,8 +2577,7 @@ const openVJudgeForLogin = async (): Promise<void> => {
     while (performance.now() < deadline) {
       if (popup.closed) throw new Error("VJudge 窗口已被关闭");
       try {
-        await verifyVJudgeLogin(vjudgeUsername.trim());
-        return;
+        return await verifyVJudgeLogin(username, "recent");
       } catch (err: unknown) {
         if (err instanceof Error && /404/.test(err.message)) {
           throw err;
@@ -2550,6 +2594,31 @@ const openVJudgeForLogin = async (): Promise<void> => {
   }
 };
 
+const setVJudgeLoginMethod = (method: VJudgeLoginMethod) => {
+  vjudgeLoginMethod = method;
+  authErrorText = method === "recent" ? "快速验证会确认最近的 VJudge 在线状态。" : "将验证码加入 VJudge 学校字段后即可验证。";
+  if (method === "school" && !schoolVerificationCode) generateSchoolVerificationCode();
+  notify();
+};
+
+const generateSchoolVerificationCode = () => {
+  const random = new Uint32Array(1);
+  crypto.getRandomValues(random);
+  schoolVerificationCode = String(random[0] % 1_000_000).padStart(6, "0");
+  notify();
+};
+
+const copySchoolVerificationCode = async () => {
+  if (!schoolVerificationCode) generateSchoolVerificationCode();
+  try {
+    await navigator.clipboard.writeText(schoolVerificationCode);
+    authErrorText = `验证码 ${schoolVerificationCode} 已复制`;
+  } catch {
+    authErrorText = `请手动复制验证码 ${schoolVerificationCode}`;
+  }
+  notify();
+};
+
 const submitVJudgeLogin = async (event: Event) => {
   event.preventDefault();
   if (loginSubmitting) return;
@@ -2562,8 +2631,9 @@ const submitVJudgeLogin = async (event: Event) => {
   loginSubmitting = true;
   notify();
   try {
-    await openVJudgeForLogin();
-    vjudgeSession = await verifyVJudgeLogin(username);
+    vjudgeSession = vjudgeLoginMethod === "recent"
+      ? await openVJudgeForLogin(username)
+      : await verifyVJudgeLogin(username, "school", schoolVerificationCode);
     identity = await renameIdentity(identity, vjudgeSession.username);
     authErrorText = "";
     bootPhase = "ready";
@@ -2573,7 +2643,7 @@ const submitVJudgeLogin = async (event: Event) => {
   } catch (error) {
     authErrorText =
       error instanceof Error
-        ? error.message + "，你可能没有登录"
+        ? error.message
         : "VJudge 登录失败";
   } finally {
     loginSubmitting = false;
@@ -2633,6 +2703,42 @@ const showSponsorCode = async () => {
   });
 };
 
+let firstVisitRulesScheduled = false;
+const scheduleFirstVisitRules = () => {
+  if (firstVisitRulesScheduled || localStorage.getItem(firstVisitRulesKey) === "1") return;
+  firstVisitRulesScheduled = true;
+  window.setTimeout(() => {
+    const rulesWindow = window.open("https://www.luogu.me/article/fgiidurs", "_blank", "noopener,noreferrer");
+    if (!rulesWindow) {
+      void showFirstVisitRules();
+      return;
+    }
+    const showOnReturn = () => {
+      if (document.visibilityState !== "visible") return;
+      document.removeEventListener("visibilitychange", showOnReturn);
+      window.removeEventListener("focus", showOnReturn);
+      void showFirstVisitRules();
+    };
+    document.addEventListener("visibilitychange", showOnReturn);
+    window.addEventListener("focus", showOnReturn);
+  }, 320);
+};
+
+const showFirstVisitRules = async () => {
+  try {
+    if (localStorage.getItem(firstVisitRulesKey) === "1") return;
+    localStorage.setItem(firstVisitRulesKey, "1");
+  } catch {
+    // Keep the in-memory guard when persistent storage is unavailable.
+  }
+  await Swal.fire({
+    title: "规则与工单",
+    html: '<p class="first-visit-rules-text">开始对决前，请先阅读使用规则。遇到问题也可以在这里提交工单。</p><a class="first-visit-rules-link" href="https://www.luogu.me/article/fgiidurs" target="_blank" rel="noopener noreferrer">打开规则与工单</a>',
+    confirmButtonText: "关闭",
+    customClass: { popup: "duel-swal", confirmButton: "duel-swal-confirm" }
+  });
+};
+
 const judgeCooldownRemaining = (): number => {
   try {
     const until = Number(localStorage.getItem(judgeCooldownKey()) || 0);
@@ -2644,7 +2750,7 @@ const judgeCooldownRemaining = (): number => {
 
 const startJudgeCooldown = () => {
   try {
-    localStorage.setItem(judgeCooldownKey(), String(Date.now() + 30_000));
+    localStorage.setItem(judgeCooldownKey(), String(Date.now() + 60_000));
   } catch {
     // Server-side rate limiting remains authoritative.
   }
@@ -2654,6 +2760,8 @@ const vjudgeProblemUrl = (problem: Problem): string => {
   const source = problem.platform === "codeforces" ? "Codeforces" : problem.platform === "atcoder" ? "AtCoder" : "洛谷";
   return `https://vjudge.net/problem/${encodeURIComponent(source)}-${encodeURIComponent(problem.pid)}`;
 };
+
+const displayJudgeStatus = (status: DuelState["feed"][number]["status"]): string => status === "UKE" ? "WA" : status;
 
 const logout = () => {
   logoutVJudgeSession();
@@ -2830,9 +2938,11 @@ const ratingRowFor = (name: string): RatingRow => {
 };
 const nameColor = (name: string, rating = ratingRowFor(name).rating): string => {
   if (isAdminName(name)) return "rgb(157, 61, 207)";
-  if (rating < 1400) return "rgb(52, 152, 219)";
-  if (rating < 1600) return "rgb(82, 196, 26)";
-  if (rating < 1900) return "rgb(243, 156, 17)";
+  if (rating == 0) return "rgb(173,139,0)";
+  if(rating < 1270) return "rgb(191,191,191)"
+  if (rating < 1350) return "rgb(52, 152, 219)";
+  if (rating < 1570) return "rgb(82, 196, 26)";
+  if (rating < 1700) return "rgb(243, 156, 17)";
   return "rgb(254, 76, 97)";
 };
 const playerRooms = (name: string): RoomListing[] =>
