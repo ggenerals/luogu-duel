@@ -1,5 +1,7 @@
 # VJudge Duel
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ggenerals/vjudge-duel)
+
 VJudge Duel 是一个基于 Lockout 赛制的在线编程竞技平台，支持用户组建单人或多人的小队，在随机生成的题目集上进行实时对抗。平台目前整合了 CodeForces、AtCoder 和 Luogu 三大主流在线评测系统（OJ），选手通过率先解决题目获取对应分值，率先达到总分阈值（通常为总分的一半或略低）的队伍即获得胜利。
 
 本项目不仅是一个竞技平台，更是一次前沿的技术实验。我们在**无完整后端服务器**的架构下，实现了准实时的状态同步与远程判题功能，如此强劲，令人惊叹。

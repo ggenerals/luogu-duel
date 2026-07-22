@@ -214,6 +214,9 @@ export class DuelRoom extends DurableObject<Env> {
     // Finished matches are immutable archives. Reject before SQLite persistence
     // so delayed retries cannot produce writes or directory broadcasts.
     if (event.roomId !== "global" && this.cachedState.phase === "finished") return false;
+    if (event.roomId !== "global" && this.cachedState.problems.length === 0 && event.type !== "room.configured") {
+      throw new Error("房间尚未完成题目配置");
+    }
     if (event.type === "chat.sent" && event.visibility === "team") {
       const violation = privateChatViolation(event.text);
       if (violation) throw new Error(violation);

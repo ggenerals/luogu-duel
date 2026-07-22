@@ -7,7 +7,6 @@ import type { ComponentChildren, JSX } from "preact";
 import { render } from "preact";
 import {
   Ban,
-  Bot,
   Building2,
   Check,
   ChevronDown,
@@ -67,6 +66,7 @@ import { cachedProblemCount, defaultRatios, difficultyMeta, parseCustomProblems,
 import { loadVJudgeSession, logoutVJudgeSession, verifyVJudgeLogin, type VJudgeLoginMethod, type VJudgeSession } from "./oauth";
 import { allowServerRequest, directoryWebSocketUrl, fetchRooms, fetchSnapshot, fetchUserRecord, fetchUsers, publishEnvelope, roomWebSocketUrl, saveUserRecord, setServerRequestWarningHandler, updateUserRating, type RoomListing, type ServerMessage, type UserRecord } from "./realtimeStore";
 import { fetchVJudgeRecords } from "./vjudge";
+import { BootScreen, SkeletonRows } from "./loadingViews";
 import type { ChatMessage, DuelEvent, DuelState, Player, Problem, Seat, SignedEnvelope, VoteKind } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -636,13 +636,18 @@ const handleServerMessage = async (raw: string) => {
     statusTone = "error";
     statusText = message.message;
     if (message.message.includes("另一场未结束比赛")) joinDeniedRooms.add(roomId);
-    await replaceRoomSnapshot().catch(() => undefined);
-    await ensureJoined();
     if (message.message.includes("每天最多创建 1 场")) {
       localStorage.removeItem(eventCacheKey(roomId));
       location.hash = "";
+      notify();
       return;
     }
+    if (message.message.includes("房间尚未完成题目配置")) {
+      notify();
+      return;
+    }
+    await replaceRoomSnapshot().catch(() => undefined);
+    await ensureJoined();
   }
   notify();
 };
@@ -1096,6 +1101,7 @@ const submitCreateRoom = async (event?: Event) => {
       });
     }
     problems = sortProblemsByDifficulty(problems);
+    if (!problems.length) throw new Error("当前难度和题库没有可用题目，请调整难度或比例后重试");
     draft.pickerStatus = `已抽取 ${problems.length} 题`;
     Swal.close();
   } catch (error) {
@@ -1114,6 +1120,7 @@ const submitCreateRoom = async (event?: Event) => {
     hostName: identity.luoguName,
     minimumDifficulty: customProblems.length ? undefined : draft.difficultyLow
   });
+  await ensureJoined();
   } finally {
     creatingRoom = false;
     notify();
@@ -1276,12 +1283,16 @@ const openVote = async (kind: VoteKind, targetPid?: string, replacement?: Proble
       return;
     }
   }
+  if (kind === "replace-problem" && targetPid && Object.values(state.votes).some((vote) => vote.kind === kind && vote.targetPid === targetPid && vote.status === "open")) {
+    setStatus(`${targetPid} 已有换题投票`);
+    return;
+  }
   await emit({ ...baseEvent("vote.opened"), vote: buildVote(kind, player, targetPid, replacement) });
 };
 
 const replaceProblem = async (targetPid: string) => {
   const current = state.problems.find((problem) => problem.pid === targetPid);
-  if (!current || replacingProblems.has(targetPid) || state.phase !== "arena") return;
+  if (!current || replacingProblems.has(targetPid) || Object.values(state.votes).some((vote) => vote.kind === "replace-problem" && vote.targetPid === targetPid && vote.status === "open") || state.phase !== "arena") return;
   replacingProblems.add(targetPid);
   notify();
   try {
@@ -1405,11 +1416,14 @@ const Shell = ({ title, subtitle, children }: { title: string; subtitle: string;
         {bootPhase === "ready" ? (
           <>
             {isAdmin() ? <button class="ghost" onClick={() => { location.hash = mode === "admin" ? "" : "admin=1"; }}><Shield size={15} />{mode === "admin" ? "主页" : "管理"}</button> : null}
-            <button class="session-user" onClick={() => openProfile(identity?.luoguName ?? "")}>
+            <button class="session-user" onClick={() => { draft.userMenuOpen = !draft.userMenuOpen; notify(); }}>
               <UserAvatar name={identity?.luoguName ?? "?"} className="chat-avatar" />
               {identity?.luoguName ?? "..."}
             </button>
-            <button class="ghost icon-only" onClick={logout}><LogOut size={15} /></button>
+            {draft.userMenuOpen ? <div class="session-menu">
+              <button onClick={() => { draft.userMenuOpen = false; openProfile(identity?.luoguName ?? ""); }}>个人主页</button>
+              <button onClick={() => { draft.userMenuOpen = false; logout(); }}><LogOut size={14} />登出</button>
+            </div> : null}
           </>
         ) : null}
       </div>
@@ -1650,6 +1664,7 @@ const ScoreBar = () => {
 
 const RoomList = () => {
   const fresh = sortedRooms().filter((room) => !(room.status === "finished" && !room.winner && playerCount(room) <= 1)).slice(0, 20);
+  if (!directoryLiveSnapshotReceived && !fresh.length) return <SkeletonRows count={6} />;
   if (!fresh.length) return <p class="muted">暂无公开房间。</p>;
   return (
     <div class="duel-table">
@@ -1744,6 +1759,7 @@ type RatingRow = {
 
 const Ranking = () => {
   const rows = ratingRows();
+  if (!usersLoaded) return <SkeletonRows count={7} />;
   if (!rows.length) return <p class="muted">暂无注册用户。</p>;
   return (
     <div class="ranking-list">
@@ -2008,7 +2024,7 @@ const Problems = () => (
               {judgingProblems.has(`${problem.platform ?? "luogu"}:${problem.pid}`) ? <RefreshCw class="spin" size={13} /> : null}
               {judgingProblems.has(`${problem.platform ?? "luogu"}:${problem.pid}`) ? "同步中" : judgeCooldownRemaining() > 0 ? `${judgeCooldownRemaining()}s` : "判题"}
             </button>
-            <button disabled={replacingProblems.has(problem.pid)} onClick={() => void replaceProblem(problem.pid)}>{replacingProblems.has(problem.pid) ? <RefreshCw class="spin" size={13} /> : null}{replacingProblems.has(problem.pid) ? "查找中" : "换题"}</button>
+            <button disabled={replacingProblems.has(problem.pid) || Object.values(state.votes).some((vote) => vote.kind === "replace-problem" && vote.targetPid === problem.pid && vote.status === "open")} onClick={() => void replaceProblem(problem.pid)}>{replacingProblems.has(problem.pid) ? <RefreshCw class="spin" size={13} /> : null}{replacingProblems.has(problem.pid) ? "查找中" : "换题"}</button>
             <button onClick={() => void openVote("delete-problem", problem.pid)}>删题</button>
           </div>
         ) : null}
@@ -2248,7 +2264,7 @@ const Votes = () => {
             ? `${requiredVoters(state, vote).filter((id) => vote.approvals[id]).length}/${requiredVoters(state, vote).length}`
             : `${Object.keys(vote.approvals).length}/${participantCount()}`}</strong>
           {vote.kind === "surrender" ? (
-            currentSeat() === vote.team && !vote.approvals[identity.id] ? <button class="danger" onClick={() => void emit({ ...baseEvent("vote.cast"), voteId: vote.id, approve: true })}>确认投降</button> : null
+            currentSeat() === vote.team && !vote.approvals[identity.id] && !vote.rejections[identity.id] ? <><button class="danger" onClick={() => void emit({ ...baseEvent("vote.cast"), voteId: vote.id, approve: true })}>确认投降</button><button onClick={() => void emit({ ...baseEvent("vote.cast"), voteId: vote.id, approve: false })}>拒绝</button></> : null
           ) : canVote ? (
             <>
               <button onClick={() => void emit({ ...baseEvent("vote.cast"), voteId: vote.id, approve: true })}>同意</button>
@@ -2650,26 +2666,6 @@ const submitVJudgeLogin = async (event: Event) => {
   }
   notify();
 };
-
-const Loading = () => (
-  <main class="center-screen">
-    <Bot size={42} />
-    <h1>Connecting</h1>
-    <p>正在连接。</p>
-  </main>
-);
-
-const BootScreen = ({ leaving }: { leaving: boolean }) => (
-  <main class={`boot-screen${leaving ? " leaving" : ""}`}>
-    <div class="boot-loading">Loading...</div>
-  </main>
-);
-
-const ProfileLoading = () => (
-  <main class="profile-page">
-    <div class="profile-loading-overlay" aria-label="loading user profile" />
-  </main>
-);
 
 const DifficultyBadge = ({ level }: { level: number }) => {
   const meta = difficultyMeta.find((item) => item.value === level);

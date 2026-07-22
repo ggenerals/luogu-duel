@@ -12,7 +12,6 @@ import type {
   Vote,
   VoteKind
 } from "./types";
-import { pinyin } from 'pinyin-pro';
 
 const statusRank: Record<JudgeStatus, number> = {
   OK: 0,
@@ -70,11 +69,6 @@ export const privateChatViolation = (text: string): string | null => {
   const normalized = text.toLowerCase();
   if (/<\s*iframe\b|&lt;\s*iframe\b/i.test(text)) return "私信不能包含 iframe";
   if (normalized.includes("https://www.luogu.com.cn/api/verify/captcha")) return "私信不能包含该验证码地址";
-  const normalizedPinyin = pinyin(text, { toneType: 'none', type: 'array' })
-    .join('')
-    .toLowerCase();
-  if(normalized.includes("gunmu") || normalized.includes("mugun"))
-    return "你没有输入任何东西，有非法不可见字符。";
   if(normalized.includes("shabi") || normalized.includes("sb") || normalized.includes("tamade") || normalized.includes("tmd") || normalized.includes("fuck"))
     return "不合适用于";
 
@@ -491,6 +485,7 @@ const openVote = (
   actorId: string
 ) => {
   if (!isTeam(state.players[actorId]?.team) || isRestricted(state, actorId) || state.votes[voteInput.id]) return;
+  if (voteInput.kind === "replace-problem" && voteInput.targetPid && Object.values(state.votes).some((vote) => vote.kind === "replace-problem" && vote.targetPid === voteInput.targetPid && vote.status === "open")) return;
   const vote: Vote = {
     ...voteInput,
     approvals: { [actorId]: true },
@@ -506,7 +501,6 @@ const openVote = (
 const castVote = (state: DuelState, voteId: string, actorId: string, approve: boolean, at: number) => {
   const vote = state.votes[voteId];
   if (!vote || vote.status !== "open" || !requiredVoters(state, vote).includes(actorId)) return;
-  if (vote.kind === "surrender" && !approve) return;
   if (approve) {
     vote.approvals[actorId] = true;
     delete vote.rejections[actorId];
