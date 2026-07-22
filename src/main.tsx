@@ -66,7 +66,7 @@ import { cachedProblemCount, defaultRatios, difficultyMeta, parseCustomProblems,
 import { loadVJudgeSession, logoutVJudgeSession, verifyVJudgeLogin, type VJudgeLoginMethod, type VJudgeSession } from "./oauth";
 import { allowServerRequest, directoryWebSocketUrl, fetchRooms, fetchSnapshot, fetchUserRecord, fetchUsers, publishEnvelope, roomWebSocketUrl, saveUserRecord, setServerRequestWarningHandler, updateUserRating, type RoomListing, type ServerMessage, type UserRecord } from "./realtimeStore";
 import { fetchVJudgeRecords } from "./vjudge";
-import { BootScreen, SkeletonRows } from "./loadingViews";
+import { AdminPlayersSkeleton, AdminRoomsSkeleton, BootScreen, ChatSkeleton, RankingSkeleton, RoomListSkeleton, SkeletonRows } from "./loadingViews";
 import type { ChatMessage, DuelEvent, DuelState, Player, Problem, Seat, SignedEnvelope, VoteKind } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -93,6 +93,7 @@ let globalModeration: DuelState = createInitialState("global");
 let rooms: RoomListing[] = [];
 let users: UserRecord[] = [];
 let usersLoaded = false;
+let profileLoading = false;
 let profileUserName = initialProfileUserName;
 let bootScreenVisible = true;
 let bootScreenLeaving = false;
@@ -294,8 +295,10 @@ const boot = async () => {
 };
 
 const enterFromHash = async () => {
+  const params = new URLSearchParams(location.hash.slice(1));
   const profileName = profileNameFromPath();
-  if (profileName) {
+  const adminRequested = params.get("admin") === "1";
+  if (profileName && !(adminRequested && isAdmin())) {
     mode = "profile";
     roomId = "global";
     roomSecret = "public-lobby";
@@ -303,12 +306,14 @@ const enterFromHash = async () => {
     closeSocket();
     connectDirectory();
     await Promise.all([loadDirectory(), loadUsers()]);
+    profileLoading = true;
+    notify();
     await ensureUserLoaded(profileName);
+    profileLoading = false;
     notify();
     return;
   }
-  const params = new URLSearchParams(location.hash.slice(1));
-  const adminRequested = params.get("admin") === "1";
+  if (profileName && adminRequested) draft.adminSearch = profileName;
   roomId = params.get("room") || "global";
   roomSecret = params.get("secret") || (roomId === "global" ? "public-lobby" : "public-room");
   mode = adminRequested && isAdmin() ? "admin" : roomId === "global" ? "home" : "room";
@@ -329,6 +334,7 @@ const enterFromHash = async () => {
     globalModeration = state;
     rooms = [];
     users = [];
+    usersLoaded = false;
     connectDirectory();
     connectRoom();
     statusTone = "info";
@@ -383,11 +389,20 @@ const loadDirectory = async () => {
   }
 };
 
+const dedupeUserRecords = (records: UserRecord[]): UserRecord[] => {
+  const unique = new Map<string, UserRecord>();
+  for (const user of records) {
+    const key = normalizeName(user.name);
+    if (key && !unique.has(key)) unique.set(key, user);
+  }
+  return [...unique.values()];
+};
+
 const loadUsers = async () => {
   try {
     const remoteUsers = await fetchUsers();
-    if (!lastUsersLiveAt || Date.now() - lastUsersLiveAt >= 60_000) users = remoteUsers;
-    for (const user of remoteUsers) userCache[normalizeName(user.name)] = { user, cachedAt: Date.now() };
+    users = dedupeUserRecords(remoteUsers);
+    for (const user of users) userCache[normalizeName(user.name)] = { user, cachedAt: Date.now() };
     writeUserCache();
   } catch {
     users = Object.values(userCache)
@@ -604,7 +619,7 @@ const handleDirectoryMessage = async (raw: string) => {
     statusText = "大厅在线";
   }
   if (message.type === "users") {
-    users = message.users;
+    users = dedupeUserRecords(message.users);
     lastUsersLiveAt = Date.now();
     for (const user of users) userCache[normalizeName(user.name)] = { user, cachedAt: Date.now() };
     writeUserCache();
@@ -1415,7 +1430,7 @@ const Shell = ({ title, subtitle, children }: { title: string; subtitle: string;
         </div>
         {bootPhase === "ready" ? (
           <>
-            {isAdmin() ? <button class="ghost" onClick={() => { location.hash = mode === "admin" ? "" : "admin=1"; }}><Shield size={15} />{mode === "admin" ? "主页" : "管理"}</button> : null}
+            {isAdmin() ? <button class="ghost" onClick={() => { draft.adminSearch = mode === "profile" ? (profileUserName || "") : ""; location.hash = mode === "admin" ? "" : "admin=1"; }}><Shield size={15} />{mode === "admin" ? "主页" : "管理"}</button> : null}
             <button class="session-user" onClick={() => { draft.userMenuOpen = !draft.userMenuOpen; notify(); }}>
               <UserAvatar name={identity?.luoguName ?? "?"} className="chat-avatar" />
               {identity?.luoguName ?? "..."}
@@ -1453,10 +1468,6 @@ const Home = () => (
         </div>
         <BanAnnouncement />
       </div>
-      <button class={`primary open-room-builder ${creatingRoom ? "is-loading" : ""}`} disabled={creatingRoom} onClick={() => void openCreateRoomDialog()}>
-        {creatingRoom ? <RefreshCw class="spin" size={18} /> : <Play size={18} />}
-        {creatingRoom ? "正在生成房间…" : "生成房间"}
-      </button>
     </section>
 
     <section class="panel home-room-panel">
@@ -1465,9 +1476,15 @@ const Home = () => (
         <div>
           <h2>公开房间</h2>
         </div>
-        <button class="ghost icon-only" onClick={() => void loadDirectory()}>
-          <RefreshCw size={16} />
-        </button>
+        <div class="home-room-actions">
+          <button class="ghost icon-only" title="刷新房间" onClick={() => void loadDirectory()}>
+            <RefreshCw size={16} />
+          </button>
+          <button class={`primary open-room-builder ${creatingRoom ? "is-loading" : ""}`} disabled={creatingRoom} onClick={() => void openCreateRoomDialog()}>
+            {creatingRoom ? <RefreshCw class="spin" size={16} /> : <Play size={16} />}
+            {creatingRoom ? "生成中…" : "生成房间"}
+          </button>
+        </div>
       </div>
       <div class="home-tabs">
         <button class={draft.roomTab === "duel" ? "active" : ""} onClick={() => {
@@ -1488,8 +1505,9 @@ const Home = () => (
   </main>
 );
 
-const Room = () => (
-  <main class="room-grid">
+const Room = () => {
+  if (!lastRoomLiveStateAt && !state.problems.length) return <main class="room-grid room-loading"><div class="room-loading-head"><i /><div><b /><span /></div><strong /></div><SkeletonRows count={8} /></main>;
+  return <main class="room-grid">
     <section class="arena-head">
       <div class="match-meta">
         <p class="eyebrow">{state.phase === "arena" ? "LIVE MATCH" : state.phase === "finished" ? "MATCH ARCHIVE" : "READY ROOM"}</p>
@@ -1530,8 +1548,8 @@ const Room = () => (
       <PanelTitle icon={<Terminal size={16} />} title="PROBLEMS" detail="easy -> hard" />
       <Problems />
     </section>
-  </main>
-);
+  </main>;
+};
 
 const ArchiveStatus = () => {
   if (state.phase !== "finished") return null;
@@ -1664,7 +1682,7 @@ const ScoreBar = () => {
 
 const RoomList = () => {
   const fresh = sortedRooms().filter((room) => !(room.status === "finished" && !room.winner && playerCount(room) <= 1)).slice(0, 20);
-  if (!directoryLiveSnapshotReceived && !fresh.length) return <SkeletonRows count={6} />;
+  if (!directoryLiveSnapshotReceived && !fresh.length) return <RoomListSkeleton />;
   if (!fresh.length) return <p class="muted">暂无公开房间。</p>;
   return (
     <div class="duel-table">
@@ -1759,7 +1777,7 @@ type RatingRow = {
 
 const Ranking = () => {
   const rows = ratingRows();
-  if (!usersLoaded) return <SkeletonRows count={7} />;
+  if (!usersLoaded) return <RankingSkeleton />;
   if (!rows.length) return <p class="muted">暂无注册用户。</p>;
   return (
     <div class="ranking-list">
@@ -1795,11 +1813,6 @@ const ratingRows = (): RatingRow[] => {
   };
   for (const user of users) ensure(user.name);
   if (identity?.luoguName) ensure(identity.luoguName);
-  for (const room of sortedRooms()) {
-    for (const name of [room.host, ...(room.redPlayers ?? []), ...(room.bluePlayers ?? [])]) {
-      if (name && normalizeName(name) !== "unknown" && name !== "待同步") ensure(name);
-    }
-  }
   return [...map.values()].sort((a, b) => b.rating - a.rating || b.wins - a.wins || a.name.localeCompare(b.name));
 };
 
@@ -1826,7 +1839,7 @@ const AdminPage = () => {
           </div>
         </div>
         <div class="admin-player-list">
-          {visibleRows.map((row) => {
+          {!usersLoaded ? <AdminPlayersSkeleton /> : visibleRows.map((row) => {
             const key = normalizeName(row.name);
             const banned = Boolean(globalModeration.banned[key]);
             const muted = Boolean(globalModeration.muted[`name:${key}`]);
@@ -1845,14 +1858,14 @@ const AdminPage = () => {
               </article>
             );
           })}
-          {!visibleRows.length ? <p class="muted admin-empty">没有匹配的玩家。</p> : null}
+          {usersLoaded && !visibleRows.length ? <p class="muted admin-empty">没有匹配的玩家。</p> : null}
         </div>
       </section>
 
       <section class="panel admin-section">
         <div class="admin-section-head"><div><h2>房间管理</h2></div></div>
         <div class="admin-room-list">
-          {managedRooms.length ? managedRooms.map((room) => {
+          {!directoryLiveSnapshotReceived ? <AdminRoomsSkeleton /> : managedRooms.length ? managedRooms.map((room) => {
             const busy = adminBusy.has(`room:${room.roomId}`);
             return (
               <article class="admin-room" key={room.roomId}>
@@ -2010,9 +2023,14 @@ const Problems = () => (
           {state.phase === "lobby" ? (
             <span class="problem-mask">P{String(index + 1).padStart(4, "0")}</span>
           ) : (
-            <a href={vjudgeProblemUrl(problem)} target="_blank" rel="noreferrer" title={problem.title}>
-              <small>{platformLabel(problem.platform ?? "luogu")}</small>{problem.pid}
-            </a>
+            <div class="problem-heading">
+              <a href={vjudgeProblemUrl(problem)} target="_blank" rel="noreferrer" title={problem.title}>
+                <small>{platformLabel(problem.platform ?? "luogu")}</small>{problem.pid}
+              </a>
+              <span class="problem-source-links">
+                {problemLinks(problem).map((link) => <a href={link.href} target="_blank" rel="noreferrer" key={link.label}>{link.label}</a>)}
+              </span>
+            </div>
           )}
           <span>{problem.score} pts</span>
         </div>
@@ -2042,7 +2060,7 @@ const Chat = () => {
     <div class="chat">
       <PanelTitle icon={<MessageSquare size={16} />} title="CHAT" detail={mode === "room" ? "/ prefix = team" : "global"} />
       <div class="chat-log">
-        {items.map((item) => <ChatLine item={item} key={item.id} />)}
+        {!lastRoomLiveStateAt && !items.length ? <ChatSkeleton /> : items.map((item) => <ChatLine item={item} key={item.id} />)}
       </div>
       <form class="chat-form" onSubmit={(event) => void submitChat(event)}>
         <div class="chat-vditor" ref={chatVditorRef} />
@@ -2129,6 +2147,7 @@ const ToastStack = () => {
 };
 
 const ProfilePage = () => {
+  if (profileLoading) return <main class="profile-page"><div class="profile-skeleton"><div class="profile-skeleton-hero"><i /><div><b /><span /></div><strong /></div><SkeletonRows count={6} /></div></main>;
   const name = profileUserName || identity.luoguName;
   const user = userRecordFor(name);
   const row = ratingRowFor(name);
@@ -2755,6 +2774,26 @@ const startJudgeCooldown = () => {
 const vjudgeProblemUrl = (problem: Problem): string => {
   const source = problem.platform === "codeforces" ? "Codeforces" : problem.platform === "atcoder" ? "AtCoder" : "洛谷";
   return `https://vjudge.net/problem/${encodeURIComponent(source)}-${encodeURIComponent(problem.pid)}`;
+};
+
+const problemLinks = (problem: Problem): Array<{ label: string; href: string }> => {
+  const pid = problem.pid.trim();
+  const platform = problem.platform ?? (pid.startsWith("CF") ? "codeforces" : pid.startsWith("AT_") ? "atcoder" : "luogu");
+  const links: Array<{ label: string; href: string }> = [{ label: "VJudge", href: vjudgeProblemUrl(problem) }];
+  if (platform === "codeforces") {
+    const match = pid.match(/^(\d+)([A-Z]\d*)$/i);
+    links.push({ label: "洛谷", href: `https://www.luogu.com.cn/problem/CF${encodeURIComponent(pid)}` });
+    links.push({ label: "原站", href: match ? `https://codeforces.com/problemset/problem/${match[1]}/${match[2]}` : "https://codeforces.com/problemset" });
+  } else if (platform === "atcoder") {
+    const task = pid;
+    const contest = task.split('_')[0].toLowerCase();
+    links.push({ label: "洛谷", href: `https://www.luogu.com.cn/problem/AT_${encodeURIComponent(pid)}` });
+    links.push({ label: "原站", href: contest ? `https://atcoder.jp/contests/${contest}/tasks/${task}` : "https://atcoder.jp/" });
+  } else {
+    links.push({ label: "洛谷", href: `https://www.luogu.com.cn/problem/${encodeURIComponent(pid)}` });
+    links.push({ label: "原站", href: `https://www.luogu.com.cn/problem/${encodeURIComponent(pid)}` });
+  }
+  return links;
 };
 
 const displayJudgeStatus = (status: DuelState["feed"][number]["status"]): string => status === "UKE" ? "WA" : status;

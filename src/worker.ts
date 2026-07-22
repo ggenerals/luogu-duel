@@ -2,7 +2,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { applyEvent, applyEvents, canStart, createInitialState, privateChatViolation } from "./domain";
-import type { DuelEvent, Problem, SignedEnvelope } from "./types";
+import type { DuelEvent, FeedRecord, Problem, SignedEnvelope } from "./types";
 
 type Env = {
   DUEL_ROOM: DurableObjectNamespace<DuelRoom>;
@@ -142,6 +142,9 @@ export class DuelRoom extends DurableObject<Env> {
       await this.expireStaleLobby();
       return Response.json({ envelopes: this.listEvents() });
     }
+    if (url.pathname.endsWith("/manual-claim") && request.method === "POST") {
+      return this.handleManualClaim(request);
+    }
     if (url.pathname.endsWith("/event") && request.method === "POST") {
       const body = (await request.json()) as { envelope?: SignedEnvelope };
       if (!body.envelope) return jsonError("missing envelope", 400);
@@ -154,6 +157,47 @@ export class DuelRoom extends DurableObject<Env> {
       }
     }
     return jsonError("not found", 404);
+  }
+
+  private async handleManualClaim(request: Request): Promise<Response> {
+    this.hydrateEvents();
+    if (this.cachedState.phase !== "arena" || !this.cachedState.startedAt) return jsonError("房间不在比赛中", 409);
+    const body = await request.json().catch(() => null) as { userName?: string; pid?: string } | null;
+    const userName = body?.userName?.trim() ?? "";
+    const pid = body?.pid?.trim() ?? "";
+    if (!userName || !pid) return jsonError("missing userName or pid", 400);
+    const player = Object.values(this.cachedState.players).find((item) => normalizeName(item.luoguName) === normalizeName(userName) && isPlayingSeat(item.team));
+    if (!player) return jsonError("指定用户不是本场参赛者", 404);
+    const problem = this.cachedState.problems.find((item) => item.pid.toLowerCase() === pid.toLowerCase());
+    if (!problem) return jsonError("题目不在本场比赛中", 404);
+    if (problem.solvedBy) {
+      if (normalizeName(problem.solvedBy.luoguName) === normalizeName(player.luoguName)) {
+        return Response.json({ ok: true, alreadyClaimed: true, roomId: this.cachedState.roomId, pid: problem.pid, userName: player.luoguName, recordId: problem.solvedBy.recordId });
+      }
+      return jsonError("题目已被其他人抢占", 409);
+    }
+    const now = Date.now();
+    const recordId = `manual:${crypto.randomUUID()}`;
+    const envelope = await systemJudgeEnvelope(this.cachedState.roomId, this.cachedState.lamport + 1, now, {
+      id: recordId,
+      recordId,
+      luoguName: player.luoguName,
+      pid: problem.pid,
+      at: now,
+      status: "OK"
+    });
+    const latestProblem = this.cachedState.problems.find((item) => item.pid.toLowerCase() === problem.pid.toLowerCase());
+    if (!latestProblem || this.cachedState.phase !== "arena") return jsonError("比赛已经结束", 409);
+    if (latestProblem.solvedBy) {
+      if (normalizeName(latestProblem.solvedBy.luoguName) === normalizeName(player.luoguName)) {
+        return Response.json({ ok: true, alreadyClaimed: true, roomId: this.cachedState.roomId, pid: latestProblem.pid, userName: player.luoguName, recordId: latestProblem.solvedBy.recordId });
+      }
+      return jsonError("题目已被其他人抢占", 409);
+    }
+    const saved = await this.acceptEnvelope(envelope);
+    if (!saved) return jsonError("manual claim rejected", 409);
+    this.broadcast({ type: "event", envelope });
+    return Response.json({ ok: true, roomId: this.cachedState.roomId, pid: problem.pid, userName: player.luoguName, recordId });
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -864,6 +908,8 @@ export class DuelRoom extends DurableObject<Env> {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const manualClaimPath = /^\/api\/rooms\/[^/]+\/manual-claim$/.test(url.pathname);
+    if (manualClaimPath && request.method === "OPTIONS") return manualClaimCors(new Response(null, { status: 204 }));
     if (url.pathname.startsWith("/api/")) {
       const blocked = await protectApiRequest(request, url, env);
       if (blocked) return blocked;
@@ -895,13 +941,14 @@ export default {
       return env.DUEL_ROOM.getByName("__directory").fetch(new Request(`https://duel.internal/users/${userMatch[1]}`, request));
     }
 
-    const roomMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/(ws|snapshot|event)$/);
+    const roomMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/(ws|snapshot|event|manual-claim)$/);
     if (roomMatch) {
       const roomId = decodeURIComponent(roomMatch[1]);
       const action = roomMatch[2];
       const secret = url.searchParams.get("secret") || "public-room";
       const stub = env.DUEL_ROOM.getByName(`${roomId}:${secret}`);
-      return stub.fetch(new Request(`https://duel.internal/${action}?secret=${encodeURIComponent(secret)}`, request));
+      const response = await stub.fetch(new Request(`https://duel.internal/${action}?secret=${encodeURIComponent(secret)}`, request));
+      return action === "manual-claim" ? manualClaimCors(response) : response;
     }
 
     const assetResponse = await env.ASSETS.fetch(request);
@@ -915,6 +962,15 @@ export default {
     }
     return new Response(assetResponse.body, { status: assetResponse.status, statusText: assetResponse.statusText, headers });
   }
+};
+
+const manualClaimCors = (response: Response): Response => {
+  const headers = new Headers(response.headers);
+  headers.set("access-control-allow-origin", "*");
+  headers.set("access-control-allow-methods", "POST, OPTIONS");
+  headers.set("access-control-allow-headers", "content-type");
+  headers.set("cache-control", "no-store");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 };
 
 type ProblemBankSource = "luogu" | "codeforces" | "atcoder";
@@ -1220,6 +1276,23 @@ const systemStartEnvelope = async (roomId: string, lamport: number, issuedAt: nu
     id: crypto.randomUUID(),
     lamport,
     issuedAt
+  };
+  const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, textBytes(stableStringify(event)));
+  return { publicKey, event, signature: btoa(String.fromCharCode(...new Uint8Array(signature))) };
+};
+
+const systemJudgeEnvelope = async (roomId: string, lamport: number, issuedAt: number, record: FeedRecord): Promise<SignedEnvelope> => {
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const publicKey = await crypto.subtle.exportKey("jwk", pair.publicKey);
+  const actorId = await keyId(publicKey);
+  const event: DuelEvent = {
+    type: "judge.recordSeen",
+    roomId,
+    actorId,
+    id: crypto.randomUUID(),
+    lamport,
+    issuedAt,
+    record
   };
   const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, textBytes(stableStringify(event)));
   return { publicKey, event, signature: btoa(String.fromCharCode(...new Uint8Array(signature))) };
