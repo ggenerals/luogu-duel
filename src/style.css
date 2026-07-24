@@ -81,6 +81,13 @@ body {
     var(--bg);
 }
 
+/* Desktop duel views own their internal scrolling; do not expose a stray page scrollbar. */
+html.fixed-viewport,
+body.fixed-viewport {
+  height: 100%;
+  overflow: hidden;
+}
+
 body,
 .panel,
 .command-panel,
@@ -568,17 +575,20 @@ code {
   padding: 18px;
   min-height: calc(100vh - 52px);
   height: calc(100vh - 52px);
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .room-grid {
-  grid-template-columns: minmax(320px, 1fr) minmax(300px, 0.85fr) minmax(360px, 1fr);
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr) minmax(0, 3fr);
+  grid-template-rows: auto minmax(0, 1fr);
   grid-template-areas:
     "head head head"
-    "roster roster roster"
     "comms submissions problems";
   height: calc(100vh - 52px);
   min-height: 620px;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .panel,
@@ -617,7 +627,7 @@ code {
 .panel,
 .command-panel {
   padding: 12px;
-  overflow: auto;
+  overflow: hidden;
 }
 
 .arena-head {
@@ -627,28 +637,6 @@ code {
   gap: 18px;
   align-items: center;
   padding: 12px 14px;
-}
-
-.roster-panel {
-  grid-area: roster;
-  padding: 8px 12px;
-  position: relative;
-  z-index: 20;
-  overflow: visible;
-}
-
-.roster-panel > .teams {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  right: 0;
-  max-height: min(60vh, 520px);
-  overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
-  box-shadow: 0 18px 48px rgb(0 0 0 / 0.3);
-  padding: 10px;
 }
 
 .comms-panel {
@@ -667,6 +655,64 @@ code {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
 }
+
+.match-island {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  z-index: 35;
+  width: min(360px, calc(100% - 28px));
+  margin: 0;
+  overflow: visible;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
+  box-shadow: 0 14px 38px rgb(0 0 0 / .24);
+  transform: translateX(-50%);
+  transition: width 180ms ease, border-radius 180ms ease, box-shadow 180ms ease;
+}
+
+.match-island-summary {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 11px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.match-island-summary time { color: var(--text); font: 900 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.island-duel { display: inline-flex; min-width: 0; align-items: center; gap: 6px; }
+.island-duel b { font: 900 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.island-red-score { color: var(--red); }
+.island-blue-score { color: var(--blue); }
+.island-duel em { color: var(--muted); font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-style: normal; white-space: nowrap; }
+.island-duel-track { position: relative; width: 78px; height: 8px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--red) 22%, var(--blue) 22%); box-shadow: inset 0 0 8px rgb(0 0 0 / .24); }
+.island-duel-track i { position: absolute; top: 0; bottom: 0; }
+.island-red-fill { left: 0; background: var(--red); }
+.island-blue-fill { right: 0; background: var(--blue); }
+.island-hover-detail { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; max-height: 0; padding: 0 12px; overflow: hidden; opacity: 0; transition: max-height 180ms ease, padding 180ms ease, opacity 180ms ease; }
+.island-hover-detail .archive-status { margin: 0; white-space: nowrap; }
+.island-hover-detail > strong { min-width: 0; overflow: hidden; color: var(--text); font-size: 12px; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+.island-hover-detail > span { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.match-island:hover { width: min(680px, calc(100% - 28px)); border-radius: 10px; box-shadow: 0 20px 48px rgb(0 0 0 / .3); }
+.match-island:hover .island-hover-detail { max-height: 38px; padding: 0 12px 9px; opacity: 1; }
+.island-roster { display: none; border-top: 1px solid var(--line-soft); padding: 10px; background: var(--panel); }
+.match-island:hover .island-roster { display: block; }
+.match-island:hover .island-roster .teams { max-height: min(58vh, 470px); overflow: auto; }
+.match-result-swal .swal2-image { object-fit: contain; }
+
+@media (hover: none) {
+  .match-island { width: min(680px, calc(100% - 28px)); border-radius: 10px; }
+  .match-island .island-hover-detail { max-height: 38px; padding: 0 12px 9px; opacity: 1; }
+  .match-island .island-roster { display: block; }
+  .match-island .island-roster .teams { max-height: min(58vh, 470px); overflow: auto; }
+}
+
+.room-grid { position: relative; }
 
 .home-room-panel > .section-head { min-height: 36px; }
 .home-room-panel > .section-head > div:nth-child(2) { min-width: 0; }
@@ -2275,7 +2321,6 @@ body .duel-swal-cancel {
   .room-grid {
     grid-template-areas:
       "head"
-      "roster"
       "comms"
       "submissions"
       "problems";
@@ -2419,8 +2464,6 @@ body .duel-swal-cancel {
   .arena-head { gap: 12px; padding: 12px; }
   .arena-head h1 { overflow-wrap: anywhere; font-size: 20px; line-height: 1.25; }
   .match-meta > p:last-child { overflow-wrap: anywhere; font-size: 12px; }
-  .roster-panel > .teams { left: -1px; right: -1px; max-height: 68vh; padding: 8px; }
-
   .submissions-panel { overflow-x: auto; }
   .feed-table { min-width: 480px; }
   .problem-card > div:first-child { align-items: flex-start; }

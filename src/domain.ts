@@ -179,6 +179,18 @@ export const applyEvent = (state: DuelState, event: DuelEvent): DuelState => {
     case "player.unmuted":
       unmutePlayer(next, event.actorId, event.targetId, event.targetName, event.issuedAt);
       break;
+    case "room.muted":
+      if (isRoomModerator(next, event.actorId) && !next.muted["__room__"]) {
+        next.muted["__room__"] = true;
+        pushSystem(next, "房间已开启全员禁言", event.issuedAt);
+      }
+      break;
+    case "room.unmuted":
+      if (isRoomModerator(next, event.actorId) && next.muted["__room__"]) {
+        delete next.muted["__room__"];
+        pushSystem(next, "房间已解除全员禁言", event.issuedAt);
+      }
+      break;
   }
 
   updateWinner(next, event.issuedAt);
@@ -221,6 +233,11 @@ export const canAcceptStart = (state: DuelState): boolean => {
 
 export const canCloseRoom = (state: DuelState, actorId: string, actorName: string): boolean =>
   isAdminName(actorName) || (state.phase === "lobby" && state.hostId === actorId);
+
+const isRoomModerator = (state: DuelState, actorId: string): boolean => {
+  const player = state.players[actorId];
+  return Boolean(player && (state.hostId === actorId || isAdminName(player.luoguName)));
+};
 
 export const visibleChats = (state: DuelState, viewerId: string): ChatMessage[] => {
   const viewer = state.players[viewerId];
@@ -389,7 +406,7 @@ const decodeSystemChatCommand = (text: string): SystemChatCommand | null => {
 
 const pushChat = (state: DuelState, event: Extract<DuelEvent, { type: "chat.sent" }>) => {
   const player = state.players[event.actorId];
-  if (!player || isMutedPlayer(state, player) || isRestricted(state, event.actorId) || event.text.trim().length === 0) return;
+  if (!player || (state.muted["__room__"] && !isRoomModerator(state, event.actorId)) || isMutedPlayer(state, player) || isRestricted(state, event.actorId) || event.text.trim().length === 0) return;
   state.chats.push({
     id: event.id,
     actorId: event.actorId,

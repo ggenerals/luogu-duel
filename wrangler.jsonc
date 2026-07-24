@@ -3,6 +3,9 @@
   "name": "vjudge-duel",
   "main": "src/worker.ts",
   "compatibility_date": "2026-07-09",
+  "vars": {
+    "MAINTENANCE": "0"
+  },
   "routes": [
     {
       "pattern": "duel.gengen.qzz.io",

@@ -86,6 +86,24 @@ export const fetchUsers = async (): Promise<UserRecord[]> => {
   return Array.isArray(data.users) ? data.users : [];
 };
 
+export const fetchLowRoomAvailability = async (name: string): Promise<boolean> => {
+  requireServerRequest();
+  const url = new URL("/api/room-limit/low", location.origin);
+  url.searchParams.set("name", name);
+  const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(requestTimeoutMs) });
+  if (!response.ok) throw new Error(`room limit request failed: ${response.status}`);
+  const data = await response.json() as { allowed?: boolean };
+  return data.allowed === true;
+};
+
+export const clearRoomDraft = async (roomId: string, secret: string): Promise<void> => {
+  const response = await fetch(roomApiUrl(roomId, secret, "clear"), {
+    method: "POST",
+    signal: AbortSignal.timeout(requestTimeoutMs)
+  });
+  if (!response.ok) throw new Error(`room cleanup failed: ${response.status}`);
+};
+
 export const fetchUserRecord = async (name: string): Promise<UserRecord | null> => {
   requireServerRequest();
   const response = await fetch(`/api/users/${encodeURIComponent(name)}`, {

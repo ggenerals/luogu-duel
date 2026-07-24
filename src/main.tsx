@@ -64,7 +64,7 @@ import {
 import { createIdentity, loadIdentity, renameIdentity, signEvent, verifyEnvelope, type LocalIdentity } from "./identity";
 import { cachedProblemCount, defaultRatios, difficultyMeta, parseCustomProblems, pickProblems, pickReplacementProblem, platformLabel, type DifficultyLevel, type PlatformRatios, type ProblemPlatform } from "./problemPicker";
 import { loadVJudgeSession, logoutVJudgeSession, verifyVJudgeLogin, type VJudgeLoginMethod, type VJudgeSession } from "./oauth";
-import { allowServerRequest, directoryWebSocketUrl, fetchRooms, fetchSnapshot, fetchUserRecord, fetchUsers, publishEnvelope, roomWebSocketUrl, saveUserRecord, setServerRequestWarningHandler, updateUserRating, type RoomListing, type ServerMessage, type UserRecord } from "./realtimeStore";
+import { allowServerRequest, clearRoomDraft, directoryWebSocketUrl, fetchLowRoomAvailability, fetchRooms, fetchSnapshot, fetchUserRecord, fetchUsers, publishEnvelope, roomWebSocketUrl, saveUserRecord, setServerRequestWarningHandler, updateUserRating, type RoomListing, type ServerMessage, type UserRecord } from "./realtimeStore";
 import { fetchVJudgeRecords } from "./vjudge";
 import { AdminPlayersSkeleton, AdminRoomsSkeleton, BootScreen, ChatSkeleton, RankingSkeleton, RoomListSkeleton, SkeletonRows } from "./loadingViews";
 import type { ChatMessage, DuelEvent, DuelState, Player, Problem, Seat, SignedEnvelope, VoteKind } from "./types";
@@ -129,6 +129,9 @@ let vjudgeUsername = "";
 let vjudgeLoginMethod: VJudgeLoginMethod = "recent";
 let schoolVerificationCode = "";
 let creatingRoom = false;
+let joiningRoom = false;
+let recoveringRoomSetup = false;
+let pendingRoomSetup: { roomId: string; secret: string; count: number; customProblems: Problem[]; rated: boolean; difficultyLow: DifficultyLevel; difficultyHigh: DifficultyLevel; ratios: PlatformRatios } | null = null;
 let loginSubmitting = false;
 const adminBusy = new Set<string>();
 const judgingProblems = new Set<string>();
@@ -180,7 +183,6 @@ const draft = {
   adminSearch: "",
   adminReason: "",
   adminRatings: {} as Record<string, string>,
-  teamsOpen: false,
   spectatorsOpen: false
 };
 
@@ -210,10 +212,20 @@ let temporaryMuteUntil = readStoredNumber(temporaryMuteKey);
 recordBurst("refresh", 4_000, 3, () => applyTemporaryBan(20_000, "4 秒内刷新次数过多"));
 
 const notify = (forceStickChat = false) => {
+  syncViewportScroll();
   const stickChat = forceStickChat || shouldStickChats();
   render(<App />, app);
   if (stickChat) queueMicrotask(scrollChatsToBottom);
 };
+
+function syncViewportScroll(): void {
+  const fixedViewport = window.innerWidth > 1180 && (mode === "home" || mode === "room");
+  document.documentElement.classList.toggle("fixed-viewport", fixedViewport);
+  document.body.classList.toggle("fixed-viewport", fixedViewport);
+}
+
+window.addEventListener("resize", syncViewportScroll, { passive: true });
+
 const applyTheme = () => {
   const effective = themeMode === "system" ? (themeQuery.matches ? "dark" : "light") : themeMode;
   document.documentElement.dataset.theme = effective;
@@ -652,12 +664,18 @@ const handleServerMessage = async (raw: string) => {
     statusText = message.message;
     if (message.message.includes("另一场未结束比赛")) joinDeniedRooms.add(roomId);
     if (message.message.includes("每天最多创建 1 场")) {
+      await clearRoomDraft(roomId, roomSecret).catch(() => undefined);
       localStorage.removeItem(eventCacheKey(roomId));
-      location.hash = "";
+      localStorage.removeItem(activeRoomKey);
+      pendingRoomSetup = null;
+      location.href = "/";
       notify();
       return;
     }
     if (message.message.includes("房间尚未完成题目配置")) {
+      statusTone = "info";
+      statusText = "正在重新配置房间题目";
+      void recoverPendingRoomSetup();
       notify();
       return;
     }
@@ -766,6 +784,7 @@ const pushToastsForEvent = (event: DuelEvent, previousPhase: DuelState["phase"],
   if (previousPhase !== "finished" && state.phase === "finished") {
     const text = state.closed?.reason ?? (state.winner === "draw" ? "双方平局" : `${teamName(state.winner)} 获胜`);
     notifyImportant(`end:${roomId}:${state.closed?.at ?? event.issuedAt}:${text}`, "比赛结束", text, "warning");
+    void showMatchResult();
   }
   if (event.type === "chat.sent" && event.visibility === "team" && state.phase === "arena") {
     const chat = state.chats.find((item) => item.id === event.id);
@@ -859,8 +878,24 @@ const insertMention = (name: string) => {
   chatVditorTarget?.querySelector<HTMLElement>("[contenteditable='true']")?.focus();
 };
 
-const emitDirect = async (event: Extract<DuelEvent, { type: "room.closed" | "player.kicked" | "player.unkicked" | "player.muted" | "player.unmuted" }>) => {
+const emitDirect = async (event: Extract<DuelEvent, { type: "room.closed" | "room.muted" | "room.unmuted" | "player.kicked" | "player.unkicked" | "player.muted" | "player.unmuted" }>) => {
   await emit(event);
+};
+
+const showMatchResult = async (): Promise<void> => {
+  const player = state.players[identity.id];
+  if (!player || !isTeam(player.team) || !state.winner || state.winner === "draw" || state.closed) return;
+  const won = player.team === state.winner;
+  await Swal.fire({
+    title: won ? "胜利" : "失败",
+    text: won ? "本场对决获胜" : "本场对决失利",
+    imageUrl: won ? "/match-win.png" : "/match-loss.png",
+    imageAlt: won ? "胜利动画" : "失败动画",
+    imageWidth: 148,
+    imageHeight: 148,
+    confirmButtonText: "知道了",
+    customClass: { popup: `duel-swal match-result-swal ${won ? "won" : "lost"}`, confirmButton: "duel-swal-confirm" }
+  });
 };
 
 const refreshGlobalModeration = async () => {
@@ -1080,8 +1115,6 @@ const submitCreateRoom = async (event?: Event) => {
   creatingRoom = true;
   notify();
   try {
-  if (!(await leaveOrCloseCurrentMatchForNewRoom())) return;
-
   const nextRoom = compactId();
   const nextSecret = compactId() + compactId();
   const customProblems = parseCustomProblems(draft.customProblems);
@@ -1094,6 +1127,18 @@ const submitCreateRoom = async (event?: Event) => {
     draft.roomCount = customProblems.length;
     draft.unrated = true;
   }
+  if (!customProblems.length && draft.difficultyLow <= 2) {
+    try {
+      if (!(await fetchLowRoomAvailability(identity.luoguName))) {
+        setStatus("今天已经创建过包含橙题或更低难度题目的房间", "error");
+        await Swal.fire({ icon: "warning", title: "今日低难度房间已达上限", text: "每位用户每天只能创建 1 场包含橙题或更低难度题目的房间。", confirmButtonText: "知道了", customClass: { popup: "duel-swal" } });
+        return;
+      }
+    } catch {
+      // 预检查不可用时继续，由服务器创建事务执行最终校验。
+    }
+  }
+  if (!(await leaveOrCloseCurrentMatchForNewRoom())) return;
   let problems: Problem[];
   try {
     if (customProblems.length) {
@@ -1126,15 +1171,44 @@ const submitCreateRoom = async (event?: Event) => {
     return;
   }
 
-  history.pushState(null, "", `#room=${nextRoom}&secret=${nextSecret}`);
-  await enterFromHash();
-  await emit({
-    ...baseEvent("room.configured"),
+  pendingRoomSetup = {
+    roomId: nextRoom,
+    secret: nextSecret,
+    count,
+    customProblems,
+    rated: customProblems.length ? false : !draft.unrated,
+    difficultyLow: draft.difficultyLow,
+    difficultyHigh: draft.difficultyHigh,
+    ratios: { ...draft.ratios }
+  };
+  const configuredEvent: DuelEvent = {
+    type: "room.configured",
+    roomId: nextRoom,
+    actorId: identity.id,
+    id: crypto.randomUUID(),
+    lamport: 1,
+    issuedAt: Date.now(),
     problems,
     rated: customProblems.length ? false : !draft.unrated,
     hostName: identity.luoguName,
     minimumDifficulty: customProblems.length ? undefined : draft.difficultyLow
-  });
+  };
+  try {
+    await publishEnvelope(nextRoom, nextSecret, await signEvent(identity, configuredEvent));
+  } catch (error) {
+    await clearRoomDraft(nextRoom, nextSecret).catch(() => undefined);
+    pendingRoomSetup = null;
+    const message = friendlyError(error, "房间配置失败");
+    if (message.includes("每天最多创建") || message.includes("daily low difficulty")) {
+      setStatus("今天已经创建过包含橙题或更低难度题目的房间，房间已删除", "error");
+      await Swal.fire({ icon: "warning", title: "房间未创建", text: "今日低难度房间次数已用完，临时房间已清理。", confirmButtonText: "知道了", customClass: { popup: "duel-swal" } });
+    } else {
+      setStatus(message, "error");
+    }
+    return;
+  }
+  history.pushState(null, "", `#room=${nextRoom}&secret=${nextSecret}`);
+  await enterFromHash();
   await ensureJoined();
   } finally {
     creatingRoom = false;
@@ -1148,6 +1222,48 @@ const problemBankProgressHtml = (): string => (["luogu", "codeforces", "atcoder"
     return `<div class="swal-bank-progress"><div><strong>${platformLabel(platform)}</strong><span>${progress.status}</span><b>${progress.percent}%</b></div><progress max="100" value="${progress.percent}"></progress></div>`;
   })
   .join("");
+
+const recoverPendingRoomSetup = async () => {
+  const setup = pendingRoomSetup;
+  if (!setup || setup.roomId !== roomId || recoveringRoomSetup) return;
+  recoveringRoomSetup = true;
+  try {
+    const problems = setup.customProblems.length
+      ? sortProblemsByDifficulty(setup.customProblems)
+      : sortProblemsByDifficulty(await pickProblems(setup.count, `${setup.roomId}:${crypto.randomUUID()}`, setup.difficultyLow, setup.difficultyHigh, setup.ratios, () => undefined));
+    if (!problems.length) throw new Error("重新抽题失败");
+    const event: DuelEvent = {
+      type: "room.configured",
+      roomId: setup.roomId,
+      actorId: identity.id,
+      id: crypto.randomUUID(),
+      lamport: Math.max(1, state.lamport + 1),
+      issuedAt: Date.now(),
+      problems,
+      rated: setup.rated,
+      hostName: identity.luoguName,
+      minimumDifficulty: setup.customProblems.length ? undefined : setup.difficultyLow
+    };
+    await publishEnvelope(setup.roomId, setup.secret, await signEvent(identity, event));
+    await replaceRoomSnapshot();
+    await ensureJoined();
+    setStatus("房间题目已重新配置");
+  } catch (error) {
+    const message = friendlyError(error, "房间重新配置失败");
+    if (message.includes("每天最多创建") || message.includes("daily low difficulty")) {
+      await clearRoomDraft(setup.roomId, setup.secret).catch(() => undefined);
+      localStorage.removeItem(eventCacheKey(setup.roomId));
+      localStorage.removeItem(activeRoomKey);
+      pendingRoomSetup = null;
+      location.href = "/";
+      return;
+    }
+    setStatus(message, "error");
+  } finally {
+    recoveringRoomSetup = false;
+    notify();
+  }
+};
 
 const submitChat = async (event?: Event) => {
   event?.preventDefault();
@@ -1215,7 +1331,7 @@ const kickLobbyPlayer = async (player: Player) => {
   });
 };
 
-const leaveOrCloseCurrentMatchForNewRoom = async (): Promise<boolean> => {
+const leaveOrCloseCurrentMatchForNewRoom = async (action = "创建新房间"): Promise<boolean> => {
   let activeState = state;
   let activeId = roomId;
   let activeSecret = roomSecret;
@@ -1234,10 +1350,10 @@ const leaveOrCloseCurrentMatchForNewRoom = async (): Promise<boolean> => {
   }
   const host = activeState.hostId === identity.id;
   const message = host
-    ? "你正在主持一场未结束的比赛。创建新房间会关闭当前房间，是否继续？"
-    : "你正在参加一场未结束的比赛。创建新房间会退出当前房间，是否继续？";
+    ? `你正在主持一场未结束的比赛。${action}会关闭当前房间，是否继续？`
+    : `你正在参加一场未结束的比赛。${action}会退出当前房间，是否继续？`;
   const confirmation = await Swal.fire({
-    title: host ? "关闭当前房间？" : "退出当前比赛？",
+    title: host ? `关闭当前房间并${action}？` : `退出当前比赛并${action}？`,
     text: message,
     icon: "warning",
     showCancelButton: true,
@@ -1264,7 +1380,12 @@ const leaveOrCloseCurrentMatchForNewRoom = async (): Promise<boolean> => {
     ? { ...base, type: "room.closed", reason: "房主创建新房间", actorName: identity.luoguName }
     : { ...base, type: "player.left" };
   const envelope = await signEvent(identity, event);
-  await publishEnvelope(activeId, activeSecret, envelope);
+  try {
+    await publishEnvelope(activeId, activeSecret, envelope);
+  } catch (error) {
+    setStatus(friendlyError(error, "退出当前比赛失败，请重试"), "error");
+    return false;
+  }
   localStorage.removeItem(`luogu-duel.${dataVersion}.seat.${activeId}`);
   localStorage.removeItem(activeRoomKey);
   return true;
@@ -1508,30 +1629,7 @@ const Home = () => (
 const Room = () => {
   if (!lastRoomLiveStateAt && !state.problems.length) return <main class="room-grid room-loading"><div class="room-loading-head"><i /><div><b /><span /></div><strong /></div><SkeletonRows count={8} /></main>;
   return <main class="room-grid">
-    <section class="arena-head">
-      <div class="match-meta">
-        <p class="eyebrow">{state.phase === "arena" ? "LIVE MATCH" : state.phase === "finished" ? "MATCH ARCHIVE" : "READY ROOM"}</p>
-        <ArchiveStatus />
-        <h1><MatchTitle /></h1>
-        <p>{state.problems.length} 题 / 胜利线 {winThreshold(state)} / {state.rated ? "Rated" : "UNR"} / 你是 {teamName(currentSeat())}</p>
-      </div>
-      <div class="timer-block">
-        <strong>{formatMatchClock()}</strong>
-        <ScoreBar />
-      </div>
-    </section>
-
-    <section class="panel roster-panel">
-      <button class="roster-toggle" onClick={() => {
-        draft.teamsOpen = !draft.teamsOpen;
-        notify();
-      }}>
-        {draft.teamsOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-        <strong>TEAMS</strong>
-        <span>{teamSummary()}</span>
-      </button>
-      {draft.teamsOpen ? <Roster /> : null}
-    </section>
+    <MatchIsland />
 
     <section class="panel comms-panel">
       <Chat />
@@ -1584,6 +1682,7 @@ const RoomControls = () => {
   const player = state.players[identity.id];
   const canClose = canCloseRoom(state, identity.id, identity.luoguName);
   const canPlayAction = state.phase === "arena" && isTeam(player?.team) && !blockedByBan();
+  const canRoomMute = state.phase === "arena" && Boolean(player && (state.hostId === identity.id || isAdminName(identity.luoguName)));
   const canLeaveSpectator = mode === "room" && (player?.team === "spectator" || (!player && preferredSeat() === "spectator"));
   const showLobbyControls = state.phase === "lobby";
   if (state.phase === "finished") {
@@ -1647,6 +1746,12 @@ const RoomControls = () => {
           </button>
         </div>
       ) : null}
+      {canRoomMute ? (
+        <button class={state.muted["__room__"] ? "ghost" : "danger"} onClick={() => void emitDirect({ ...baseEvent(state.muted["__room__"] ? "room.unmuted" : "room.muted") })}>
+          {state.muted["__room__"] ? <Volume2 size={16} /> : <VolumeX size={16} />}
+          {state.muted["__room__"] ? "解除全员禁言" : "全员禁言"}
+        </button>
+      ) : null}
     </div>
   );
 };
@@ -1692,7 +1797,7 @@ const RoomList = () => {
         <span>状态</span>
       </div>
       {fresh.map((room) => (
-        <button class="duel-row" key={room.roomId} onClick={() => joinRoom(room)}>
+        <button class="duel-row" key={room.roomId} disabled={joiningRoom || creatingRoom} onClick={() => void joinRoom(room)}>
           <code>{shortRoomId(room.roomId)}</code>
           <RoomLineView room={room} />
           <em class={roomStatusClass(room)}>{roomStatusLabel(room)}</em>
@@ -1889,6 +1994,9 @@ const runAdminUserAction = async (name: string, action: "ban" | "unban" | "mute"
   notify();
   try {
     await moderateGlobal(action);
+    setStatus(`已${actionLabel(action)} ${name}`);
+  } catch (error) {
+    setStatus(friendlyError(error, `操作 ${actionLabel(action)} 失败`), "error");
   } finally {
     adminBusy.delete(key);
     notify();
@@ -2053,7 +2161,7 @@ const Problems = () => (
 
 const Chat = () => {
   const items = chatStreamItems();
-  const muted = isMutedCurrent();
+  const muted = isMutedCurrent() || (state.muted["__room__"] === true && state.hostId !== identity.id && !isAdminName(identity.luoguName));
   const readOnly = mode === "room" && state.phase === "finished";
   queueMicrotask(syncChatVditorState);
   return (
@@ -2703,8 +2811,46 @@ const History = () => {
   );
 };
 
-const joinRoom = (room: RoomListing) => {
-  location.hash = `room=${room.roomId}&secret=${room.secret}`;
+const joinRoom = async (room: RoomListing) => {
+  if (joiningRoom || creatingRoom) return;
+  joiningRoom = true;
+  notify();
+  try {
+    if (!(await leaveOrCloseCurrentMatchForNewRoom("进入新房间"))) return;
+    location.hash = `room=${room.roomId}&secret=${room.secret}`;
+  } finally {
+    joiningRoom = false;
+    notify();
+  }
+};
+
+const MatchIsland = () => {
+  const red = scoreOf(state, "red");
+  const blue = scoreOf(state, "blue");
+  const total = Math.max(1, state.problems.reduce((sum, problem) => sum + problem.score, 0));
+  const threshold = winThreshold(state);
+  return (
+    <aside class="match-island">
+      <div class="match-island-summary">
+        <time>{state.phase === "lobby" ? "准备中" : formatMatchClock()}</time>
+        <span class="island-duel" aria-label={`红方 ${red} 分，蓝方 ${blue} 分，胜利线 ${threshold}`}>
+          <b class="island-red-score">{red}</b>
+          <span class="island-duel-track">
+            <i class="island-red-fill" style={{ width: `${Math.min(100, red / total * 100)}%` }} />
+            <i class="island-blue-fill" style={{ width: `${Math.min(100, blue / total * 100)}%` }} />
+          </span>
+          <b class="island-blue-score">{blue}</b>
+          <em>胜 {threshold}</em>
+        </span>
+      </div>
+      <div class="island-hover-detail">
+        <ArchiveStatus />
+        <strong><MatchTitle /></strong>
+        {state.phase === "lobby" ? <span>{state.problems.length} 题 / {state.rated ? "Rated" : "UNR"}</span> : null}
+      </div>
+      <div class="island-roster"><Roster /></div>
+    </aside>
+  );
 };
 
 const showSponsorCode = async () => {
@@ -3024,11 +3170,6 @@ const matchTitle = (): string => {
   const blue = Object.values(state.players).filter((p) => p.team === "blue").map((p) => p.luoguName).join(" / ");
   return `${red || "红方"} vs ${blue || "蓝方"}`;
 };
-const teamSummary = (): string => {
-  const count = (seat: Seat) => Object.values(state.players).filter((player) => player.team === seat).length;
-  return `红 ${count("red")} / 蓝 ${count("blue")}`;
-};
-
 const rememberActiveRoomIfNeeded = () => {
   const seat = state.players[identity.id]?.team;
   if (mode === "room" && isTeam(seat) && !blockedByBan() && state.phase !== "finished") {

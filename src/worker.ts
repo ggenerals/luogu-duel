@@ -47,6 +47,8 @@ type ClientMessage = { type: "event"; envelope: SignedEnvelope } | { type: "ping
 type SocketKind = "room" | "directory";
 
 const adminNames = new Set(["general0826", "slmxf", "liyifan202201", "gcend", "gcsg01","imzfx_square"]);
+const DATA_RETENTION_MS = 3 * 24 * 60 * 60_000;
+const DIRECTORY_PRUNE_INTERVAL_MS = 24 * 60 * 60_000;
 
 export class DuelRoom extends DurableObject<Env> {
   private eventsCache: SignedEnvelope[] | null = null;
@@ -134,6 +136,9 @@ export class DuelRoom extends DurableObject<Env> {
     if (url.pathname.endsWith("/low-room-limit")) return this.handleLowRoomLimit(request);
     if (url.pathname.endsWith("/users")) return this.handleUsers(request);
     if (url.pathname.endsWith("/clear-all")) return this.handleClearAll(request);
+    if (url.pathname.endsWith("/clear-runtime-data")) return this.handleClearRuntimeData(request);
+    if (url.pathname.endsWith("/clear-global-chat")) return this.handleClearGlobalChat(request);
+    if (url.pathname.endsWith("/compact")) return this.handleCompact(request);
     if (url.pathname.endsWith("/clear-room")) return this.handleClearRoom(request);
     const userMatch = url.pathname.match(/\/users\/([^/]+)$/);
     if (userMatch) return this.handleUser(request, decodeURIComponent(userMatch[1]));
@@ -258,6 +263,9 @@ export class DuelRoom extends DurableObject<Env> {
     // Finished matches are immutable archives. Reject before SQLite persistence
     // so delayed retries cannot produce writes or directory broadcasts.
     if (event.roomId !== "global" && this.cachedState.phase === "finished") return false;
+    if (event.type === "room.configured" && this.cachedState.problems.length > 0) {
+      throw new Error("房间已经完成题目配置");
+    }
     if (event.roomId !== "global" && this.cachedState.problems.length === 0 && event.type !== "room.configured") {
       throw new Error("房间尚未完成题目配置");
     }
@@ -278,6 +286,10 @@ export class DuelRoom extends DurableObject<Env> {
     }
     if (event.type === "room.closed" && this.cachedState.phase === "arena" && !adminNames.has(normalizeName(event.actorName))) {
       throw new Error("比赛开始后只有管理员可以关闭房间");
+    }
+    if ((event.type === "room.muted" || event.type === "room.unmuted") && event.roomId !== "global") {
+      const actor = this.cachedState.players[event.actorId];
+      if (!actor || (this.cachedState.hostId !== event.actorId && !adminNames.has(normalizeName(actor.luoguName)))) throw new Error("只有房主或管理员可以全员禁言");
     }
     if (event.type === "player.joined" && event.team === "spectator" && !this.cachedState.hostId && event.roomId !== "global") {
       throw new Error("房主不能进入观战席");
@@ -334,11 +346,11 @@ export class DuelRoom extends DurableObject<Env> {
     this.eventsCache!.push(envelope);
     this.eventsCache!.sort(compareEnvelopes);
     this.eventIds.add(event.id);
-    this.writeSnapshot("events", this.eventsCache!);
     this.firstEvent ??= event;
     this.cachedState = !previousLastEnvelope || compareEnvelopes(previousLastEnvelope, envelope) <= 0
       ? applyEvent(this.cachedState.roomId === event.roomId ? this.cachedState : createInitialState(event.roomId), event)
       : applyEvents(event.roomId, this.eventsCache!.map((item) => item.event));
+    this.writeSnapshot("events", this.eventsCache!);
     if (claimName && !isPlayingSeat(this.cachedState.players[event.actorId]?.team)) {
       await this.releaseActivePlayer(claimName, event.roomId);
     }
@@ -368,7 +380,7 @@ export class DuelRoom extends DurableObject<Env> {
   async alarm(): Promise<void> {
     if (await this.isDirectoryObject()) {
       await this.pruneDirectory();
-      if (this.listingsCache!.size > 500) await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      await this.ctx.storage.setAlarm(Date.now() + DIRECTORY_PRUNE_INTERVAL_MS);
       this.broadcastDirectory();
       return;
     }
@@ -490,6 +502,7 @@ export class DuelRoom extends DurableObject<Env> {
 
   private async handleDirectory(request: Request): Promise<Response> {
     if (request.method === "GET") {
+      await this.ctx.storage.setAlarm(Date.now() + DIRECTORY_PRUNE_INTERVAL_MS);
       return Response.json({ rooms: this.listRooms() }, { headers: cacheHeaders(60, 24 * 60 * 60) });
     }
     if (request.method === "POST") {
@@ -513,7 +526,7 @@ export class DuelRoom extends DurableObject<Env> {
       this.listingsCache!.set(body.listing.roomId, body.listing);
       await this.pruneDirectory();
       this.writeSnapshot("directory", [...this.listingsCache!.values()]);
-      if (this.listingsCache!.size > 500) await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      await this.ctx.storage.setAlarm(Date.now() + DIRECTORY_PRUNE_INTERVAL_MS);
       this.broadcastDirectory();
       return Response.json({ ok: true });
     }
@@ -615,6 +628,126 @@ export class DuelRoom extends DurableObject<Env> {
     return Response.json({ ok: true });
   }
 
+  private async handleClearRuntimeData(request: Request): Promise<Response> {
+    if (request.method !== "POST") return jsonError("method not allowed", 405);
+    this.hydrateDirectory();
+    this.hydrateEvents();
+    const retainedEvents = this.activeGlobalBanEvents();
+    const roomListings = [...this.listingsCache!.values()];
+    let clearedRooms = 0;
+    for (let offset = 0; offset < roomListings.length; offset += 25) {
+      const batch = roomListings.slice(offset, offset + 25);
+      const results = await Promise.all(batch.map(async (listing) => {
+        const secret = listing.secret || "public-room";
+        try {
+          await this.env.DUEL_ROOM.getByName(`${listing.roomId}:${secret}`).fetch("https://duel.internal/clear-room", { method: "POST" });
+          return true;
+        } catch {
+          // The directory entry is removed even when an old room object is unavailable.
+          return false;
+        }
+      }));
+      clearedRooms += results.filter(Boolean).length;
+    }
+
+    this.ctx.storage.sql.exec("DELETE FROM listings");
+    this.ctx.storage.sql.exec("DELETE FROM processed_results");
+    this.ctx.storage.sql.exec("DELETE FROM active_players");
+    this.ctx.storage.sql.exec("DELETE FROM low_room_days");
+    this.ctx.storage.sql.exec("DELETE FROM events");
+    this.ctx.storage.sql.exec("DELETE FROM snapshots WHERE snapshot_key NOT IN ('users', 'banned-users')");
+    for (const envelope of retainedEvents) {
+      const event = envelope.event;
+      this.ctx.storage.sql.exec(
+        "INSERT INTO events (id, room_id, issued_at, lamport, envelope) VALUES (?, ?, ?, ?, ?)",
+        event.id,
+        event.roomId,
+        event.issuedAt,
+        event.lamport,
+        JSON.stringify(envelope)
+      );
+    }
+    this.eventsCache = retainedEvents;
+    this.eventIds = new Set(retainedEvents.map((item) => item.event.id));
+    this.firstEvent = retainedEvents[0]?.event ?? null;
+    this.cachedState = retainedEvents.length ? applyEvents("global", retainedEvents.map((item) => item.event)) : createInitialState("");
+    this.listingsCache = new Map();
+    this.processedResultsCache = new Set();
+    this.writeSnapshot("events", retainedEvents);
+    this.writeSnapshot("directory", []);
+    this.writeSnapshot("processed-results", []);
+    await this.env.DUEL_ROOM.getByName("global:public-lobby").fetch("https://duel.internal/clear-global-chat", { method: "POST" });
+    await this.ctx.storage.setAlarm(Date.now() + DIRECTORY_PRUNE_INTERVAL_MS);
+    this.broadcastDirectory();
+    return Response.json({ ok: true, clearedRooms, retainedBans: retainedEvents.filter((item) => item.event.type === "player.kicked").length });
+  }
+
+  private async handleClearGlobalChat(request: Request): Promise<Response> {
+    if (request.method !== "POST") return jsonError("method not allowed", 405);
+    this.hydrateEvents();
+    const retainedEvents = this.activeGlobalBanEvents();
+    this.ctx.storage.sql.exec("DELETE FROM events");
+    this.ctx.storage.sql.exec("DELETE FROM snapshots WHERE snapshot_key = 'events'");
+    for (const envelope of retainedEvents) {
+      const event = envelope.event;
+      this.ctx.storage.sql.exec(
+        "INSERT INTO events (id, room_id, issued_at, lamport, envelope) VALUES (?, ?, ?, ?, ?)",
+        event.id,
+        event.roomId,
+        event.issuedAt,
+        event.lamport,
+        JSON.stringify(envelope)
+      );
+    }
+    this.eventsCache = retainedEvents;
+    this.eventIds = new Set(retainedEvents.map((item) => item.event.id));
+    this.firstEvent = retainedEvents[0]?.event ?? null;
+    this.cachedState = retainedEvents.length ? applyEvents("global", retainedEvents.map((item) => item.event)) : createInitialState("global");
+    this.writeSnapshot("events", retainedEvents);
+    this.broadcast({ type: "sync", envelopes: retainedEvents });
+    return Response.json({ ok: true, retainedBans: retainedEvents.filter((item) => item.event.type === "player.kicked").length });
+  }
+
+  private activeGlobalBanEvents(): SignedEnvelope[] {
+    const moderation = applyEvents("global", this.eventsCache!.map((item) => item.event));
+    const activeBans = new Set(Object.keys(moderation.banned));
+    const banEvents = this.eventsCache!.filter((item) =>
+      item.event.type === "player.kicked" && activeBans.has(normalizeName(item.event.targetName || ""))
+    );
+    const banActors = new Set(banEvents.map((item) => item.event.actorId));
+    return this.eventsCache!.filter((item) =>
+      (item.event.type === "player.joined" && banActors.has(item.event.actorId)) || banEvents.includes(item)
+    );
+  }
+
+  private async handleCompact(request: Request): Promise<Response> {
+    if (request.method !== "POST") return jsonError("method not allowed", 405);
+    this.hydrateEvents();
+    const beforeEvents = this.eventsCache!.length;
+    this.hydrateDirectory();
+    const cutoff = Date.now() - DATA_RETENTION_MS;
+    let clearedRooms = 0;
+    for (const listing of [...this.listingsCache!.values()]) {
+      const at = listing.endedAt ?? listing.startedAt ?? listing.createdAt;
+      if (at < cutoff) {
+        this.ctx.storage.sql.exec("DELETE FROM listings WHERE room_id = ?", listing.roomId);
+        this.listingsCache!.delete(listing.roomId);
+        this.processedResultsCache?.delete(listing.roomId);
+        const secret = listing.secret || "public-room";
+        try {
+          await this.env.DUEL_ROOM.getByName(`${listing.roomId}:${secret}`).fetch("https://duel.internal/clear-room", { method: "POST" });
+          clearedRooms += 1;
+        } catch {
+          // The directory entry is gone; an unavailable old room can be retried on a later cleanup.
+        }
+      }
+    }
+    this.writeSnapshot("directory", [...this.listingsCache!.values()]);
+    if (this.processedResultsCache) this.writeSnapshot("processed-results", [...this.processedResultsCache]);
+    this.broadcastDirectory();
+    return Response.json({ ok: true, directoryEvents: beforeEvents, clearedRooms, listings: this.listingsCache!.size });
+  }
+
   private async handleClearRoom(request: Request): Promise<Response> {
     if (request.method !== "POST") return jsonError("method not allowed", 405);
     this.ctx.storage.sql.exec("DELETE FROM events");
@@ -631,10 +764,15 @@ export class DuelRoom extends DurableObject<Env> {
 
   private async pruneDirectory(): Promise<void> {
     this.hydrateDirectory();
+    const cutoff = Date.now() - DATA_RETENTION_MS;
+    const expired = [...this.listingsCache!.values()]
+      .filter((listing) => (listing.endedAt ?? listing.startedAt ?? listing.createdAt) < cutoff);
     const overflow = [...this.listingsCache!.values()]
+      .filter((listing) => !expired.some((old) => old.roomId === listing.roomId))
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(500, 525);
-    for (const listing of overflow) {
+    const stale = [...expired, ...overflow];
+    for (const listing of stale) {
       this.ctx.storage.sql.exec("DELETE FROM listings WHERE room_id = ?", listing.roomId);
       this.ctx.storage.sql.exec("DELETE FROM processed_results WHERE room_id = ?", listing.roomId);
       this.ctx.storage.sql.exec("DELETE FROM active_players WHERE room_id = ?", listing.roomId);
@@ -643,7 +781,8 @@ export class DuelRoom extends DurableObject<Env> {
       const secret = listing.secret || "public-room";
       await this.env.DUEL_ROOM.getByName(`${listing.roomId}:${secret}`).fetch("https://duel.internal/clear-room", { method: "POST" });
     }
-    if (overflow.length) this.writeSnapshot("directory", [...this.listingsCache!.values()]);
+    this.ctx.storage.sql.exec("DELETE FROM active_players WHERE updated_at < ?", Date.now() - DATA_RETENTION_MS);
+    if (stale.length) this.writeSnapshot("directory", [...this.listingsCache!.values()]);
   }
 
   private async isDirectoryObject(): Promise<boolean> {
@@ -746,7 +885,7 @@ export class DuelRoom extends DurableObject<Env> {
 
   private listRooms(): RoomListing[] {
     this.hydrateDirectory();
-    const maxAge = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const maxAge = Date.now() - DATA_RETENTION_MS;
     return [...this.listingsCache!.values()]
       .map((room) => room.host === "unknown" || room.host === "待同步"
         ? { ...room, host: room.redPlayers?.[0] ?? room.bluePlayers?.[0] ?? "待同步" }
@@ -883,14 +1022,15 @@ export class DuelRoom extends DurableObject<Env> {
   }
 
   private async handleLowRoomLimit(request: Request): Promise<Response> {
-    if (request.method !== "POST") return jsonError("method not allowed", 405);
-    const body = (await request.json()) as { roomId?: string };
-    const roomId = body.roomId?.trim() || "";
-    if (!/^[A-Za-z0-9_-]{1,80}$/.test(roomId)) return jsonError("invalid room", 400);
     const dayKey = chinaDayKey(Date.now());
     const existing = this.ctx.storage.sql
       .exec<{ room_id: string }>("SELECT room_id FROM low_room_days WHERE day_key = ? LIMIT 1", dayKey)
       .toArray()[0];
+    if (request.method === "GET") return Response.json({ allowed: !existing, dayKey, roomId: existing?.room_id ?? null });
+    if (request.method !== "POST") return jsonError("method not allowed", 405);
+    const body = (await request.json()) as { roomId?: string };
+    const roomId = body.roomId?.trim() || "";
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(roomId)) return jsonError("invalid room", 400);
     if (existing && existing.room_id !== roomId) {
       return jsonError("daily low difficulty room limit reached", 429);
     }
@@ -914,7 +1054,7 @@ export default {
       const blocked = await protectApiRequest(request, url, env);
       if (blocked) return blocked;
     }
-    if (env.MAINTENANCE === "1" && !url.pathname.startsWith("/api/admin/clear-all")) {
+    if (env.MAINTENANCE === "1" && !url.pathname.startsWith("/api/admin/")) {
       return new Response(maintenanceHtml(), {
         status: 503,
         headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }
@@ -926,6 +1066,11 @@ export default {
       return proxyProblemBank(request, problemBankMatch[1] as ProblemBankSource, ctx);
     }
     if (url.pathname === "/api/vjudge/status" && request.method === "GET") return fetchVJudgeStatus(url, request, env);
+    if (url.pathname === "/api/room-limit/low" && request.method === "GET") {
+      const name = normalizeName(url.searchParams.get("name") || "");
+      if (!name) return jsonError("missing name", 400);
+      return env.DUEL_ROOM.getByName(`__low-room-limit:${name}`).fetch("https://duel.internal/low-room-limit");
+    }
     if (url.pathname === "/api/rooms" && request.method === "GET") {
       return directoryJsonResponse(request, env, "https://duel.internal/directory");
     }
@@ -934,20 +1079,42 @@ export default {
       return directoryJsonResponse(request, env, "https://duel.internal/users");
     }
     if (url.pathname === "/api/admin/clear-all" && request.method === "POST") {
+      const actor = normalizeName(request.headers.get("x-admin-name") || "");
+      if (!adminNames.has(actor)) return jsonError("admin required", 403);
       return env.DUEL_ROOM.getByName("__directory").fetch("https://duel.internal/clear-all", request);
+    }
+    if (url.pathname === "/api/admin/clear-runtime-data" && request.method === "POST") {
+      const actor = normalizeName(request.headers.get("x-admin-name") || "");
+      if (!adminNames.has(actor)) return jsonError("admin required", 403);
+      return env.DUEL_ROOM.getByName("__directory").fetch("https://duel.internal/clear-runtime-data", request);
+    }
+    if (url.pathname === "/api/admin/compact" && request.method === "POST") {
+      const actor = normalizeName(request.headers.get("x-admin-name") || "");
+      if (!adminNames.has(actor)) return jsonError("admin required", 403);
+      return env.DUEL_ROOM.getByName("__directory").fetch("https://duel.internal/compact", request);
+    }
+    const adminRoomClear = url.pathname.match(/^\/api\/admin\/rooms\/([^/]+)\/clear$/);
+    if (adminRoomClear && request.method === "POST") {
+      const actor = normalizeName(request.headers.get("x-admin-name") || "");
+      if (!adminNames.has(actor)) return jsonError("admin required", 403);
+      const roomId = decodeURIComponent(adminRoomClear[1]);
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(roomId)) return jsonError("invalid room", 400);
+      const secret = url.searchParams.get("secret") || "public-room";
+      return env.DUEL_ROOM.getByName(`${roomId}:${secret}`).fetch("https://duel.internal/clear-room", { method: "POST" });
     }
     const userMatch = url.pathname.match(/^\/api\/users\/([^/]+)$/);
     if (userMatch) {
       return env.DUEL_ROOM.getByName("__directory").fetch(new Request(`https://duel.internal/users/${userMatch[1]}`, request));
     }
 
-    const roomMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/(ws|snapshot|event|manual-claim)$/);
+    const roomMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/(ws|snapshot|event|manual-claim|clear)$/);
     if (roomMatch) {
       const roomId = decodeURIComponent(roomMatch[1]);
       const action = roomMatch[2];
       const secret = url.searchParams.get("secret") || "public-room";
       const stub = env.DUEL_ROOM.getByName(`${roomId}:${secret}`);
-      const response = await stub.fetch(new Request(`https://duel.internal/${action}?secret=${encodeURIComponent(secret)}`, request));
+      const internalAction = action === "clear" ? "clear-room" : action;
+      const response = await stub.fetch(new Request(`https://duel.internal/${internalAction}?secret=${encodeURIComponent(secret)}`, request));
       return action === "manual-claim" ? manualClaimCors(response) : response;
     }
 
@@ -1002,7 +1169,7 @@ const proxyProblemBank = async (request: Request, source: ProblemBankSource, ctx
     if (cached) return cached;
 
     const config = problemBankSources[source];
-    const upstream = await fetch(config.url, {
+    const upstream = await fetchExternalWith403Fallback(config.url, {
       headers: { accept: config.accept },
       cf: { cacheEverything: true, cacheTtl: problemBankCacheSeconds },
       signal: AbortSignal.timeout(60_000)
@@ -1050,7 +1217,7 @@ const fetchVJudgeStatus = async (requestUrl: URL, request: Request, env: Env): P
       upstreamUrl.searchParams.set("length", String(pageSize));
       upstreamUrl.searchParams.set("OJId", oj);
       upstreamUrl.searchParams.set("probNum", problem);
-      const upstream = await fetch(upstreamUrl, {
+      const upstream = await fetchExternalWith403Fallback(upstreamUrl, {
         headers: { accept: "application/json", referer: "https://vjudge.net/status", "cache-control": "no-cache" },
         cf: { cacheTtl: 0 },
         signal: AbortSignal.timeout(12_000)
@@ -1122,7 +1289,7 @@ const verifyVJudgeLogin = async (request: Request, env: Env): Promise<Response> 
   try {
     const profileUrl = new URL(`https://vjudge.net/user/${encodeURIComponent(username)}`);
     profileUrl.searchParams.set("_", String(Date.now()));
-    const response = await fetch(profileUrl, {
+    const response = await fetchExternalWith403Fallback(profileUrl, {
       headers: { accept: "text/html", "cache-control": "no-cache", pragma: "no-cache" },
       cf: { cacheTtl: 0 },
       signal: AbortSignal.timeout(10_000)
@@ -1157,6 +1324,21 @@ const isRecentVJudgeActivity = (value: string): boolean => {
   if (normalized === "just now") return true;
   const seconds = normalized.match(/^(\d+)\s*(?:sec|secs|second|seconds)\s+ago$/)?.[1];
   return seconds !== undefined && Number(seconds) <= 3;
+};
+
+const external403Fallback = "https://liyifan202201-bug.hf.space/";
+
+// The proxy is only a one-shot fallback for known public OJ sources. Normal
+// traffic stays on the origin, and client-controlled URLs can never use it.
+const fetchExternalWith403Fallback = async (input: string | URL, init?: RequestInit): Promise<Response> => {
+  const target = new URL(input.toString());
+  const allowedHosts = new Set(["vjudge.net", "codeforces.com", "kenkoooo.com", "cdn.luogu.com.cn"]);
+  const response = await fetch(target, init);
+  if (response.status !== 403 || !allowedHosts.has(target.hostname)) return response;
+
+  const proxyUrl = new URL(external403Fallback);
+  proxyUrl.searchParams.set("url", target.toString());
+  return fetch(proxyUrl, init);
 };
 
 const extractProfileField = (html: string, i18nKey: string): string => {
@@ -1360,6 +1542,6 @@ body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b101
 main{max-width:560px;padding:28px;border:1px solid #263241;border-radius:8px;background:#111820;box-shadow:0 20px 70px #0008}
 h1{margin:0 0 8px;font-size:24px}p{margin:0;color:#a8b3c1}
 </style>
-<main><h1>VJ DUEL 日报！</h1><p>请不要多次刷新，当前正在维护</p></main>`;
+<main><h1>VJudge Duel 维护中</h1><p>维护时间：2026-07-23 15:00-16:00。请勿重复刷新，维护完成后服务将自动恢复。</p></main>`;
 
 const jsonError = (message: string, status: number): Response => Response.json({ error: message }, { status });

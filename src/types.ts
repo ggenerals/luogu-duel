@@ -251,6 +251,10 @@ export type DuelEvent =
       issuedAt: number;
       targetId: string;
       targetName?: string;
+    }
+  | {
+      type: "room.muted" | "room.unmuted";
+      roomId: string; actorId: string; id: string; lamport: number; issuedAt: number;
     };
 
 export type SignedEnvelope = {
