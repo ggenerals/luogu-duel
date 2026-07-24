@@ -502,7 +502,16 @@ const openVote = (
   actorId: string
 ) => {
   if (!isTeam(state.players[actorId]?.team) || isRestricted(state, actorId) || state.votes[voteInput.id]) return;
-  if (voteInput.kind === "replace-problem" && voteInput.targetPid && Object.values(state.votes).some((vote) => vote.kind === "replace-problem" && vote.targetPid === voteInput.targetPid && vote.status === "open")) return;
+  // Auto-deduplicate: never open a second vote of the same kind that is still open.
+  // draw -> one open draw proposal per room; surrender -> one per team;
+  // replace/delete-problem -> one per target problem.
+  if (Object.values(state.votes).some((vote) => vote.status === "open" && vote.kind === voteInput.kind && (
+    voteInput.kind === "replace-problem" || voteInput.kind === "delete-problem"
+      ? vote.targetPid === voteInput.targetPid
+      : voteInput.kind === "surrender"
+        ? vote.team === voteInput.team
+        : true
+  ))) return;
   const vote: Vote = {
     ...voteInput,
     approvals: { [actorId]: true },
@@ -650,6 +659,8 @@ const cloneModerationMap = (map: Record<string, ModerationRecord>): Record<strin
   Object.fromEntries(Object.entries(map).map(([key, value]) => [key, { ...value }]));
 
 const pushSystem = (state: DuelState, text: string, at: number) => {
+  const last = state.system.at(-1);
+  if (last && last.text === text) return;
   state.system.push({
     id: `${at}:${state.system.length}:${text}`,
     text,

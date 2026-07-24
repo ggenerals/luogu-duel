@@ -5,6 +5,7 @@ import type VditorType from "vditor";
 import "vditor/dist/index.css";
 import type { ComponentChildren, JSX } from "preact";
 import { render } from "preact";
+import { useEffect, useRef } from "preact/hooks";
 import {
   Ban,
   Building2,
@@ -25,6 +26,8 @@ import {
   MessageSquare,
   Monitor,
   Moon,
+  Palette,
+  Pin,
   Play,
   Radio,
   RefreshCw,
@@ -150,6 +153,13 @@ const userCacheKey = "luogu-duel.user-cache";
 const registrationCacheKey = "luogu-duel.registration-cache";
 const userCacheTtl = 24 * 60 * 60 * 1000;
 const themeModeKey = "luogu-duel.theme-mode";
+const bgImageKey = "luogu-duel.bg-image";
+const frostedKey = "luogu-duel.frosted";
+const blurRadiusKey = "luogu-duel.blur-radius";
+const panelAlphaKey = "luogu-duel.panel-alpha";
+const themeColorRKey = "luogu-duel.theme-color-r";
+const themeColorGKey = "luogu-duel.theme-color-g";
+const themeColorBKey = "luogu-duel.theme-color-b";
 const avatarCache: Record<string, string> = readAvatarCache();
 const userCache: Record<string, { user: UserRecord; cachedAt: number }> = readUserCache();
 const avatarLoading = new Set<string>();
@@ -161,11 +171,17 @@ let chatVditorGeneration = 0;
 let vditorModulePromise: Promise<typeof import("vditor")> | null = null;
 const vditorPreviewSources = new WeakMap<HTMLElement, string>();
 let themeMode = readThemeMode();
+let bgImageUrl = readStoredText(bgImageKey) || "";
+let frostedGlass = readStoredText(frostedKey) === "1";
+let blurRadius = readStoredNumber(blurRadiusKey, 0);
+let panelAlpha = readStoredNumber(panelAlphaKey, 100);
+let themeColorR = readStoredNumber(themeColorRKey, 63);
+let themeColorG = readStoredNumber(themeColorGKey, 185);
+let themeColorB = readStoredNumber(themeColorBKey, 140);
 const themeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
 const draft = {
   userMenuOpen: false,
-  themeMenuOpen: false,
   roomTab: "duel" as "duel" | "ranking",
   profileTab: "home" as "home" | "matches" | "achievements",
   profileEditing: false,
@@ -183,7 +199,8 @@ const draft = {
   adminSearch: "",
   adminReason: "",
   adminRatings: {} as Record<string, string>,
-  spectatorsOpen: false
+  spectatorsOpen: false,
+  matchIslandPinned: false
 };
 
 type ToastMessage = {
@@ -226,9 +243,65 @@ function syncViewportScroll(): void {
 
 window.addEventListener("resize", syncViewportScroll, { passive: true });
 
+let themeTick = 0;
+
 const applyTheme = () => {
   const effective = themeMode === "system" ? (themeQuery.matches ? "dark" : "light") : themeMode;
   document.documentElement.dataset.theme = effective;
+  if (bgImageUrl) {
+    document.body.style.backgroundImage = `url(${bgImageUrl})`;
+    document.body.style.backgroundSize = "cover";
+    document.body.style.backgroundPosition = "center";
+    document.body.style.backgroundAttachment = "fixed";
+  } else {
+    document.body.style.backgroundImage = "";
+    document.body.style.backgroundSize = "";
+    document.body.style.backgroundPosition = "";
+    document.body.style.backgroundAttachment = "";
+  }
+  const isDefaultColor = themeColorR === 63 && themeColorG === 185 && themeColorB === 140;
+  if (!isDefaultColor) {
+    document.documentElement.style.setProperty("--green", `rgb(${themeColorR},${themeColorG},${themeColorB})`);
+  } else {
+    document.documentElement.style.removeProperty("--green");
+  }
+  const styleEl = document.getElementById("frosted-custom-style") || document.createElement("style");
+  styleEl.id = "frosted-custom-style";
+  if (frostedGlass && blurRadius > 0) {
+    const a = panelAlpha / 100;
+    const dk = `rgba(13,17,23,${a})`;
+    const lt = `rgba(244,247,251,${a})`;
+    // Top-level surfaces: get the frosted blur + translucent background.
+    const surfaces = [
+      ".panel", ".topbar", ".match-island", ".home-room-panel",
+      ".command-panel", ".profile-card", ".session-menu", ".modal-overlay",
+      ".duel-swal .swal2-popup", "body.swal2-shown .swal2-popup", ".admin-page-head"
+    ];
+    // Nested sub-cards: stay fully transparent so blur/colour never stacks.
+    const subs = [
+      ".home-announcement", ".problem-card", ".chat-line.bubble", ".vditor", ".vditor-toolbar",
+      ".vditor-content", ".vditor-wysiwyg", ".vditor-reset", ".vditor-preview", ".duel-table",
+      ".ranking-list", ".team-card", ".island-roster", ".chat-log", ".chat-form input",
+      ".chat-form textarea", "input", "select", "textarea"
+    ];
+    const surfaceRules = [
+      ...surfaces.map(s => `${s} { backdrop-filter: blur(${blurRadius}px); -webkit-backdrop-filter: blur(${blurRadius}px); background: ${dk}; }`),
+      ...surfaces.map(s => `[data-theme="light"] ${s} { background: ${lt}; }`)
+    ];
+    const subRules = [
+      ...subs.map(s => `${s} { background: transparent !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }`),
+      ...subs.map(s => `[data-theme="light"] ${s} { background: transparent !important; }`),
+      `.problem-card:hover { background: color-mix(in srgb, var(--green) 10%, transparent) !important; border-color: var(--green); }`,
+      `.duel-row { background: transparent; }`,
+      `.duel-swal .swal2-html-container { background: transparent; }`
+    ];
+    styleEl.textContent = [...surfaceRules, ...subRules].join("\n");
+  } else {
+    styleEl.textContent = "";
+  }
+  if (!document.head.contains(styleEl)) document.head.appendChild(styleEl);
+  themeTick++;
+  try { document.dispatchEvent(new Event("luogu-duel:theme")); } catch { /* ignore */ }
 };
 const setStatus = (text: string, tone: "info" | "error" = "info") => {
   statusText = text;
@@ -391,6 +464,8 @@ const loadDirectory = async () => {
     if (!directoryLiveSnapshotReceived || Date.now() - lastDirectoryLiveAt >= 20_000) {
       rooms = remoteRooms;
       writeDirectoryCache(rooms);
+      directoryLiveSnapshotReceived = true;
+      lastDirectoryLiveAt = Date.now();
     }
     statusTone = "info";
     statusText = "大厅在线";
@@ -435,7 +510,6 @@ const setThemeMode = (next: "system" | "light" | "dark") => {
   applyTheme();
   setVditorTheme(profileVditor);
   setVditorTheme(chatVditor);
-  draft.themeMenuOpen = false;
   notify();
 };
 
@@ -448,6 +522,129 @@ function readThemeMode(): "system" | "light" | "dark" {
   }
   return "system";
 }
+
+const rgbToHex = (r: number, g: number, b: number): string =>
+  `#${[r, g, b].map((c) => Math.min(255, Math.max(0, c)).toString(16).padStart(2, "0")).join("")}`;
+
+const hexToRgb = (hex: string): { r: number; g: number; b: number } => {
+  const clean = hex.replace("#", "");
+  return {
+    r: parseInt(clean.slice(0, 2), 16) || 63,
+    g: parseInt(clean.slice(2, 4), 16) || 185,
+    b: parseInt(clean.slice(4, 6), 16) || 140
+  };
+};
+
+const openThemeEditor = async () => {
+  const modeLabels: Record<string, string> = { system: "跟随系统", light: "浅色", dark: "深色" };
+  const modeIcons: Record<string, string> = { system: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>', light: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>', dark: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>' };
+  const modeButtons = (["system", "light", "dark"] as const).map(m => 
+    `<button type="button" class="theme-editor-mode-btn ${themeMode === m ? 'active' : ''}" data-mode="${m}">${modeIcons[m]} ${modeLabels[m]}</button>`
+  ).join("");
+
+  // Snapshot current values for cancel revert
+  const snap = { mode: themeMode, bg: bgImageUrl, r: themeColorR, g: themeColorG, b: themeColorB, frosted: frostedGlass, blur: blurRadius, alpha: panelAlpha };
+
+  const preview = () => { applyTheme(); };
+
+  const result = await Swal.fire({
+    title: "主题编辑器",
+    html: `
+      <div class="theme-editor-dialog">
+        <label>主题模式</label>
+        <div class="theme-editor-modes">${modeButtons}</div>
+        <label>背景图片 URL</label>
+        <input id="te-bg" type="text" value="${bgImageUrl.replace(/"/g, "&quot;")}" placeholder="留空=无背景">
+        <label>主题颜色</label>
+        <div class="te-color-row">
+          <input id="te-color" type="color" value="${rgbToHex(themeColorR, themeColorG, themeColorB)}">
+          <span id="te-color-hex">${rgbToHex(themeColorR, themeColorG, themeColorB)}</span>
+        </div>
+        <label>毛玻璃</label>
+        <div class="te-frosted-row">
+          <label class="te-check"><input id="te-frosted" type="checkbox" ${frostedGlass ? "checked" : ""}> 启用</label>
+          <label class="te-range">模糊 <input id="te-blur" type="range" min="0" max="40" value="${blurRadius}" ${frostedGlass ? "" : "disabled"}> <span id="te-blur-val">${blurRadius}px</span></label>
+          <label class="te-range">透明 <input id="te-alpha" type="range" min="10" max="100" value="${panelAlpha}" ${frostedGlass ? "" : "disabled"}> <span id="te-alpha-val">${panelAlpha}%</span></label>
+        </div>
+      </div>
+    `,
+    confirmButtonText: "保存",
+    showCancelButton: true,
+    cancelButtonText: "取消",
+    showDenyButton: true,
+    denyButtonText: "重置默认",
+    customClass: { popup: "duel-swal theme-editor-swal", confirmButton: "duel-swal-confirm", cancelButton: "duel-swal-cancel", denyButton: "duel-swal-deny" },
+    didOpen: () => {
+      const get = (id: string) => document.getElementById(id) as HTMLInputElement;
+      const applyNow = () => {
+        const colorHex = get("te-color")?.value || "#3fb98c";
+        const { r, g, b } = hexToRgb(colorHex);
+        themeColorR = r; themeColorG = g; themeColorB = b;
+        frostedGlass = get("te-frosted")?.checked ?? false;
+        blurRadius = Number(get("te-blur")?.value) || 0;
+        panelAlpha = Number(get("te-alpha")?.value) || 100;
+        (get("te-blur-val")).textContent = `${blurRadius}px`;
+        (get("te-alpha-val")).textContent = `${panelAlpha}%`;
+        (get("te-color-hex")).textContent = colorHex;
+        const blurInp = get("te-blur");
+        const alphaInp = get("te-alpha");
+        if (blurInp) blurInp.disabled = !frostedGlass;
+        if (alphaInp) alphaInp.disabled = !frostedGlass;
+        preview();
+      };
+      // Mode buttons
+      document.querySelectorAll(".theme-editor-mode-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const mode = btn.getAttribute("data-mode") || "system";
+          setThemeMode(mode as "system" | "light" | "dark");
+          document.querySelectorAll(".theme-editor-mode-btn").forEach(b => b.classList.remove("active"));
+          btn.classList.add("active");
+        });
+      });
+      // Real-time: color, blur, alpha, frosted
+      ["te-color", "te-blur", "te-alpha", "te-frosted"].forEach(id => get(id)?.addEventListener("input", applyNow));
+      get("te-frosted")?.addEventListener("change", applyNow);
+    },
+    preConfirm: () => {
+      const bgUrl = (document.getElementById("te-bg") as HTMLInputElement)?.value?.trim() || "";
+      return { bgUrl, r: themeColorR, g: themeColorG, b: themeColorB, frosted: frostedGlass, blur: blurRadius, alpha: panelAlpha };
+    }
+  });
+
+  if (result.isDenied) {
+    // Reset to defaults
+    themeMode = "system";
+    bgImageUrl = "";
+    themeColorR = 63; themeColorG = 185; themeColorB = 140;
+    frostedGlass = false; blurRadius = 0; panelAlpha = 100;
+    try { localStorage.removeItem(themeModeKey); localStorage.removeItem(bgImageKey); localStorage.removeItem(frostedKey); localStorage.removeItem(blurRadiusKey); localStorage.removeItem(panelAlphaKey); localStorage.removeItem(themeColorRKey); localStorage.removeItem(themeColorGKey); localStorage.removeItem(themeColorBKey); } catch {}
+    applyTheme(); notify(); return;
+  }
+
+  if (result.isDismissed) {
+    // Cancelled - revert to snapshot
+    themeMode = snap.mode;
+    bgImageUrl = snap.bg;
+    themeColorR = snap.r; themeColorG = snap.g; themeColorB = snap.b;
+    frostedGlass = snap.frosted; blurRadius = snap.blur; panelAlpha = snap.alpha;
+    applyTheme(); notify(); return;
+  }
+
+  if (result.isConfirmed && result.value) {
+    bgImageUrl = result.value.bgUrl;
+    try {
+      localStorage.setItem(themeModeKey, themeMode);
+      localStorage.setItem(bgImageKey, bgImageUrl);
+      localStorage.setItem(frostedKey, frostedGlass ? "1" : "0");
+      localStorage.setItem(blurRadiusKey, String(blurRadius));
+      localStorage.setItem(panelAlphaKey, String(panelAlpha));
+      localStorage.setItem(themeColorRKey, String(themeColorR));
+      localStorage.setItem(themeColorGKey, String(themeColorG));
+      localStorage.setItem(themeColorBKey, String(themeColorB));
+    } catch {}
+    applyTheme(); notify();
+  }
+};
 
 const loadSnapshot = async (): Promise<boolean> => {
   try {
@@ -884,7 +1081,21 @@ const emitDirect = async (event: Extract<DuelEvent, { type: "room.closed" | "roo
 
 const showMatchResult = async (): Promise<void> => {
   const player = state.players[identity.id];
-  if (!player || !isTeam(player.team) || !state.winner || state.winner === "draw" || state.closed) return;
+  if (!player || !isTeam(player.team) || state.closed) return;
+  if (!state.winner) return;
+  if (state.winner === "draw") {
+    await Swal.fire({
+      title: "平局",
+      text: "双方握手言和",
+      imageUrl: "/match-draw.png",
+      imageAlt: "平局动画",
+      imageWidth: 160,
+      imageHeight: 160,
+      confirmButtonText: "知道了",
+      customClass: { popup: "duel-swal match-result-swal draw", confirmButton: "duel-swal-confirm" }
+    });
+    return;
+  }
   const won = player.team === state.winner;
   await Swal.fire({
     title: won ? "胜利" : "失败",
@@ -1423,6 +1634,10 @@ const openVote = async (kind: VoteKind, targetPid?: string, replacement?: Proble
     setStatus(`${targetPid} 已有换题投票`);
     return;
   }
+  if (kind === "draw" && Object.values(state.votes).some((vote) => vote.kind === "draw" && vote.status === "open")) {
+    setStatus("已有求和投票");
+    return;
+  }
   await emit({ ...baseEvent("vote.opened"), vote: buildVote(kind, player, targetPid, replacement) });
 };
 
@@ -1512,11 +1727,6 @@ const App = () => {
   );
 };
 
-const ThemeModeIcon = () => {
-  const Icon = themeMode === "system" ? Monitor : themeMode === "light" ? Sun : Moon;
-  return <Icon size={16} />;
-};
-
 const Shell = ({ title, subtitle, children }: { title: string; subtitle: string; children: ComponentChildren }) => (
   <div class="app-shell">
     <header class="topbar">
@@ -1534,21 +1744,9 @@ const Shell = ({ title, subtitle, children }: { title: string; subtitle: string;
         <span>{statusText}</span>
       </div>
       <div class="session">
-        <div class="theme-picker">
-          <button class="ghost icon-only" onClick={() => {
-            draft.themeMenuOpen = !draft.themeMenuOpen;
-            notify();
-          }}>
-            <ThemeModeIcon />
-          </button>
-          {draft.themeMenuOpen ? (
-            <div class="theme-menu">
-              <button class={themeMode === "system" ? "active" : ""} onClick={() => setThemeMode("system")}><Monitor size={14} />跟随系统</button>
-              <button class={themeMode === "light" ? "active" : ""} onClick={() => setThemeMode("light")}><Sun size={14} />浅色</button>
-              <button class={themeMode === "dark" ? "active" : ""} onClick={() => setThemeMode("dark")}><Moon size={14} />深色</button>
-            </div>
-          ) : null}
-        </div>
+        <button class="ghost icon-only" onClick={() => void openThemeEditor()}>
+          <Palette size={16} />
+        </button>
         {bootPhase === "ready" ? (
           <>
             {isAdmin() ? <button class="ghost" onClick={() => { draft.adminSearch = mode === "profile" ? (profileUserName || "") : ""; location.hash = mode === "admin" ? "" : "admin=1"; }}><Shield size={15} />{mode === "admin" ? "主页" : "管理"}</button> : null}
@@ -1682,7 +1880,6 @@ const RoomControls = () => {
   const player = state.players[identity.id];
   const canClose = canCloseRoom(state, identity.id, identity.luoguName);
   const canPlayAction = state.phase === "arena" && isTeam(player?.team) && !blockedByBan();
-  const canRoomMute = state.phase === "arena" && Boolean(player && (state.hostId === identity.id || isAdminName(identity.luoguName)));
   const canLeaveSpectator = mode === "room" && (player?.team === "spectator" || (!player && preferredSeat() === "spectator"));
   const showLobbyControls = state.phase === "lobby";
   if (state.phase === "finished") {
@@ -1746,12 +1943,6 @@ const RoomControls = () => {
           </button>
         </div>
       ) : null}
-      {canRoomMute ? (
-        <button class={state.muted["__room__"] ? "ghost" : "danger"} onClick={() => void emitDirect({ ...baseEvent(state.muted["__room__"] ? "room.unmuted" : "room.muted") })}>
-          {state.muted["__room__"] ? <Volume2 size={16} /> : <VolumeX size={16} />}
-          {state.muted["__room__"] ? "解除全员禁言" : "全员禁言"}
-        </button>
-      ) : null}
     </div>
   );
 };
@@ -1797,7 +1988,7 @@ const RoomList = () => {
         <span>状态</span>
       </div>
       {fresh.map((room) => (
-        <button class="duel-row" key={room.roomId} disabled={joiningRoom || creatingRoom} onClick={() => void joinRoom(room)}>
+        <button class="duel-row" key={room.roomId} disabled={joiningRoom || creatingRoom} onClick={() => void joinRoom(room)} style={`--diff-gradient: ${roomDifficultyGradient(room)}`} title={roomDifficultyLabel(room) || undefined}>
           <code>{shortRoomId(room.roomId)}</code>
           <RoomLineView room={room} />
           <em class={roomStatusClass(room)}>{roomStatusLabel(room)}</em>
@@ -1863,6 +2054,21 @@ const roomLine = (room: RoomListing): string => {
 
 const roomStatusLabel = (room: RoomListing): string =>
   isClosedListing(room) ? "已关闭" : room.status === "lobby" ? "准备" : room.status === "arena" ? "进行中" : room.winner ? "已结束" : "已关闭";
+
+const roomDifficultyLabel = (room: RoomListing): string => {
+  if (!room.averageDifficulty && !room.minimumDifficulty) return "";
+  const avg = room.averageDifficulty ? difficultyMeta.find(d => d.value === Math.round(room.averageDifficulty!))?.label ?? `L${Math.round(room.averageDifficulty!)}` : "";
+  const min = room.minimumDifficulty ? `≥${difficultyMeta.find(d => d.value === room.minimumDifficulty)?.label ?? `L${room.minimumDifficulty}`}` : "";
+  return avg && min ? `${avg} (${min})` : avg || min;
+};
+
+const roomDifficultyGradient = (room: RoomListing): string => {
+  const min = room.minimumDifficulty ?? 1;
+  const max = room.averageDifficulty ? Math.round(room.averageDifficulty) : min;
+  const minColor = difficultyMeta.find(d => d.value === min)?.color ?? "#888";
+  const maxColor = difficultyMeta.find(d => d.value === max)?.color ?? "#888";
+  return `linear-gradient(to right, ${minColor} 0%, ${minColor} 80px, transparent 180px, transparent calc(100% - 180px), ${maxColor} calc(100% - 80px), ${maxColor} 100%)`;
+};
 
 const roomStatusClass = (room: RoomListing): string =>
   isClosedListing(room) || (room.status === "finished" && !room.winner) ? "closed" : room.status;
@@ -2163,6 +2369,7 @@ const Chat = () => {
   const items = chatStreamItems();
   const muted = isMutedCurrent() || (state.muted["__room__"] === true && state.hostId !== identity.id && !isAdminName(identity.luoguName));
   const readOnly = mode === "room" && state.phase === "finished";
+  const canRoomMute = mode === "room" && state.phase === "arena" && (state.hostId === identity.id || isAdmin());
   queueMicrotask(syncChatVditorState);
   return (
     <div class="chat">
@@ -2172,10 +2379,18 @@ const Chat = () => {
       </div>
       <form class="chat-form" onSubmit={(event) => void submitChat(event)}>
         <div class="chat-vditor" ref={chatVditorRef} />
-        <button disabled={blockedByBan() || muted || readOnly}>
-          <Send size={15} />
-          {readOnly ? "只读" : muted ? "禁言" : "发送"}
-        </button>
+        <div class="chat-form-actions">
+          <button disabled={blockedByBan() || muted || readOnly}>
+            <Send size={15} />
+            {readOnly ? "只读" : muted ? "禁言" : "发送"}
+          </button>
+          {canRoomMute ? (
+            <button class={state.muted["__room__"] ? "ghost" : "danger"} onClick={(event) => { event.preventDefault(); void emitDirect({ ...baseEvent(state.muted["__room__"] ? "room.unmuted" : "room.muted") }); }}>
+              {state.muted["__room__"] ? <Volume2 size={15} /> : <VolumeX size={15} />}
+              {state.muted["__room__"] ? "解禁" : "禁言"}
+            </button>
+          ) : null}
+        </div>
       </form>
     </div>
   );
@@ -2421,6 +2636,7 @@ const BanOverlay = () => {
 };
 
 const RatingCurve = ({ name }: { name: string }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const user = userRecordFor(name);
   const raw = user?.ratingHistory?.length ? user.ratingHistory.slice(-24) : [{ at: Date.now(), rating: user?.rating ?? 1300 }];
   const history = raw.length === 1 ? [raw[0], { ...raw[0], at: raw[0].at + 1 }] : raw;
@@ -2430,21 +2646,54 @@ const RatingCurve = ({ name }: { name: string }) => {
   const range = Math.max(80, maximum - minimum);
   const floor = minimum - Math.max(30, (range - (maximum - minimum)) / 2);
   const ceiling = floor + range;
-  const points = history.map((point, index) => {
-    const x = history.length <= 1 ? 0 : index / (history.length - 1) * 360;
-    const y = 92 - (point.rating - floor) / (ceiling - floor) * 76;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
   const first = history[0].rating;
   const current = history.at(-1)?.rating ?? first;
+  const draw = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const W = 360;
+    const H = 108;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const green = getComputedStyle(document.documentElement).getPropertyValue("--green").trim() || "#3fb98c";
+    const pts = history.map((point, index) => {
+      const x = history.length <= 1 ? 0 : (index / (history.length - 1)) * W;
+      const y = H - 10 - ((point.rating - floor) / (ceiling - floor)) * (H - 22);
+      return [x, y] as [number, number];
+    });
+    ctx.beginPath();
+    ctx.moveTo(0, H);
+    pts.forEach(([x, y]) => ctx.lineTo(x, y));
+    ctx.lineTo(W, H);
+    ctx.closePath();
+    ctx.globalAlpha = 0.16;
+    ctx.fillStyle = green;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    pts.forEach(([x, y], index) => (index ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.strokeStyle = green;
+    ctx.lineWidth = 3;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.stroke();
+  };
+  useEffect(() => {
+    draw();
+    const handler = () => draw();
+    document.addEventListener("luogu-duel:theme", handler);
+    return () => document.removeEventListener("luogu-duel:theme", handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name]);
   return (
     <section class="rating-curve-card" aria-label="Rating 曲线">
       <div><span>RATING</span><strong>{Math.round(current)}</strong><em class={current >= first ? "up" : "down"}>{current >= first ? "+" : ""}{Math.round(current - first)}</em></div>
-      <svg viewBox="0 0 360 108" preserveAspectRatio="none" role="img">
-        <defs><linearGradient id="rating-area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--green)" stop-opacity=".38"/><stop offset="1" stop-color="var(--green)" stop-opacity="0"/></linearGradient></defs>
-        <polygon points={`0,108 ${points} 360,108`} fill="url(#rating-area)" />
-        <polyline points={points} fill="none" stroke="var(--green)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
-      </svg>
+      <canvas ref={canvasRef} class="rating-canvas" />
     </section>
   );
 };
@@ -2830,7 +3079,7 @@ const MatchIsland = () => {
   const total = Math.max(1, state.problems.reduce((sum, problem) => sum + problem.score, 0));
   const threshold = winThreshold(state);
   return (
-    <aside class="match-island">
+    <aside class={`match-island${draft.matchIslandPinned ? " pinned" : ""}`} onClick={() => { draft.matchIslandPinned = !draft.matchIslandPinned; notify(); }}>
       <div class="match-island-summary">
         <time>{state.phase === "lobby" ? "准备中" : formatMatchClock()}</time>
         <span class="island-duel" aria-label={`红方 ${red} 分，蓝方 ${blue} 分，胜利线 ${threshold}`}>
@@ -2842,6 +3091,7 @@ const MatchIsland = () => {
           <b class="island-blue-score">{blue}</b>
           <em>胜 {threshold}</em>
         </span>
+        {draft.matchIslandPinned ? <span class="island-pin-icon" title="已固定，点击取消"><Pin size={12} /></span> : null}
       </div>
       <div class="island-hover-detail">
         <ArchiveStatus />
@@ -3293,12 +3543,12 @@ const timeAgo = (time: number): string => {
   return `${Math.floor(minutes / 60)} 小时前`;
 };
 
-function readStoredNumber(key: string): number {
+function readStoredNumber(key: string, fallback = 0): number {
   try {
-    const value = Number(localStorage.getItem(key) || 0);
-    return Number.isFinite(value) ? value : 0;
+    const value = Number(localStorage.getItem(key) || fallback);
+    return Number.isFinite(value) ? value : fallback;
   } catch {
-    return 0;
+    return fallback;
   }
 }
 

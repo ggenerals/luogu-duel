@@ -62,6 +62,7 @@ export class DuelRoom extends DurableObject<Env> {
   private processedResultsCache: Set<string> | null = null;
   private actorWriteWindow = new Map<string, number[]>();
   private directoryObject: boolean | null = null;
+  private wsActors = new Map<WebSocket, string>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -221,14 +222,51 @@ export class DuelRoom extends DurableObject<Env> {
       if (attachment?.kind === "directory") return;
       if (data.type !== "event" || !data.envelope) return;
       const saved = await this.acceptEnvelope(data.envelope);
-      if (saved) this.broadcast({ type: "event", envelope: data.envelope });
+      if (saved) {
+        // Track WebSocket → actor mapping for auto-leave on disconnect
+        if (data.envelope.event.type === "player.joined") {
+          this.wsActors.set(ws, data.envelope.event.actorId);
+        }
+        this.broadcast({ type: "event", envelope: data.envelope });
+      }
     } catch (error) {
       ws.send(JSON.stringify({ type: "error", message: error instanceof Error ? error.message : "bad message" }));
     }
   }
 
-  async webSocketClose(): Promise<void> {
-    // Hibernation lets the runtime clean up closed sockets; no in-memory state is required.
+  async webSocketClose(ws: WebSocket): Promise<void> {
+    const actorId = this.wsActors.get(ws);
+    if (!actorId) return;
+    this.wsActors.delete(ws);
+    // Check if the player still has other active WebSocket connections
+    let hasOtherConnection = false;
+    for (const [otherWs, otherActorId] of this.wsActors) {
+      if (otherWs !== ws && otherActorId === actorId && otherWs.readyState === WebSocket.OPEN) {
+        hasOtherConnection = true;
+        break;
+      }
+    }
+    if (hasOtherConnection) return;
+    // Generate player.left event automatically on disconnect
+    try {
+      this.hydrateEvents();
+      const player = this.cachedState.players[actorId];
+      if (!player || this.cachedState.phase === "finished") return;
+      // Only auto-leave for non-global rooms
+      if (this.cachedState.roomId === "global") return;
+      const now = Date.now();
+      // Unready the player first
+      if (player.ready) {
+        const unreadyEnvelope = await systemPlayerReadyEnvelope(this.cachedState.roomId, this.cachedState.lamport + 1, now, actorId, false);
+        await this.acceptEnvelope(unreadyEnvelope);
+        this.broadcast({ type: "event", envelope: unreadyEnvelope });
+      }
+      const leaveEnvelope = await systemPlayerLeaveEnvelope(this.cachedState.roomId, this.cachedState.lamport + 2, now + 1, actorId);
+      await this.acceptEnvelope(leaveEnvelope);
+      this.broadcast({ type: "event", envelope: leaveEnvelope });
+    } catch {
+      // Best-effort cleanup; ignore errors
+    }
   }
 
   private async handleWebSocket(request: Request): Promise<Response> {
@@ -1493,6 +1531,39 @@ const systemCloseEnvelope = async (roomId: string, lamport: number, issuedAt: nu
     issuedAt,
     actorName: "gcend",
     reason: "已自动关闭"
+  };
+  const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, textBytes(stableStringify(event)));
+  return { publicKey, event, signature: btoa(String.fromCharCode(...new Uint8Array(signature))) };
+};
+
+const systemPlayerLeaveEnvelope = async (roomId: string, lamport: number, issuedAt: number, targetActorId: string): Promise<SignedEnvelope> => {
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const publicKey = await crypto.subtle.exportKey("jwk", pair.publicKey);
+  const actorId = await keyId(publicKey);
+  const event: DuelEvent = {
+    type: "player.left",
+    roomId,
+    actorId: targetActorId,
+    id: crypto.randomUUID(),
+    lamport,
+    issuedAt
+  };
+  const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, textBytes(stableStringify(event)));
+  return { publicKey, event, signature: btoa(String.fromCharCode(...new Uint8Array(signature))) };
+};
+
+const systemPlayerReadyEnvelope = async (roomId: string, lamport: number, issuedAt: number, targetActorId: string, ready: boolean): Promise<SignedEnvelope> => {
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const publicKey = await crypto.subtle.exportKey("jwk", pair.publicKey);
+  const signedById = await keyId(publicKey);
+  const event: DuelEvent = {
+    type: "player.readyChanged",
+    roomId,
+    actorId: targetActorId,
+    id: crypto.randomUUID(),
+    lamport,
+    issuedAt,
+    ready
   };
   const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, textBytes(stableStringify(event)));
   return { publicKey, event, signature: btoa(String.fromCharCode(...new Uint8Array(signature))) };
