@@ -173,8 +173,8 @@ const vditorPreviewSources = new WeakMap<HTMLElement, string>();
 let themeMode = readThemeMode();
 let bgImageUrl = readStoredText(bgImageKey) || "";
 let frostedGlass = readStoredText(frostedKey) === "1";
-let blurRadius = readStoredNumber(blurRadiusKey, 0);
-let panelAlpha = readStoredNumber(panelAlphaKey, 100);
+let blurRadius = readStoredNumber(blurRadiusKey, 5);
+let panelAlpha = readStoredNumber(panelAlphaKey, 80);
 let themeColorR = readStoredNumber(themeColorRKey, 63);
 let themeColorG = readStoredNumber(themeColorGKey, 185);
 let themeColorB = readStoredNumber(themeColorBKey, 140);
@@ -236,7 +236,7 @@ const notify = (forceStickChat = false) => {
 };
 
 function syncViewportScroll(): void {
-  const fixedViewport = window.innerWidth > 1180 && (mode === "home" || mode === "room");
+  const fixedViewport = window.innerWidth > 1180 && (mode === "home" || mode === "room" || mode === "profile");
   document.documentElement.classList.toggle("fixed-viewport", fixedViewport);
   document.body.classList.toggle("fixed-viewport", fixedViewport);
 }
@@ -249,11 +249,20 @@ const applyTheme = () => {
   const effective = themeMode === "system" ? (themeQuery.matches ? "dark" : "light") : themeMode;
   document.documentElement.dataset.theme = effective;
   if (bgImageUrl) {
-    document.body.style.backgroundImage = `url(${bgImageUrl})`;
-    document.body.style.backgroundSize = "cover";
-    document.body.style.backgroundPosition = "center";
-    document.body.style.backgroundAttachment = "fixed";
+    let bgLayer = document.getElementById("theme-bg-layer");
+    if (!bgLayer) {
+      bgLayer = document.createElement("div");
+      bgLayer.id = "theme-bg-layer";
+      document.body.insertBefore(bgLayer, document.body.firstChild);
+    }
+    bgLayer.style.backgroundImage = `url(${bgImageUrl})`;
+    document.body.style.backgroundImage = "";
+    document.body.style.backgroundSize = "";
+    document.body.style.backgroundPosition = "";
+    document.body.style.backgroundAttachment = "";
   } else {
+    const bgLayer = document.getElementById("theme-bg-layer");
+    if (bgLayer) bgLayer.style.backgroundImage = "";
     document.body.style.backgroundImage = "";
     document.body.style.backgroundSize = "";
     document.body.style.backgroundPosition = "";
@@ -563,7 +572,7 @@ const openThemeEditor = async () => {
         <label>毛玻璃</label>
         <div class="te-frosted-row">
           <label class="te-check"><input id="te-frosted" type="checkbox" ${frostedGlass ? "checked" : ""}> 启用</label>
-          <label class="te-range">模糊 <input id="te-blur" type="range" min="0" max="40" value="${blurRadius}" ${frostedGlass ? "" : "disabled"}> <span id="te-blur-val">${blurRadius}px</span></label>
+          <label class="te-range">模糊 <input id="te-blur" type="range" min="1" max="40" value="${blurRadius}" ${frostedGlass ? "" : "disabled"}> <span id="te-blur-val">${blurRadius}px</span></label>
           <label class="te-range">透明 <input id="te-alpha" type="range" min="10" max="100" value="${panelAlpha}" ${frostedGlass ? "" : "disabled"}> <span id="te-alpha-val">${panelAlpha}%</span></label>
         </div>
       </div>
@@ -603,7 +612,18 @@ const openThemeEditor = async () => {
       });
       // Real-time: color, blur, alpha, frosted
       ["te-color", "te-blur", "te-alpha", "te-frosted"].forEach(id => get(id)?.addEventListener("input", applyNow));
-      get("te-frosted")?.addEventListener("change", applyNow);
+      get("te-frosted")?.addEventListener("change", () => {
+        frostedGlass = get("te-frosted")?.checked ?? false;
+        const blurInp = get("te-blur");
+        const alphaInp = get("te-alpha");
+        if (blurInp) blurInp.disabled = !frostedGlass;
+        if (alphaInp) alphaInp.disabled = !frostedGlass;
+        if (frostedGlass && blurRadius === 0 && panelAlpha === 100) {
+          if (blurInp) blurInp.value = "5";
+          if (alphaInp) alphaInp.value = "80";
+        }
+        applyNow();
+      });
     },
     preConfirm: () => {
       const bgUrl = (document.getElementById("te-bg") as HTMLInputElement)?.value?.trim() || "";
@@ -616,7 +636,7 @@ const openThemeEditor = async () => {
     themeMode = "system";
     bgImageUrl = "";
     themeColorR = 63; themeColorG = 185; themeColorB = 140;
-    frostedGlass = false; blurRadius = 0; panelAlpha = 100;
+    frostedGlass = false; blurRadius = 5; panelAlpha = 80;
     try { localStorage.removeItem(themeModeKey); localStorage.removeItem(bgImageKey); localStorage.removeItem(frostedKey); localStorage.removeItem(blurRadiusKey); localStorage.removeItem(panelAlphaKey); localStorage.removeItem(themeColorRKey); localStorage.removeItem(themeColorGKey); localStorage.removeItem(themeColorBKey); } catch {}
     applyTheme(); notify(); return;
   }
@@ -2524,13 +2544,15 @@ const ProfilePage = () => {
                   </div>
                 ) : null}
               </div>
-              {draft.profileEditing && mine ? (
-                <div id="profile-vditor" class="profile-vditor" />
-              ) : (
-                <div class="profile-html">
-                  <RichText text={source || "这个用户还没有填写个人主页。"} className="profile-rich-text" />
-                </div>
-              )}
+              <div class="profile-home-scroll">
+                {draft.profileEditing && mine ? (
+                  <div id="profile-vditor" class="profile-vditor" />
+                ) : (
+                  <div class="profile-html">
+                    <RichText text={source || "这个用户还没有填写个人主页。"} className="profile-rich-text" />
+                  </div>
+                )}
+              </div>
             </section>
             <aside class="profile-sidebar">
               <RatingCurve name={name} />
@@ -2646,8 +2668,9 @@ const RatingCurve = ({ name }: { name: string }) => {
   const minimum = Math.min(...ratings);
   const maximum = Math.max(...ratings);
   // Robust upper bound: ignore extreme spikes (e.g. 1300 -> 10000 -> 1300) so a single
-  // outlier doesn't squash the rest of the curve. Outliers are drawn as an uncapped
-  // spike pinned to the top edge instead of capping the whole chart.
+  // outlier doesn't squash the rest of the curve. Outliers are drawn as two near-vertical
+  // lines rising from the curve and stopping ~10px below the top edge — an uncapped spike
+  // (the top is left open), not a point pinned to the chart ceiling.
   const sorted = [...ratings].sort((a, b) => a - b);
   const quantile = (p: number): number => {
     const idx = (sorted.length - 1) * p;
@@ -2672,6 +2695,9 @@ const RatingCurve = ({ name }: { name: string }) => {
     const dpr = window.devicePixelRatio || 1;
     const W = 360;
     const H = 108;
+    const PAD_TOP = 10;       // 离群尖峰顶端距画布顶部 10px = “上不封顶”
+    const PAD_BOTTOM = 10;
+    const NORMAL_TOP = 28;    // 正常曲线预留顶部空间，使离群尖峰明显更高
     canvas.width = W * dpr;
     canvas.height = H * dpr;
     const ctx = canvas.getContext("2d");
@@ -2679,29 +2705,79 @@ const RatingCurve = ({ name }: { name: string }) => {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
     const green = getComputedStyle(document.documentElement).getPropertyValue("--green").trim() || "#3fb98c";
-    const pts = history.map((point, index) => {
-      const x = history.length <= 1 ? 0 : (index / (history.length - 1)) * W;
-      const ratio = (point.rating - floor) / (ceiling - floor);
+
+    const isOut = ratings.map((rating) => rating > upperFence);
+    const xOf = (i: number): number => (history.length <= 1 ? 0 : (i / (history.length - 1)) * W);
+    const yOfNormal = (rating: number): number => {
+      const ratio = (rating - floor) / (ceiling - floor);
       const clamped = Math.max(0, Math.min(1, ratio));
-      const y = H - 10 - clamped * (H - 22);
-      return [x, y] as [number, number];
+      return H - PAD_BOTTOM - clamped * (H - PAD_BOTTOM - NORMAL_TOP);
+    };
+
+    // 主曲线只连正常点；离群点单独画成两条近似垂直线
+    const mainPts: Array<[number, number]> = [];
+    history.forEach((point, i) => {
+      if (isOut[i]) return;
+      mainPts.push([xOf(i), yOfNormal(point.rating)]);
     });
-    ctx.beginPath();
-    ctx.moveTo(0, H);
-    pts.forEach(([x, y]) => ctx.lineTo(x, y));
-    ctx.lineTo(W, H);
-    ctx.closePath();
-    ctx.globalAlpha = 0.16;
-    ctx.fillStyle = green;
-    ctx.fill();
-    ctx.globalAlpha = 1;
-    ctx.beginPath();
-    pts.forEach(([x, y], index) => (index ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
-    ctx.strokeStyle = green;
-    ctx.lineWidth = 3;
-    ctx.lineJoin = "round";
-    ctx.lineCap = "round";
-    ctx.stroke();
+
+    // 填充（正常曲线下方）
+    if (mainPts.length) {
+      ctx.beginPath();
+      ctx.moveTo(mainPts[0][0], H);
+      mainPts.forEach(([x, y]) => ctx.lineTo(x, y));
+      ctx.lineTo(mainPts[mainPts.length - 1][0], H);
+      ctx.closePath();
+      ctx.globalAlpha = 0.16;
+      ctx.fillStyle = green;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // 主曲线描边
+    if (mainPts.length > 1) {
+      ctx.beginPath();
+      mainPts.forEach(([x, y], idx) => (idx ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+      ctx.strokeStyle = green;
+      ctx.lineWidth = 3;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.stroke();
+    }
+
+    // 离群尖峰：两条近似垂直线，顶端停在离画布顶部 PAD_TOP=10px 处，顶部不封口 = 上不封顶
+    const nearestNormal = (from: number, dir: -1 | 1): number => {
+      let i = from + dir;
+      while (i >= 0 && i < history.length) {
+        if (!isOut[i]) return i;
+        i += dir;
+      }
+      return -1;
+    };
+    isOut.forEach((out, i) => {
+      if (!out) return;
+      const prev = nearestNormal(i, -1);
+      const next = nearestNormal(i, 1);
+      ctx.strokeStyle = green;
+      ctx.lineWidth = 3;
+      ctx.lineCap = "round";
+      if (prev >= 0) {
+        const px = xOf(prev);
+        const py = yOfNormal(history[prev].rating);
+        ctx.beginPath();
+        ctx.moveTo(px, py);
+        ctx.lineTo(px, PAD_TOP); // 左壁：从曲线近似垂直升至顶端 10px 处
+        ctx.stroke();
+      }
+      if (next >= 0) {
+        const nx = xOf(next);
+        const ny = yOfNormal(history[next].rating);
+        ctx.beginPath();
+        ctx.moveTo(nx, PAD_TOP); // 右壁：从顶端 10px 处近似垂直落回曲线
+        ctx.lineTo(nx, ny);
+        ctx.stroke();
+      }
+    });
   };
   useEffect(() => {
     draw();
