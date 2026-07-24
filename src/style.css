@@ -88,11 +88,16 @@ body {
 #theme-bg-layer {
   position: fixed;
   inset: 0;
-  z-index: -1;
+  z-index: 0;
   pointer-events: none;
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
+}
+
+#app {
+  position: relative;
+  z-index: 1;
 }
 
 /* Desktop duel views own their internal scrolling; do not expose a stray page scrollbar. */
@@ -759,7 +764,11 @@ code {
 .panel,
 .command-panel {
   padding: 12px;
-  overflow: hidden;
+}
+
+.command-panel {
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .arena-head {
@@ -1980,7 +1989,7 @@ img.chat-avatar {
 .rich-text blockquote { margin: 7px 0; border-left: 3px solid var(--green); padding-left: 9px; color: var(--muted); }
 .rich-text img { max-width: 100%; border-radius: 10px; }
 .rich-text .katex-display { max-width: 100%; overflow-x: auto; overflow-y: hidden; }
-.announcement-content { color: var(--muted); max-height: 300px; overflow: auto; padding-right: 6px; }
+.announcement-content { color: var(--muted); }
 .chat-text.rich-text { white-space: normal; }
 
 .home-chat-panel .chat-log {
