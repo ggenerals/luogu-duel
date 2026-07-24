@@ -25,6 +25,7 @@ type RoomListing = {
   rated?: boolean;
   averageDifficulty?: number;
   minimumDifficulty?: number;
+  maximumDifficulty?: number;
   closedReason?: string;
   redPlayers?: string[];
   bluePlayers?: string[];
@@ -525,6 +526,7 @@ export class DuelRoom extends DurableObject<Env> {
       rated: state.rated,
       averageDifficulty: difficulties.length ? average(difficulties) : undefined,
       minimumDifficulty: difficulties.length ? Math.min(...difficulties) : undefined,
+      maximumDifficulty: difficulties.length ? Math.max(...difficulties) : undefined,
       closedReason: state.closed?.reason,
       redPlayers,
       bluePlayers

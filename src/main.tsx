@@ -282,7 +282,7 @@ const applyTheme = () => {
       ".home-announcement", ".problem-card", ".chat-line.bubble", ".vditor", ".vditor-toolbar",
       ".vditor-content", ".vditor-wysiwyg", ".vditor-reset", ".vditor-preview", ".duel-table",
       ".ranking-list", ".team-card", ".island-roster", ".chat-log", ".chat-form input",
-      ".chat-form textarea", "input", "select", "textarea"
+      ".chat-form textarea", ".vote", "input", "select", "textarea"
     ];
     const surfaceRules = [
       ...surfaces.map(s => `${s} { backdrop-filter: blur(${blurRadius}px); -webkit-backdrop-filter: blur(${blurRadius}px); background: ${dk}; }`),
@@ -2056,17 +2056,19 @@ const roomStatusLabel = (room: RoomListing): string =>
   isClosedListing(room) ? "已关闭" : room.status === "lobby" ? "准备" : room.status === "arena" ? "进行中" : room.winner ? "已结束" : "已关闭";
 
 const roomDifficultyLabel = (room: RoomListing): string => {
-  if (!room.averageDifficulty && !room.minimumDifficulty) return "";
-  const avg = room.averageDifficulty ? difficultyMeta.find(d => d.value === Math.round(room.averageDifficulty!))?.label ?? `L${Math.round(room.averageDifficulty!)}` : "";
-  const min = room.minimumDifficulty ? `≥${difficultyMeta.find(d => d.value === room.minimumDifficulty)?.label ?? `L${room.minimumDifficulty}`}` : "";
-  return avg && min ? `${avg} (${min})` : avg || min;
+  if (!room.averageDifficulty && !room.minimumDifficulty && !room.maximumDifficulty) return "";
+  const labelOf = (value?: number): string => value ? difficultyMeta.find((d) => d.value === value)?.label ?? `L${value}` : "";
+  const min = room.minimumDifficulty ? labelOf(room.minimumDifficulty) : "";
+  const max = room.maximumDifficulty ? labelOf(room.maximumDifficulty) : (room.averageDifficulty ? labelOf(Math.round(room.averageDifficulty)) : "");
+  if (min && max) return min === max ? min : `${min}~${max}`;
+  return min || max;
 };
 
 const roomDifficultyGradient = (room: RoomListing): string => {
   const min = room.minimumDifficulty ?? 1;
-  const max = room.averageDifficulty ? Math.round(room.averageDifficulty) : min;
-  const minColor = difficultyMeta.find(d => d.value === min)?.color ?? "#888";
-  const maxColor = difficultyMeta.find(d => d.value === max)?.color ?? "#888";
+  const max = room.maximumDifficulty ? room.maximumDifficulty : (room.averageDifficulty ? Math.round(room.averageDifficulty) : min);
+  const minColor = difficultyMeta.find((d) => d.value === min)?.color ?? "#888";
+  const maxColor = difficultyMeta.find((d) => d.value === max)?.color ?? "#888";
   return `linear-gradient(to right, ${minColor} 0%, ${minColor} 80px, transparent 180px, transparent calc(100% - 180px), ${maxColor} calc(100% - 80px), ${maxColor} 100%)`;
 };
 
@@ -2643,8 +2645,24 @@ const RatingCurve = ({ name }: { name: string }) => {
   const ratings = history.map((point) => point.rating);
   const minimum = Math.min(...ratings);
   const maximum = Math.max(...ratings);
-  const range = Math.max(80, maximum - minimum);
-  const floor = minimum - Math.max(30, (range - (maximum - minimum)) / 2);
+  // Robust upper bound: ignore extreme spikes (e.g. 1300 -> 10000 -> 1300) so a single
+  // outlier doesn't squash the rest of the curve. Outliers are drawn as an uncapped
+  // spike pinned to the top edge instead of capping the whole chart.
+  const sorted = [...ratings].sort((a, b) => a - b);
+  const quantile = (p: number): number => {
+    const idx = (sorted.length - 1) * p;
+    const lo = Math.floor(idx);
+    const hi = Math.ceil(idx);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+  };
+  const q1 = quantile(0.25);
+  const q3 = quantile(0.75);
+  const iqr = q3 - q1;
+  const upperFence = q3 + 3 * iqr;
+  const normalRatings = ratings.filter((rating) => rating <= upperFence);
+  const robustMax = normalRatings.length ? Math.max(...normalRatings) : maximum;
+  const range = Math.max(80, robustMax - minimum);
+  const floor = minimum - Math.max(30, (range - (robustMax - minimum)) / 2);
   const ceiling = floor + range;
   const first = history[0].rating;
   const current = history.at(-1)?.rating ?? first;
@@ -2663,7 +2681,9 @@ const RatingCurve = ({ name }: { name: string }) => {
     const green = getComputedStyle(document.documentElement).getPropertyValue("--green").trim() || "#3fb98c";
     const pts = history.map((point, index) => {
       const x = history.length <= 1 ? 0 : (index / (history.length - 1)) * W;
-      const y = H - 10 - ((point.rating - floor) / (ceiling - floor)) * (H - 22);
+      const ratio = (point.rating - floor) / (ceiling - floor);
+      const clamped = Math.max(0, Math.min(1, ratio));
+      const y = H - 10 - clamped * (H - 22);
       return [x, y] as [number, number];
     });
     ctx.beginPath();

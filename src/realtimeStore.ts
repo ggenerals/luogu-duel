@@ -13,6 +13,7 @@ export type RoomListing = {
   rated?: boolean;
   averageDifficulty?: number;
   minimumDifficulty?: number;
+  maximumDifficulty?: number;
   closedReason?: string;
   redPlayers?: string[];
   bluePlayers?: string[];

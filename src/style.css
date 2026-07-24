@@ -1484,8 +1484,8 @@ button.is-loading { cursor: wait; }
 .problem-card:hover,
 .vote:hover,
 .player-row:hover {
-  border-color: rgb(63 185 140 / 0.36);
-  background: var(--panel-alt);
+  border-color: color-mix(in srgb, var(--green) 36%, transparent);
+  background: transparent;
   transform: translateY(-1px);
 }
 
@@ -2019,6 +2019,7 @@ img.chat-avatar {
   align-items: center;
   margin-bottom: 8px;
   padding: 7px;
+  background: transparent;
 }
 
 .feed-table {
